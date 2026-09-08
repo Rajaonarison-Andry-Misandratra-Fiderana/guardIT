@@ -73,9 +73,20 @@ enum Cmd {
 
 fn main() {
     let cli = Cli::parse();
+    let cmd = cli.cmd.unwrap_or(Cmd::Tui);
+    // everything except the read-only commands writes /etc/guardit, talks to
+    // the kernel, or connects to the root-owned daemon socket
+    let read_only = matches!(
+        cmd,
+        Cmd::List | Cmd::LogApp { .. } | Cmd::Apply { dry_run: true }
+    );
+    if !read_only && !ruleset::is_root() {
+        eprintln!("guardit needs root — run with sudo");
+        std::process::exit(1);
+    }
     let mut cfg = Config::load();
 
-    match cli.cmd.unwrap_or(Cmd::Tui) {
+    match cmd {
         Cmd::Allow(args) => add_rule(&mut cfg, RuleAction::Allow, args),
         Cmd::Deny(args) => add_rule(&mut cfg, RuleAction::Deny, args),
         Cmd::Rm { id } => {
@@ -94,10 +105,6 @@ fn main() {
                 print!("{}", ruleset::render(&cfg));
                 return;
             }
-            if !ruleset::is_root() {
-                eprintln!("guardit apply needs root (CAP_NET_ADMIN) — run with sudo");
-                std::process::exit(1);
-            }
             match ruleset::apply(&cfg) {
                 Ok(()) => println!(
                     "applied {} rule(s)",
@@ -112,10 +119,6 @@ fn main() {
         Cmd::Status => println!("{}", ruleset::status()),
         Cmd::Tui => tui::run(cfg),
         Cmd::Daemon { debug } => {
-            if !ruleset::is_root() {
-                eprintln!("guardit daemon needs root (CAP_NET_ADMIN) — run with sudo");
-                std::process::exit(1);
-            }
             if let Err(e) = daemon::run(cfg, debug) {
                 eprintln!("{e}");
                 std::process::exit(1);

@@ -941,10 +941,6 @@ fn reset_flow_selection(app: &mut App) {
 fn save_rules(app: &mut App) {
     let rule = app.cfg.rule.clone();
     app.cfg = Config::update(|fresh| fresh.rule = rule);
-    if !ruleset::is_root() {
-        app.msg = "need root to apply (run guardit tui as sudo) — rule saved but not loaded".into();
-        return;
-    }
     if let Err(e) = ruleset::apply(&app.cfg) {
         app.msg = format!("apply failed: {e}");
     }
