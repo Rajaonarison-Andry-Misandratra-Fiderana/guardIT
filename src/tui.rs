@@ -754,6 +754,9 @@ pub fn run(cfg: Config) {
                     KeyCode::Char('k') | KeyCode::Up => flow_select(&mut app, true),
                     KeyCode::Char('y') => flow_decide(&mut app, Action::Allow),
                     KeyCode::Char('n') => flow_decide(&mut app, Action::Deny),
+                    // uppercase = wider scope: the peer's name instead of the port
+                    KeyCode::Char('Y') => flow_decide_host(&mut app, Action::Allow),
+                    KeyCode::Char('N') => flow_decide_host(&mut app, Action::Deny),
                     KeyCode::Char('l') => {
                         if let Some(exe) = app
                             .apps_state
@@ -1064,12 +1067,20 @@ fn cascade_flow_rows(app: &mut App, action: Action, matches_row: impl Fn(&FlowWi
 /// (port-specific override first, else the app's whole-app default) and
 /// only falls back to the stored status if nothing matches at all — this
 /// is what makes the Flow pane self-correct after a reconnect instead of
-/// showing decisions you already made as reverted.
+/// showing decisions you already made as reverted. The row's own peer name
+/// is what host rules are matched against, so a host rule shows up here on
+/// exactly the rows it will actually apply to.
 fn effective_status(e: &FlowWire, app_rules: &[AppRule]) -> FlowStatus {
     if matches!(e.status, FlowStatus::Pending) {
         return FlowStatus::Pending;
     }
-    match_rule(app_rules, &e.exe, e.port, Some(e.direction))
+    match_rule(
+        app_rules,
+        &e.exe,
+        e.port,
+        Some(e.direction),
+        e.peer_name.as_deref(),
+    )
         .map(|r| FlowStatus::from(r.action))
         .unwrap_or(e.status)
 }
@@ -1093,6 +1104,7 @@ fn apps_set_verdict(app: &mut App, action: Action) {
         direction: None,
         action,
         expires: None,
+        host: None,
     });
     cascade_flow_rows(app, action, |e| e.exe == exe);
 }
@@ -1169,12 +1181,48 @@ fn flow_decide(app: &mut App, verdict: Action) {
             direction: Some(direction),
             action: verdict,
             expires: None,
+            host: None,
         });
     }
     // the rule covers this app's OTHER rows on the SAME port and direction
     // too (per-port control, never the whole app — that's Apps' job)
     cascade_flow_rows(app, verdict, |e| {
         e.exe == exe && e.port == port && e.direction == direction
+    });
+}
+
+/// `Y`/`N` in the Flow pane: rule the *destination* rather than the port —
+/// every connection this app makes to the name the selected row resolved
+/// to, on any port, in either direction. The exact name is used, not a
+/// guessed `*.` wildcard: widening "block tracker.ads.net" into "block
+/// everything under ads.net" is a call only the user can make, and
+/// `guardit app deny <exe> --host '*.ads.net'` is how they make it.
+fn flow_decide_host(app: &mut App, verdict: Action) {
+    let idxs = current_flow_indices(app);
+    let entry = app
+        .flow_state
+        .selected()
+        .and_then(|sel| idxs.get(sel).copied())
+        .and_then(|i| app.flow.get(i));
+    let Some(entry) = entry else { return };
+    let exe = entry.exe.clone();
+    let Some(host) = entry.peer_name.clone() else {
+        app.msg = "no resolved name for this peer — the DNS tap never saw its lookup".into();
+        return;
+    };
+    let Some(ipc) = &mut app.ipc else { return };
+    ipc.send(&ClientMsg::SetAppRule {
+        exe: exe.clone(),
+        port: None,
+        direction: None,
+        action: verdict,
+        expires: None,
+        host: Some(host.clone()),
+    });
+    // a host rule beats port and direction (config::match_rule), so it takes
+    // over every row of this app that reached the same name, whatever port
+    cascade_flow_rows(app, verdict, |e| {
+        e.exe == exe && e.peer_name.as_deref() == Some(host.as_str())
     });
 }
 
@@ -1219,6 +1267,7 @@ fn conflicts_decide(app: &mut App, action: Action) {
         direction: Some(Direction::In),
         action,
         expires: None,
+        host: None,
     });
     cascade_flow_rows(app, action, |e| {
         e.exe == exe && e.port == port && e.direction == Direction::In
@@ -1324,6 +1373,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("j/k", "select"),
             ("l", "log"),
             ("y/n", "allow/deny port"),
+            ("Y/N", "allow/deny host"),
         ],
         (Focus::Conflicts, _) => vec![
             ("Tab", "pane"),

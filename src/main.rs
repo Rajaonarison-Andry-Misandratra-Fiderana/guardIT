@@ -69,6 +69,10 @@ struct AppRuleArgs {
     /// one direction only; omit for both
     #[arg(long)]
     dir: Option<DirArg>,
+    /// only peers resolving to this name, e.g. example.com or *.example.com
+    /// (wins over --port; needs the daemon's DNS tap to have seen the lookup)
+    #[arg(long)]
+    host: Option<String>,
     /// expire after this long, e.g. 30s, 10m, 1h30m, 2d
     #[arg(long = "for", value_parser = parse_duration)]
     expires_in: Option<u64>,
@@ -367,6 +371,11 @@ fn set_app_rule(action: RuleAction, args: AppRuleArgs) {
         DirArg::Out => Direction::Out,
     });
     let expires = args.expires_in.map(|secs| now_ts() + secs);
+    if let Some(h) = &args.host
+        && let Err(e) = config::validate_host(h)
+    {
+        fail(&e);
+    }
     let exe = args.exe;
     let via_daemon = match ipc::Client::connect() {
         Ok(mut c) => {
@@ -376,20 +385,25 @@ fn set_app_rule(action: RuleAction, args: AppRuleArgs) {
                 direction,
                 action,
                 expires,
+                host: args.host.clone(),
             })
             .and_then(|()| wait_app_rules(&mut c))
             .unwrap_or_else(|e| fail(&format!("daemon: {e}")));
             true
         }
         Err(_) => {
-            daemon::upsert_rule(&exe, args.port, direction, action, expires);
+            daemon::upsert_rule(&exe, args.port, direction, action, expires, args.host.clone());
             false
         }
     };
     println!(
-        "{} {exe}{}{}{}{}",
+        "{} {exe}{}{}{}{}{}",
         format!("{action:?}").to_lowercase(),
         args.port.map(|p| format!(" port {p}")).unwrap_or_default(),
+        args.host
+            .as_deref()
+            .map(|h| format!(" host {h}"))
+            .unwrap_or_default(),
         direction
             .map(|d| format!(" {}", d.as_str()))
             .unwrap_or_default(),
@@ -411,17 +425,18 @@ fn print_app_list(cfg: &Config) {
     }
     let now = now_ts();
     println!(
-        "{:<4}{:<8}{:<7}{:<5}{:<4}{:<10}EXE",
-        "ID", "ACTION", "PORT", "DIR", "ON", "EXPIRES"
+        "{:<4}{:<8}{:<7}{:<5}{:<4}{:<22}{:<10}EXE",
+        "ID", "ACTION", "PORT", "DIR", "ON", "HOST", "EXPIRES"
     );
     for r in &cfg.app_rule {
         println!(
-            "{:<4}{:<8}{:<7}{:<5}{:<4}{:<10}{}{}",
+            "{:<4}{:<8}{:<7}{:<5}{:<4}{:<22}{:<10}{}{}",
             r.id,
             format!("{:?}", r.action).to_lowercase(),
             r.port.map(|p| p.to_string()).unwrap_or_else(|| "*".into()),
             r.direction.map(|d| d.as_str()).unwrap_or("*"),
             if r.enabled { "yes" } else { "no" },
+            r.host.as_deref().unwrap_or("*"),
             r.expires
                 .map(|t| daemon::ago(t.saturating_sub(now)))
                 .unwrap_or_default(),

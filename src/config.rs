@@ -54,6 +54,42 @@ pub fn validate_src(src: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// does `name` (the peer name the DNS tap resolved, if any) fall under the
+/// rule's host pattern? `*.example.com` deliberately covers the apex too —
+/// "block this domain" means the whole domain, not everything but the bare
+/// name. Comparison is case- and trailing-dot-insensitive, as DNS is.
+/// A peer with no resolved name matches nothing: a host rule is a statement
+/// about a named destination, and guessing on an unnamed one would silently
+/// widen a deny into a block on unrelated traffic.
+pub fn host_matches(pat: &str, name: Option<&str>) -> bool {
+    let Some(name) = name else { return false };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    let pat = pat.trim_end_matches('.').to_ascii_lowercase();
+    match pat.strip_prefix("*.") {
+        Some(apex) => name == apex || name.ends_with(&format!(".{apex}")),
+        None => name == pat,
+    }
+}
+
+/// a host pattern is only ever compared against a resolved name (never fed
+/// to nft, unlike `Rule::src`), so this is a typo guard rather than an
+/// injection one: a leading `*.` wildcard, then hostname characters only.
+pub fn validate_host(pat: &str) -> Result<(), String> {
+    let bare = pat.strip_prefix("*.").unwrap_or(pat).trim_end_matches('.');
+    let bad = bare.is_empty()
+        || bare.starts_with('.')
+        || bare.contains("..")
+        || !bare
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_');
+    if bad {
+        return Err(format!(
+            "bad host {pat:?}: want a hostname like example.com or *.example.com"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
@@ -105,6 +141,16 @@ pub struct AppRule {
     /// (hand-written rule). See `stale`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// `None` = any peer. `Some(pat)` restricts the rule to connections
+    /// whose peer the daemon's DNS tap resolved to a name matching `pat`
+    /// ("example.com" or "*.example.com" — see `host_matches`). A peer with
+    /// no known name never matches such a rule, so it falls through to the
+    /// app's less specific rules. Best-effort by construction: the tap only
+    /// sees plain DNS, so DoH/DoT and cached lookups are invisible to it.
+    /// ponytail: plain-DNS tap only, an app that resolves its own names
+    /// bypasses host rules — needs an nftables-set-per-domain to close
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 impl AppRule {
@@ -135,15 +181,21 @@ pub fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
-/// the one matching rule for (exe, port, direction): the most specific rule
-/// wins — a per-port rule over the app's whole-app default (`port: None`),
-/// and within that a directional rule over one that covers both. Used by
-/// the daemon to verdict and by the TUI to show what would happen right now
+/// the one matching rule for (exe, port, direction, peer name): the most
+/// specific rule wins — a host rule over a per-port rule over the app's
+/// whole-app default (`port: None`), and within each a directional rule
+/// over one that covers both. Host is the most specific axis on purpose:
+/// "this app must not reach *that domain*" is a narrower claim than "this
+/// app may use port 443", so it has to survive the broader allow.
+/// Used by the daemon to verdict and by the TUI to show what would happen
+/// right now; `host` is the name the DNS tap resolved for the peer, `None`
+/// when it saw no lookup for it.
 pub fn match_rule<'a>(
     rules: &'a [AppRule],
     exe: &str,
     port: Option<u16>,
     dir: Option<Direction>,
+    host: Option<&str>,
 ) -> Option<&'a AppRule> {
     let now = now_ts();
     rules
@@ -151,7 +203,8 @@ pub fn match_rule<'a>(
         .filter(|r| r.enabled && r.exe == exe && !r.expired(now))
         .filter(|r| r.port.is_none() || r.port == port)
         .filter(|r| r.direction.is_none() || r.direction == dir)
-        .max_by_key(|r| (r.port.is_some(), r.direction.is_some()))
+        .filter(|r| r.host.as_deref().is_none_or(|pat| host_matches(pat, host)))
+        .max_by_key(|r| (r.host.is_some(), r.port.is_some(), r.direction.is_some()))
 }
 
 fn default_pending_timeout() -> u32 {
@@ -283,7 +336,18 @@ mod tests {
             enabled: true,
             expires: None,
             fingerprint: None,
+            host: None,
         }
+    }
+
+    /// the host-less case, which is what every test below this one is about
+    fn match_rule<'a>(
+        rules: &'a [AppRule],
+        exe: &str,
+        port: Option<u16>,
+        dir: Option<Direction>,
+    ) -> Option<&'a AppRule> {
+        super::match_rule(rules, exe, port, dir, None)
     }
 
     fn act(r: Option<&AppRule>) -> Option<Action> {
@@ -316,6 +380,79 @@ mod tests {
             None,
             "denying one port must not deny the app"
         );
+    }
+
+    #[test]
+    fn host_pattern_covers_subdomains_and_the_apex() {
+        assert!(host_matches("*.foo.com", Some("a.foo.com")));
+        assert!(host_matches("*.foo.com", Some("deep.a.foo.com")));
+        assert!(host_matches("*.foo.com", Some("foo.com")), "apex included");
+        assert!(host_matches("*.foo.com", Some("FOO.COM")), "case-insensitive");
+        assert!(host_matches("*.foo.com", Some("foo.com.")), "trailing dot");
+        assert!(!host_matches("*.foo.com", Some("evilfoo.com")));
+        assert!(!host_matches("*.foo.com", Some("foo.com.evil.net")));
+        assert!(!host_matches("foo.com", Some("a.foo.com")), "exact means exact");
+        assert!(!host_matches("*.foo.com", None), "unresolved peer matches nothing");
+    }
+
+    #[test]
+    fn host_rule_beats_port_rule_but_only_for_that_host() {
+        let mut blocked = rule("/usr/bin/a", None, Action::Deny);
+        blocked.host = Some("*.ads.net".into());
+        let rules = vec![rule("/usr/bin/a", Some(443), Action::Allow), blocked];
+        assert_eq!(
+            act(super::match_rule(
+                &rules,
+                "/usr/bin/a",
+                Some(443),
+                None,
+                Some("tracker.ads.net")
+            )),
+            Some(Action::Deny),
+            "the host rule survives the broader port allow"
+        );
+        assert_eq!(
+            act(super::match_rule(
+                &rules,
+                "/usr/bin/a",
+                Some(443),
+                None,
+                Some("github.com")
+            )),
+            Some(Action::Allow)
+        );
+        assert_eq!(
+            act(super::match_rule(&rules, "/usr/bin/a", Some(443), None, None)),
+            Some(Action::Allow),
+            "an unresolved peer falls through to the port rule"
+        );
+    }
+
+    #[test]
+    fn host_rule_alone_leaves_other_hosts_unruled() {
+        let mut r = rule("/usr/bin/a", None, Action::Deny);
+        r.host = Some("*.ads.net".into());
+        assert_eq!(
+            act(super::match_rule(
+                &[r],
+                "/usr/bin/a",
+                Some(443),
+                None,
+                Some("github.com")
+            )),
+            None,
+            "denying one domain must not deny the app"
+        );
+    }
+
+    #[test]
+    fn host_must_be_a_hostname_or_wildcard() {
+        for ok in ["example.com", "*.example.com", "a-b_c.example.com", "localhost"] {
+            assert!(validate_host(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "*.", "*", "ex ample.com", "a//b", "a..b", ".example.com", "http://x"] {
+            assert!(validate_host(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

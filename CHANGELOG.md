@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Rules by domain**: `guardit app deny <exe> --host '*.doubleclick.net'` restricts a
+  rule to peers that resolved to a name, exactly or under a wildcard. A host rule is the
+  most specific kind — it beats a per-port rule, which beats the whole-app default — so
+  "allow 443, except that domain" reads and behaves that way. In the Flow pane, `Y`/`N`
+  rules the selected row's hostname instead of its port. Best-effort by construction: it
+  rides the passive DNS tap, so a peer with no name the daemon saw resolved never matches
+  a host rule (it falls through), and DoH/DoT stay invisible.
+
 ## 0.2.0 — 2026-09-08
 
 Per-app rules got precise, and usable without the TUI.

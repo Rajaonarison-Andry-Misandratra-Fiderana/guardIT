@@ -50,7 +50,9 @@ pub struct FlowWire {
     pub port: Option<u16>,
     pub peer_ip: String,
     /// the name an app resolved to get `peer_ip`, when the daemon's DNS tap
-    /// saw the answer (daemon::dns_loop) — display only, never matched on
+    /// saw the answer (daemon::dns_loop). Shown in the UI, and what host
+    /// rules match against (config::host_matches) — a flow with no name here
+    /// can never match one
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_name: Option<String>,
     pub status: FlowStatus,
@@ -116,6 +118,10 @@ pub enum ClientMsg {
         /// unix epoch seconds; None = permanent
         #[serde(default)]
         expires: Option<u64>,
+        /// restrict to peers resolving to this hostname pattern; None = any
+        /// peer. Wins over port and direction, see config::match_rule
+        #[serde(default)]
+        host: Option<String>,
     },
     ToggleAppRule {
         id: u32,

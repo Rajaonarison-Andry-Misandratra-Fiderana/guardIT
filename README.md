@@ -82,6 +82,7 @@ Per-app rules (what the daemon enforces) — the same things the TUI does, headl
 guardit app list                                            # every per-app rule
 guardit app allow /usr/bin/curl                             # whole app, both directions
 guardit app deny  /usr/bin/curl --port 80 --dir out         # one port, one direction
+guardit app deny  /usr/bin/firefox --host '*.doubleclick.net'  # one domain, any port
 guardit app allow /usr/bin/ssh --for 1h                     # expires (30s, 10m, 1h30m, 2d)
 guardit app rm    /usr/bin/curl                             # forget the app entirely
 guardit pending                                             # connections waiting for a decision
@@ -111,6 +112,26 @@ command. `notify = false` in `/etc/guardit/rules.toml` turns it off. Peers show 
 `github.com (140.82.121.4)` when the daemon saw the DNS answer (plain DNS only — DoH/DoT
 stay invisible). A hand edit of `rules.toml` is picked up within 5 seconds.
 
+### Rules by domain
+
+`--host` restricts a rule to peers the daemon resolved to a given name —
+`example.com` exactly, or `*.example.com` for the domain and everything under it:
+
+```
+guardit app deny /usr/bin/firefox --host '*.doubleclick.net'
+```
+
+A host rule is the **most specific** kind, so it beats a per-port rule, which beats the
+app's whole-app default. `allow firefox --port 443` plus `deny firefox --host
+'*.doubleclick.net'` means exactly what it reads: HTTPS everywhere except that domain.
+
+It rides on the same passive DNS tap that puts names in the dashboard, so it inherits its
+limits: a peer whose lookup the daemon never saw has no name, and a rule with `--host`
+can't match it — the connection falls through to the app's port and whole-app rules. An
+app doing DoH/DoT, or answering from its own cache, is invisible to the tap and therefore
+to host rules. Treat them as a convenience over named destinations, not a containment
+boundary — for that, deny the app and allow the ports you mean.
+
 ## The TUI
 
 Five panes in a fixed grid, `Tab` / `Shift+Tab` to move between them — the focused one gets
@@ -122,7 +143,7 @@ a thick border:
 | **Application blocking** | one row per app, its whole-app default, and how many per-port overrides it has — apps with no rule yet sort to the top | `j/k` select · `Enter` jump to its Flow · `l` this app's log · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely |
 | **Listening ports** | every LISTEN/bound local socket, who owns it, and real bind conflicts (rare — the kernel already prevents most) | `j/k` select · `l` log · `y`/`n` allow/deny **this port only** |
 | **Top apps** | bar chart of the apps with the most connection attempts, over the whole audit log (reset by `f` flush) | informational |
-| **Network flow** | live connection history for whichever app is selected in Application blocking | `j/k` select · `y`/`n` allow/deny **this port and direction only** (remembered as a per-port rule) |
+| **Network flow** | live connection history for whichever app is selected in Application blocking | `j/k` select · `y`/`n` allow/deny **this port and direction only** (remembered as a per-port rule) · `Y`/`N` allow/deny **this peer's hostname**, any port (needs a resolved name; uses the exact name — `--host '*.foo.com'` on the CLI for a whole domain) |
 
 Other keys: `L` opens the full audit log as its own tab (`j/k` move, `f` flush with confirm, `q`/`L` back), `t` cycles color theme (remembered across restarts), `q` quits.
 

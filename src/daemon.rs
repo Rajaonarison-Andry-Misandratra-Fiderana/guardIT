@@ -654,25 +654,27 @@ fn resolve_exe_cached(proto: u8, local_port: u16) -> Option<String> {
     exe
 }
 
-/// `port: None` (whole-app, from Apps/Conflicts) wipes every existing rule
-/// for `exe` — the app-wide port-specific overrides too, since "allow the
-/// whole app" is meant to actually mean every port. `port: Some(p)`
-/// (per-port, from Flow) only replaces that one port's existing override
-/// for the same direction, leaving the app-wide default and every other
-/// port alone.
+/// The whole-app case — `port: None` AND `host: None` (Apps/Conflicts) —
+/// wipes every existing rule for `exe`, the port-specific overrides and the
+/// host rules too, since "allow the whole app" is meant to actually mean
+/// everything. Any narrower rule only replaces the existing rule with the
+/// same (port, direction, host) key, leaving the app-wide default and every
+/// other port/host alone.
 pub fn upsert_rule(
     exe: &str,
     port: Option<u16>,
     direction: Option<Direction>,
     action: Action,
     expires: Option<u64>,
+    host: Option<String>,
 ) -> Vec<AppRule> {
     Config::update(|cfg| {
-        match port {
-            None => cfg.app_rule.retain(|r| r.exe != exe),
-            Some(p) => cfg
-                .app_rule
-                .retain(|r| !(r.exe == exe && r.port == Some(p) && r.direction == direction)),
+        if port.is_none() && host.is_none() {
+            cfg.app_rule.retain(|r| r.exe != exe);
+        } else {
+            cfg.app_rule.retain(|r| {
+                !(r.exe == exe && r.port == port && r.direction == direction && r.host == host)
+            });
         }
         let id = cfg.next_app_id();
         cfg.app_rule.push(AppRule {
@@ -684,6 +686,7 @@ pub fn upsert_rule(
             enabled: true,
             expires,
             fingerprint: fingerprint(exe),
+            host,
         });
     })
     .app_rule
@@ -692,8 +695,14 @@ pub fn upsert_rule(
 /// what the rules say for this connection — `None` also when the matching
 /// rule was made for a binary that has since changed, so the app is asked
 /// again (and the answer replaces the rule with a fresh fingerprint)
-fn ruled(rules: &[AppRule], exe: &str, port: u16, dir: Direction) -> Option<Action> {
-    let r = match_rule(rules, exe, Some(port), Some(dir))?;
+fn ruled(
+    rules: &[AppRule],
+    exe: &str,
+    port: u16,
+    dir: Direction,
+    host: Option<&str>,
+) -> Option<Action> {
+    let r = match_rule(rules, exe, Some(port), Some(dir), host)?;
     if r.stale() {
         return None;
     }
@@ -910,7 +919,13 @@ fn queue_loop(
 
         // a per-port override (Flow pane) wins over the app's whole-app
         // default (Apps/Conflicts panes) when both exist for this app
-        let matched = ruled(&app_rules.lock().unwrap(), &exe, rule_port, dir);
+        let matched = ruled(
+            &app_rules.lock().unwrap(),
+            &exe,
+            rule_port,
+            dir,
+            peer_name.as_deref(),
+        );
 
         let verdict = match matched {
             Some(action) => {
@@ -969,10 +984,16 @@ fn queue_loop(
                         // y/n, which cascades a Decide to us) already gives this
                         // exact verdict, in which case adding a redundant
                         // per-port override would just clutter the app's rules
-                        if ruled(&app_rules.lock().unwrap(), &exe, rule_port, dir) != Some(verdict)
+                        if ruled(
+                            &app_rules.lock().unwrap(),
+                            &exe,
+                            rule_port,
+                            dir,
+                            peer_name.as_deref(),
+                        ) != Some(verdict)
                         {
                             let rules =
-                                upsert_rule(&exe, Some(rule_port), Some(dir), verdict, None);
+                                upsert_rule(&exe, Some(rule_port), Some(dir), verdict, None, None);
                             *app_rules.lock().unwrap() = rules.clone();
                             let _ = event_tx.send(ServerMsg::AppRules(rules));
                         }
@@ -1214,8 +1235,9 @@ fn handle_client_msg(
             direction,
             action,
             expires,
+            host,
         } => {
-            let rules = upsert_rule(&exe, port, direction, action, expires);
+            let rules = upsert_rule(&exe, port, direction, action, expires, host);
             *app_rules.lock().unwrap() = rules.clone();
             Some(rules)
         }
