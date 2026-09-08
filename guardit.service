@@ -1,0 +1,17 @@
+[Unit]
+Description=guardit — per-app firewall daemon
+After=network-pre.target
+
+[Service]
+Type=simple
+# re-apply the ruleset on every start so the daemon's queue rules are
+# always in the kernel before it tries to bind them — makes `systemctl
+# restart guardit` a complete, idempotent "reload everything"
+ExecStartPre=/usr/local/bin/guardit apply
+ExecStart=/usr/local/bin/guardit daemon
+Restart=always
+RestartSec=1
+User=root
+
+[Install]
+WantedBy=multi-user.target
