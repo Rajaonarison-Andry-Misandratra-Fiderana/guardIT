@@ -1063,11 +1063,17 @@ fn ipc_thread(
     event_rx: Receiver<ServerMsg>,
     notify: bool,
 ) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // root only: anyone who can connect can allow any app's traffic. The
+    // socket is created 0777 & ~umask, so clamp it (and the directory)
+    // explicitly rather than trusting whatever umask we were started with.
     if let Some(dir) = ipc::socket_path().parent() {
         fs::create_dir_all(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     let _ = fs::remove_file(ipc::socket_path()); // stale socket from a previous crashed run
     let listener = UnixListener::bind(ipc::socket_path())?;
+    fs::set_permissions(ipc::socket_path(), fs::Permissions::from_mode(0o600))?;
     eprintln!(
         "guardit daemon: listening on {}",
         ipc::socket_path().display()

@@ -221,6 +221,11 @@ fn main() {
             .unwrap_or_else(|e| fail(&format!("read {file}: {e}")));
             let new: Config =
                 toml::from_str(&text).unwrap_or_else(|e| fail(&format!("bad config: {e}")));
+            for r in &new.rule {
+                if let Err(e) = config::validate_src(&r.src) {
+                    fail(&format!("bad config: rule #{}: {e}", r.id));
+                }
+            }
             let n_rules = new.rule.len();
             let n_app = new.app_rule.len();
             Config::update(|cfg| *cfg = new);
@@ -408,6 +413,9 @@ fn print_app_list(cfg: &Config) {
 }
 
 fn add_rule(cfg: &mut Config, action: RuleAction, args: RuleArgs) {
+    if let Err(e) = config::validate_src(&args.src) {
+        fail(&e);
+    }
     let rule = Rule {
         id: cfg.next_id(),
         action,

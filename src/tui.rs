@@ -1,3 +1,4 @@
+use crate::config;
 use crate::config::now_ts;
 use crate::config::{Action, AppRule, Config, Direction, Proto, Rule, config_path, match_rule};
 use crate::daemon;
@@ -545,6 +546,7 @@ fn parse_spec(line: &str) -> Result<Rule, String> {
         _ => return Err("proto must be tcp|udp|any".into()),
     };
     let src = parts[2].to_string();
+    config::validate_src(&src)?;
     let port = if parts[3] == "-" {
         None
     } else {

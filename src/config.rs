@@ -23,10 +23,35 @@ pub struct Rule {
     pub id: u32,
     pub action: Action,
     pub proto: Proto,
-    /// "any" or an ip/cidr
+    /// "any" or an ip/cidr — see `validate_src`
     pub src: String,
     pub port: Option<u16>,
     pub enabled: bool,
+}
+
+/// `src` goes verbatim into the nft ruleset (ruleset::rule_line), so it
+/// must be exactly "any", an ip, or ip/prefix — nothing nft could read as
+/// more than one address expression. Every way a Rule gets in (CLI, TUI,
+/// import) checks this.
+pub fn validate_src(src: &str) -> Result<(), String> {
+    if src == "any" {
+        return Ok(());
+    }
+    let (ip, prefix) = match src.split_once('/') {
+        Some((ip, p)) => (ip, Some(p)),
+        None => (src, None),
+    };
+    let ip: std::net::IpAddr = ip
+        .parse()
+        .map_err(|_| format!("bad source {src:?}: want any, an ip, or ip/prefix"))?;
+    if let Some(p) = prefix {
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        match p.parse::<u8>() {
+            Ok(n) if n <= max => {}
+            _ => return Err(format!("bad prefix in {src:?}: want /0../{max}")),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +316,31 @@ mod tests {
             None,
             "denying one port must not deny the app"
         );
+    }
+
+    #[test]
+    fn src_must_be_any_ip_or_cidr() {
+        for ok in [
+            "any",
+            "10.0.0.1",
+            "192.168.1.0/24",
+            "fd00::1",
+            "fd00::/64",
+            "0.0.0.0/0",
+        ] {
+            assert!(validate_src(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "lan",
+            "10.0.0.1/33",
+            "fd00::/129",
+            "1.2.3.4 accept",
+            "1.2.3",
+            "10.0.0.0/",
+        ] {
+            assert!(validate_src(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
