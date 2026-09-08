@@ -111,18 +111,21 @@ impl Default for Config {
     }
 }
 
+/// fixed system-wide path: the daemon runs as root under systemd/cron and the
+/// TUI/CLI run under sudo, so a `$HOME`-relative path would silently point
+/// each of them at a different file depending on how sudo sets HOME
 pub fn config_path() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME not set");
-    PathBuf::from(home).join(".config/guardit/rules.toml")
+    PathBuf::from("/etc/guardit/rules.toml")
 }
 
 impl Config {
     pub fn load() -> Self {
         let path = config_path();
         match fs::read_to_string(&path) {
-            Ok(s) => {
-                toml::from_str(&s).unwrap_or_else(|e| panic!("bad config {}: {e}", path.display()))
-            }
+            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
+                eprintln!("bad config {}: {e}", path.display());
+                std::process::exit(1);
+            }),
             Err(_) => Config::default(),
         }
     }
