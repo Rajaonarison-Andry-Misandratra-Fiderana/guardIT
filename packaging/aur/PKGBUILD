@@ -1,12 +1,13 @@
 # Maintainer: Fiderana Rajaonarison <mirovarajaonarison@gmail.com>
 pkgname=guardit
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="nftables-backed firewall with per-app control and a live TUI dashboard"
 arch=('x86_64')
 url="https://github.com/Rajaonarison-Andry-Misandratra-Fiderana/guardIT"
 license=('MIT')
 depends=('nftables' 'gcc-libs' 'glibc')
+optdepends=('libnotify: desktop notification when a new app asks')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
@@ -37,4 +38,9 @@ package() {
     install -Dm644 guardit.service "$pkgdir/usr/lib/systemd/system/guardit.service"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    local bin=target/release/guardit
+    "$bin" man | install -Dm644 /dev/stdin "$pkgdir/usr/share/man/man1/guardit.1"
+    "$bin" completions bash | install -Dm644 /dev/stdin "$pkgdir/usr/share/bash-completion/completions/guardit"
+    "$bin" completions fish | install -Dm644 /dev/stdin "$pkgdir/usr/share/fish/vendor_completions.d/guardit.fish"
+    "$bin" completions zsh | install -Dm644 /dev/stdin "$pkgdir/usr/share/zsh/site-functions/_guardit"
 }

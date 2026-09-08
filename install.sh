@@ -26,6 +26,17 @@ sudo install -Dm755 "$SRC/guardit-supervise.sh" /usr/local/bin/guardit-supervise
 
 echo "installed: $(command -v guardit)"
 
+# man page and shell completions, wherever the shell's completion dir exists
+guardit man | sudo install -Dm644 /dev/stdin /usr/share/man/man1/guardit.1
+for pair in "bash:/usr/share/bash-completion/completions/guardit" \
+            "fish:/usr/share/fish/vendor_completions.d/guardit.fish" \
+            "zsh:/usr/share/zsh/site-functions/_guardit"; do
+    shell="${pair%%:*}"; dest="${pair#*:}"
+    if [ -d "$(dirname "$dest")" ]; then
+        guardit completions "$shell" | sudo install -Dm644 /dev/stdin "$dest"
+    fi
+done
+
 # config moved from root's $HOME to a fixed /etc path — carry an existing one over once
 if [ ! -e /etc/guardit ] && sudo test -d /root/.config/guardit; then
     sudo mv /root/.config/guardit /etc/guardit

@@ -1,6 +1,6 @@
 pkgbase = guardit
 	pkgdesc = nftables-backed firewall with per-app control and a live TUI dashboard
-	pkgver = 0.1.0
+	pkgver = 0.2.0
 	pkgrel = 1
 	url = https://github.com/Rajaonarison-Andry-Misandratra-Fiderana/guardIT
 	arch = x86_64
@@ -9,7 +9,8 @@ pkgbase = guardit
 	depends = nftables
 	depends = gcc-libs
 	depends = glibc
-	source = guardit-0.1.0.tar.gz::https://github.com/Rajaonarison-Andry-Misandratra-Fiderana/guardIT/archive/refs/tags/v0.1.0.tar.gz
+	optdepends = libnotify: desktop notification when a new app asks
+	source = guardit-0.2.0.tar.gz::https://github.com/Rajaonarison-Andry-Misandratra-Fiderana/guardIT/archive/refs/tags/v0.2.0.tar.gz
 	sha256sums = SKIP
 
 pkgname = guardit

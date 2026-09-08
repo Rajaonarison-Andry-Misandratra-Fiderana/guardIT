@@ -65,6 +65,8 @@ you can use CLI or TUI whatever you like
 
 ## CLI
 
+IP/port rules (nftables level):
+
 ```
 guardit allow --proto tcp --src 192.168.1.0/24 --port 22   # add an IP/port rule
 guardit deny  --port 80                                     # explicit block
@@ -72,10 +74,42 @@ guardit rm <id>                                             # remove a rule
 guardit list                                                # list configured rules
 guardit apply [--dry-run]                                   # load the ruleset into the kernel
 guardit status                                              # show what's loaded
+```
+
+Per-app rules (what the daemon enforces) — the same things the TUI does, headless:
+
+```
+guardit app list                                            # every per-app rule
+guardit app allow /usr/bin/curl                             # whole app, both directions
+guardit app deny  /usr/bin/curl --port 80 --dir out         # one port, one direction
+guardit app allow /usr/bin/ssh --for 1h                     # expires (30s, 10m, 1h30m, 2d)
+guardit app rm    /usr/bin/curl                             # forget the app entirely
+guardit pending                                             # connections waiting for a decision
+guardit answer <id> allow|deny                              # decide one (remembered as a rule)
+```
+
+`<exe>` is the path shown by `app list` — or `flatpak:<app-id>` / `snap:<name>.<app>`
+for sandboxed apps. Rules made through the daemon remember the binary's size+mtime; when
+the binary changes (update, replacement) the app is asked again instead of inheriting the
+rule.
+
+Everything else:
+
+```
+guardit export > backup.toml                                # whole config as TOML
+guardit import backup.toml                                  # replace it (daemon reloads)
 guardit log-app [--n 100] [--exe <substr>]                  # full per-app audit trail
 guardit daemon [--debug]                                    # per-app enforcement (needs root)
+guardit completions fish|bash|zsh                           # shell completion script
+guardit man                                                 # man page (roff)
 guardit tui   (or just guardit)                             # the dashboard (default with no args)
 ```
+
+When a new app asks and the TUI isn't open, the daemon pops a desktop notification
+(`notify-send`, every logged-in session) naming the app, the peer and the `guardit answer`
+command. `notify = false` in `/etc/guardit/rules.toml` turns it off. Peers show as
+`github.com (140.82.121.4)` when the daemon saw the DNS answer (plain DNS only — DoH/DoT
+stay invisible). A hand edit of `rules.toml` is picked up within 5 seconds.
 
 ## The TUI
 
@@ -88,7 +122,7 @@ a thick border:
 | **Application blocking** | one row per app, its whole-app default, and how many per-port overrides it has | `j/k` select · `Enter` jump to its Flow · `l` this app's log · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely |
 | **Listening ports** | every LISTEN/bound local socket, who owns it, and real bind conflicts (rare — the kernel already prevents most) | `j/k` select · `l` log · `y`/`n` allow/deny **this port only** |
 | **Top apps** | bar chart of the apps with the most connection attempts, over the whole audit log (reset by `f` flush) | informational |
-| **Network flow** | live connection history for whichever app is selected in Application blocking | `j/k` select · `y`/`n` allow/deny **this port only** (remembered as a per-port rule) |
+| **Network flow** | live connection history for whichever app is selected in Application blocking | `j/k` select · `y`/`n` allow/deny **this port and direction only** (remembered as a per-port rule) |
 
 Other keys: `L` opens the full audit log as its own tab (`j/k` move, `f` flush with confirm, `q`/`L` back), `t` cycles color theme (remembered across restarts), `q` quits.
 
