@@ -4,6 +4,9 @@
 
 ## What it GuardIT?
 
+<img width="1920" height="1080" alt="Recording_2026-09-08_17-03-32" src="https://github.com/user-attachments/assets/bd5914ff-b687-46a7-bf1d-d8d45340b53f" />
+
+
 GuardIt est un parefeu TUI pour linux qui utilise directement nfttables.
 
 
@@ -14,7 +17,7 @@ GuardIt est un parefeu TUI pour linux qui utilise directement nfttables.
   by application — either the whole app, or one specific port at a time.
 
 Default policy is **deny-first and fail-closed**: Donc chaque nouvelle app qui veulent se connecter doivent d abord etre accepté avant d etre pouvoir utilisé
-## How to nstall
+## How to install
 
 ```
 git clone https://github.com/Rajaonarison-Andry-Misandratra-Fiderana/guardIT.git
