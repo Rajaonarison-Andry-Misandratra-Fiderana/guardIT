@@ -1791,7 +1791,7 @@ fn draw_top_apps(f: &mut Frame, app: &App, area: Rect) {
         .map(|(exe, count)| {
             Bar::default()
                 .value(*count)
-                .label(format!("{} ({count})", basename(exe)).into())
+                .label(Line::from(format!("{} ({count})", basename(exe))))
                 .text_value(String::new())
                 .style(Style::new().fg(theme.chart))
         })

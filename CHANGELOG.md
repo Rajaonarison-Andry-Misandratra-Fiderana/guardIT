@@ -9,6 +9,10 @@
   rules the selected row's hostname instead of its port. Best-effort by construction: it
   rides the passive DNS tap, so a peer with no name the daemon saw resolved never matches
   a host rule (it falls through), and DoH/DoT stay invisible.
+- **Dependencies**: ratatui 0.29 → 0.30 and crossterm 0.28 → 0.29 (one crossterm in the
+  tree again, not two). Clears the three `cargo audit` warnings that came in through
+  ratatui's `paste` and `lru`. ratatui's default features are off — `widget-calendar`
+  pulled in `time` and `uuid` for a widget this app never draws.
 - **Filter the Application blocking pane** with `/`: narrows the list live as you type,
   `Enter` keeps the filter, `Esc` clears it. Flow follows the selection as before, so
   filtering down to one app and hitting `Enter` is now the fast path on a busy machine.
