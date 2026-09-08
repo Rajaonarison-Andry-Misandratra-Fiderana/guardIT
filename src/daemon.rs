@@ -1,4 +1,4 @@
-use crate::config::{Action, AppRule, Config, Direction, config_path, match_rule};
+use crate::config::{Action, AppRule, Config, Direction, config_path, match_rule, now_ts};
 use crate::ipc::{self, ClientMsg, FlowStatus, FlowWire, ServerMsg};
 use crate::ruleset::{QUEUE_IN, QUEUE_OUT};
 use nfq::{Queue, Verdict};
@@ -10,14 +10,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-pub fn now_ts() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+use std::time::{Duration, Instant};
 
 type AppRules = Arc<Mutex<Vec<AppRule>>>;
 /// one Sender per connected TUI — `broadcast` fans a message out to all of
@@ -497,6 +490,7 @@ fn upsert_rule(
     port: Option<u16>,
     direction: Option<Direction>,
     action: Action,
+    expires: Option<u64>,
 ) -> Vec<AppRule> {
     Config::update(|cfg| {
         match port {
@@ -513,9 +507,23 @@ fn upsert_rule(
             direction,
             action,
             enabled: true,
+            expires,
         });
     })
     .app_rule
+}
+
+/// drops every expired rule from the file; `Some(rules)` when anything
+/// changed. match_rule already ignores expired rules, this is the cleanup
+/// that makes them disappear from the file and the TUI too.
+fn sweep_expired(app_rules: &AppRules) -> Option<Vec<AppRule>> {
+    let now = now_ts();
+    if !app_rules.lock().unwrap().iter().any(|r| r.expired(now)) {
+        return None;
+    }
+    let fresh = Config::update(|cfg| cfg.app_rule.retain(|r| !r.expired(now)));
+    *app_rules.lock().unwrap() = fresh.app_rule.clone();
+    Some(fresh.app_rule)
 }
 
 fn to_verdict(action: Action) -> Verdict {
@@ -574,9 +582,13 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
     if !debug {
         let scan_listening = listening.clone();
         let scan_event_tx = event_tx.clone();
+        let scan_app_rules = app_rules.clone();
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(LISTEN_SCAN_INTERVAL);
+                if let Some(rules) = sweep_expired(&scan_app_rules) {
+                    let _ = scan_event_tx.send(ServerMsg::AppRules(rules));
+                }
                 let fresh = list_listening();
                 let changed = {
                     let mut cur = scan_listening.lock().unwrap();
@@ -719,7 +731,8 @@ fn queue_loop(
                             .map(|r| r.action)
                             != Some(verdict)
                         {
-                            let rules = upsert_rule(&exe, Some(rule_port), Some(dir), verdict);
+                            let rules =
+                                upsert_rule(&exe, Some(rule_port), Some(dir), verdict, None);
                             *app_rules.lock().unwrap() = rules.clone();
                             let _ = event_tx.send(ServerMsg::AppRules(rules));
                         }
@@ -887,8 +900,9 @@ fn handle_client_msg(
             port,
             direction,
             action,
+            expires,
         } => {
-            let rules = upsert_rule(&exe, port, direction, action);
+            let rules = upsert_rule(&exe, port, direction, action, expires);
             *app_rules.lock().unwrap() = rules.clone();
             Some(rules)
         }

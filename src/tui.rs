@@ -1,5 +1,7 @@
+use crate::config::now_ts;
 use crate::config::{Action, AppRule, Config, Direction, Proto, Rule, config_path, match_rule};
 use crate::daemon;
+use crate::daemon::ago;
 use crate::ipc::{self, ClientMsg, FlowStatus, FlowWire, ServerMsg};
 use crate::ruleset;
 use crossterm::ExecutableCommand;
@@ -1078,6 +1080,7 @@ fn apps_set_verdict(app: &mut App, action: Action) {
         port: None,
         direction: None,
         action,
+        expires: None,
     });
     cascade_flow_rows(app, action, |e| e.exe == exe);
 }
@@ -1153,6 +1156,7 @@ fn flow_decide(app: &mut App, verdict: Action) {
             port,
             direction: Some(direction),
             action: verdict,
+            expires: None,
         });
     }
     // the rule covers this app's OTHER rows on the SAME port and direction
@@ -1202,6 +1206,7 @@ fn conflicts_decide(app: &mut App, action: Action) {
         port,
         direction: Some(Direction::In),
         action,
+        expires: None,
     });
     cascade_flow_rows(app, action, |e| {
         e.exe == exe && e.port == port && e.direction == Direction::In
@@ -1417,12 +1422,12 @@ fn draw_throughput_spark(
 /// drill-down view genuinely needs the room these 7 columns take
 fn draw_app_log(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = THEMES[app.theme_idx];
-    let now = daemon::now_ts();
+    let now = now_ts();
     let rows: Vec<Row> = app
         .app_log
         .iter()
         .map(|e| {
-            let ago = daemon::ago(now.saturating_sub(e.ts));
+            let ago = ago(now.saturating_sub(e.ts));
             let (status, color) = match e.status {
                 FlowStatus::Allowed => ("allow", theme.allow),
                 FlowStatus::Denied => ("deny", theme.deny),
@@ -1584,6 +1589,9 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
             };
             if disabled {
                 status.push_str(" (off)");
+            }
+            if let Some(t) = row.rule.as_ref().and_then(|r| r.expires) {
+                status.push_str(&format!(" ⏱{}", ago(t.saturating_sub(now_ts()))));
             }
             // exe identity is just a path (see config::AppRule docs) — an
             // app that got reinstalled/updated to a different binary path

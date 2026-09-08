@@ -98,6 +98,9 @@ pub enum ClientMsg {
         #[serde(default)]
         direction: Option<Direction>,
         action: Action,
+        /// unix epoch seconds; None = permanent
+        #[serde(default)]
+        expires: Option<u64>,
     },
     ToggleAppRule {
         id: u32,

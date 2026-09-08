@@ -69,6 +69,23 @@ pub struct AppRule {
     pub direction: Option<Direction>,
     pub action: Action,
     pub enabled: bool,
+    /// unix epoch seconds after which this rule no longer matches (`guardit
+    /// app allow --for 1h`); the daemon sweeps expired rules out of the file
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<u64>,
+}
+
+impl AppRule {
+    pub fn expired(&self, now: u64) -> bool {
+        self.expires.is_some_and(|t| t <= now)
+    }
+}
+
+pub fn now_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// the one matching rule for (exe, port, direction): the most specific rule
@@ -81,9 +98,10 @@ pub fn match_rule<'a>(
     port: Option<u16>,
     dir: Option<Direction>,
 ) -> Option<&'a AppRule> {
+    let now = now_ts();
     rules
         .iter()
-        .filter(|r| r.enabled && r.exe == exe)
+        .filter(|r| r.enabled && r.exe == exe && !r.expired(now))
         .filter(|r| r.port.is_none() || r.port == port)
         .filter(|r| r.direction.is_none() || r.direction == dir)
         .max_by_key(|r| (r.port.is_some(), r.direction.is_some()))
@@ -198,6 +216,7 @@ mod tests {
             direction: None,
             action,
             enabled: true,
+            expires: None,
         }
     }
 
@@ -230,6 +249,21 @@ mod tests {
             act(match_rule(&rules, "/usr/bin/a", Some(53), None)),
             None,
             "denying one port must not deny the app"
+        );
+    }
+
+    #[test]
+    fn expired_rule_does_not_match() {
+        let mut r = rule("/usr/bin/a", None, Action::Allow);
+        r.expires = Some(now_ts() - 1);
+        assert_eq!(
+            act(match_rule(&[r.clone()], "/usr/bin/a", Some(80), None)),
+            None
+        );
+        r.expires = Some(now_ts() + 60);
+        assert_eq!(
+            act(match_rule(&[r], "/usr/bin/a", Some(80), None)),
+            Some(Action::Allow)
         );
     }
 
