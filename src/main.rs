@@ -1,7 +1,6 @@
 mod config;
 mod daemon;
 mod ipc;
-mod log;
 mod ruleset;
 mod tui;
 
@@ -54,11 +53,6 @@ enum Cmd {
     Status,
     /// interactive rule browser
     Tui,
-    /// show recent connection attempts seen by the kernel (needs `apply`d ruleset + dmesg access)
-    Log {
-        #[arg(long, default_value_t = 20)]
-        n: usize,
-    },
     /// bind NFQUEUE and enforce per-app rules (needs root; runs in the foreground,
     /// no daemonization — wrap it yourself if you want it as a service)
     Daemon {
@@ -114,28 +108,6 @@ fn main() {
         }
         Cmd::Status => println!("{}", ruleset::status()),
         Cmd::Tui => tui::run(cfg),
-        Cmd::Log { n } => match log::recent(n) {
-            Ok(entries) if entries.is_empty() => println!("no connection attempts logged yet (did you `guardit apply`?)"),
-            Ok(entries) => {
-                println!("{:<4}{:<20}{:<6}{:<6}", "DIR", "SRC", "PROTO", "PORT");
-                for e in entries {
-                    println!(
-                        "{:<4}{:<20}{:<6}{:<6}",
-                        match e.dir {
-                            log::Dir::In => "in",
-                            log::Dir::Out => "out",
-                        },
-                        e.src,
-                        e.proto,
-                        e.dport.map(|p| p.to_string()).unwrap_or_default()
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        },
         Cmd::Daemon { debug } => {
             if !ruleset::is_root() {
                 eprintln!("guardit daemon needs root (CAP_NET_ADMIN) — run with sudo");
