@@ -1,4 +1,4 @@
-use crate::config::{config_path, match_rule, Action, AppRule, Config, Direction};
+use crate::config::{Action, AppRule, Config, Direction, config_path, match_rule};
 use crate::ipc::{self, ClientMsg, FlowStatus, FlowWire, ServerMsg};
 use crate::ruleset::{QUEUE_IN, QUEUE_OUT};
 use nfq::{Queue, Verdict};
@@ -13,7 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub fn now_ts() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 type AppRules = Arc<Mutex<Vec<AppRule>>>;
@@ -33,7 +36,6 @@ type ListeningState = Arc<Mutex<Vec<ipc::ListenEntry>>>;
 
 const HISTORY_CAP: usize = 300;
 const LISTEN_SCAN_INTERVAL: Duration = Duration::from_secs(5);
-
 
 fn push_history(history: &History, entry: FlowWire) {
     let mut h = history.lock().unwrap();
@@ -64,17 +66,23 @@ pub fn history_log_path() -> std::path::PathBuf {
 
 fn append_history_line(entry: &FlowWire) {
     use std::io::Write as _;
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(history_log_path())
-        && let Ok(line) = serde_json::to_string(entry) {
-            let _ = writeln!(f, "{line}");
-        }
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_log_path())
+        && let Ok(line) = serde_json::to_string(entry)
+    {
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 /// the last `limit` entries of history.jsonl, oldest first, optionally only
 /// those whose exe contains `filter` — one reader shared by the daemon's
 /// startup reload, `guardit log-app`, and the TUI's log tab
 pub fn read_history(limit: usize, filter: Option<&str>) -> Vec<FlowWire> {
-    let Ok(text) = fs::read_to_string(history_log_path()) else { return Vec::new() };
+    let Ok(text) = fs::read_to_string(history_log_path()) else {
+        return Vec::new();
+    };
     let mut entries: Vec<FlowWire> = text
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -100,11 +108,17 @@ pub fn ago(secs: u64) -> String {
 pub fn print_log_app(exe_filter: Option<&str>, n: usize) {
     let entries = read_history(n, exe_filter);
     if entries.is_empty() {
-        println!("no matching connection attempts logged ({})", history_log_path().display());
+        println!(
+            "no matching connection attempts logged ({})",
+            history_log_path().display()
+        );
         return;
     }
     let now = now_ts();
-    println!("{:<8}{:<6}{:<20}{:<6}{:<6}{:<8}EXE", "AGO", "DIR", "PEER", "PROTO", "PORT", "STATUS");
+    println!(
+        "{:<8}{:<6}{:<20}{:<6}{:<6}{:<8}EXE",
+        "AGO", "DIR", "PEER", "PROTO", "PORT", "STATUS"
+    );
     for e in entries {
         let status = match e.status {
             FlowStatus::Allowed => "allow",
@@ -136,9 +150,10 @@ fn should_log_matched(throttle: &Throttle, key: (String, u8, u16, bool)) -> bool
     let mut t = throttle.lock().unwrap();
     let now = Instant::now();
     if let Some(&last) = t.get(&key)
-        && now.duration_since(last) < HISTORY_THROTTLE {
-            return false;
-        }
+        && now.duration_since(last) < HISTORY_THROTTLE
+    {
+        return false;
+    }
     t.insert(key, now);
     true
 }
@@ -178,8 +193,18 @@ fn parse_ipv4(payload: &[u8]) -> Option<PktInfo> {
         proto,
         src_port: u16::from_be_bytes([l4[0], l4[1]]),
         dst_port: u16::from_be_bytes([l4[2], l4[3]]),
-        src_ip: IpAddr::V4(Ipv4Addr::new(payload[12], payload[13], payload[14], payload[15])),
-        dst_ip: IpAddr::V4(Ipv4Addr::new(payload[16], payload[17], payload[18], payload[19])),
+        src_ip: IpAddr::V4(Ipv4Addr::new(
+            payload[12],
+            payload[13],
+            payload[14],
+            payload[15],
+        )),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(
+            payload[16],
+            payload[17],
+            payload[18],
+            payload[19],
+        )),
     })
 }
 
@@ -239,7 +264,12 @@ fn proc_net_rows(text: &str) -> impl Iterator<Item = ProcNetRow<'_>> {
         let (ip_hex, port_hex) = cols[1].split_once(':')?;
         let port = u16::from_str_radix(port_hex, 16).ok()?;
         let inode = cols[9].parse::<u64>().ok().filter(|&i| i != 0)?;
-        Some(ProcNetRow { ip_hex, port, state: cols[3], inode })
+        Some(ProcNetRow {
+            ip_hex,
+            port,
+            state: cols[3],
+            inode,
+        })
     })
 }
 
@@ -252,7 +282,9 @@ fn find_inode(proto: u8, local_port: u16) -> Option<u64> {
     };
     files.iter().find_map(|path| {
         let text = fs::read_to_string(path).ok()?;
-        proc_net_rows(&text).find(|r| r.port == local_port).map(|r| r.inode)
+        proc_net_rows(&text)
+            .find(|r| r.port == local_port)
+            .map(|r| r.inode)
     })
 }
 
@@ -268,8 +300,14 @@ fn find_pid_by_inode(inode: u64) -> Option<u32> {
 /// does `pid` still hold an fd pointing at socket `inode` right now?
 fn pid_owns_inode(pid: u32, inode: u64) -> bool {
     let target = format!("socket:[{inode}]");
-    let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else { return false };
-    fds.flatten().any(|fd| fs::read_link(fd.path()).map(|l| l.to_string_lossy() == target).unwrap_or(false))
+    let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.flatten().any(|fd| {
+        fs::read_link(fd.path())
+            .map(|l| l.to_string_lossy() == target)
+            .unwrap_or(false)
+    })
 }
 
 /// port -> inode -> pid -> exe, the way any /proc-based tool (ss, lsof, ...)
@@ -286,7 +324,9 @@ fn parse_hex_ipv4(hex: &str) -> Option<Ipv4Addr> {
     if hex.len() != 8 {
         return None;
     }
-    let b: Vec<u8> = (0..4).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0)).collect();
+    let b: Vec<u8> = (0..4)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0))
+        .collect();
     Some(Ipv4Addr::new(b[3], b[2], b[1], b[0]))
 }
 
@@ -300,7 +340,8 @@ fn parse_hex_ipv6(hex: &str) -> Option<Ipv6Addr> {
     for word in 0..4 {
         let chunk = &hex[word * 8..word * 8 + 8];
         for i in 0..4 {
-            bytes[word * 4 + i] = u8::from_str_radix(&chunk[(3 - i) * 2..(3 - i) * 2 + 2], 16).unwrap_or(0);
+            bytes[word * 4 + i] =
+                u8::from_str_radix(&chunk[(3 - i) * 2..(3 - i) * 2 + 2], 16).unwrap_or(0);
         }
     }
     Some(Ipv6Addr::from(bytes))
@@ -320,14 +361,29 @@ fn list_listening() -> Vec<ipc::ListenEntry> {
     ];
     let mut out = Vec::new();
     for (path, proto_name, want_state) in SOURCES {
-        let Ok(text) = fs::read_to_string(path) else { continue };
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
         let is_v6 = path.ends_with('6');
         for row in proc_net_rows(&text).filter(|r| r.state == want_state) {
-            let addr: Option<IpAddr> = if is_v6 { parse_hex_ipv6(row.ip_hex).map(IpAddr::V6) } else { parse_hex_ipv4(row.ip_hex).map(IpAddr::V4) };
+            let addr: Option<IpAddr> = if is_v6 {
+                parse_hex_ipv6(row.ip_hex).map(IpAddr::V6)
+            } else {
+                parse_hex_ipv4(row.ip_hex).map(IpAddr::V4)
+            };
             let Some(addr) = addr else { continue };
-            let Some(pid) = find_pid_by_inode(row.inode) else { continue };
-            let Some(exe) = fs::read_link(format!("/proc/{pid}/exe")).ok() else { continue };
-            out.push(ipc::ListenEntry { proto: proto_name.to_string(), addr: addr.to_string(), port: row.port, exe: exe.to_string_lossy().into_owned() });
+            let Some(pid) = find_pid_by_inode(row.inode) else {
+                continue;
+            };
+            let Some(exe) = fs::read_link(format!("/proc/{pid}/exe")).ok() else {
+                continue;
+            };
+            out.push(ipc::ListenEntry {
+                proto: proto_name.to_string(),
+                addr: addr.to_string(),
+                port: row.port,
+                exe: exe.to_string_lossy().into_owned(),
+            });
         }
     }
     out
@@ -354,7 +410,11 @@ pub fn find_conflicts(entries: &[ipc::ListenEntry]) -> Vec<(ipc::ListenEntry, ip
     for i in 0..entries.len() {
         for j in (i + 1)..entries.len() {
             let (a, b) = (&entries[i], &entries[j]);
-            if a.proto == b.proto && a.port == b.port && a.exe != b.exe && addrs_overlap(&a.addr, &b.addr) {
+            if a.proto == b.proto
+                && a.port == b.port
+                && a.exe != b.exe
+                && addrs_overlap(&a.addr, &b.addr)
+            {
                 out.push((a.clone(), b.clone()));
             }
         }
@@ -381,10 +441,18 @@ fn upsert_rule(exe: &str, port: Option<u16>, action: Action) -> Vec<AppRule> {
     Config::update(|cfg| {
         match port {
             None => cfg.app_rule.retain(|r| r.exe != exe),
-            Some(p) => cfg.app_rule.retain(|r| !(r.exe == exe && r.port == Some(p))),
+            Some(p) => cfg
+                .app_rule
+                .retain(|r| !(r.exe == exe && r.port == Some(p))),
         }
         let id = cfg.next_app_id();
-        cfg.app_rule.push(AppRule { id, exe: exe.to_string(), port, action, enabled: true });
+        cfg.app_rule.push(AppRule {
+            id,
+            exe: exe.to_string(),
+            port,
+            action,
+            enabled: true,
+        });
     })
     .app_rule
 }
@@ -397,7 +465,14 @@ fn to_verdict(action: Action) -> Verdict {
 }
 
 pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
-    eprintln!("guardit daemon: starting{}", if debug { " (--debug, always-accept)" } else { "" });
+    eprintln!(
+        "guardit daemon: starting{}",
+        if debug {
+            " (--debug, always-accept)"
+        } else {
+            ""
+        }
+    );
     let app_rules: AppRules = Arc::new(Mutex::new(cfg.app_rule.clone()));
     let history: History = Arc::new(Mutex::new(read_history(HISTORY_CAP, None)));
     let listening: ListeningState = Arc::new(Mutex::new(list_listening()));
@@ -438,17 +513,19 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
     if !debug {
         let scan_listening = listening.clone();
         let scan_event_tx = event_tx.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(LISTEN_SCAN_INTERVAL);
-            let fresh = list_listening();
-            let changed = {
-                let mut cur = scan_listening.lock().unwrap();
-                let changed = *cur != fresh;
-                *cur = fresh.clone();
-                changed
-            };
-            if changed {
-                let _ = scan_event_tx.send(ServerMsg::Listening(fresh));
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(LISTEN_SCAN_INTERVAL);
+                let fresh = list_listening();
+                let changed = {
+                    let mut cur = scan_listening.lock().unwrap();
+                    let changed = *cur != fresh;
+                    *cur = fresh.clone();
+                    changed
+                };
+                if changed {
+                    let _ = scan_event_tx.send(ServerMsg::Listening(fresh));
+                }
             }
         });
         ipc_thread(app_rules, history, listening, pending_registry, event_rx)?;
@@ -576,7 +653,9 @@ fn queue_loop(
                         // y/n, which cascades a Decide to us) already gives this
                         // exact verdict, in which case adding a redundant
                         // per-port override would just clutter the app's rules
-                        if match_rule(&app_rules.lock().unwrap(), &exe, Some(rule_port)) != Some(verdict) {
+                        if match_rule(&app_rules.lock().unwrap(), &exe, Some(rule_port))
+                            != Some(verdict)
+                        {
                             let rules = upsert_rule(&exe, Some(rule_port), verdict);
                             *app_rules.lock().unwrap() = rules.clone();
                             let _ = event_tx.send(ServerMsg::AppRules(rules));
@@ -600,16 +679,28 @@ fn queue_loop(
 }
 
 fn broadcast(subscribers: &Subscribers, msg: ServerMsg) {
-    subscribers.lock().unwrap().retain(|tx| tx.send(msg.clone()).is_ok());
+    subscribers
+        .lock()
+        .unwrap()
+        .retain(|tx| tx.send(msg.clone()).is_ok());
 }
 
-fn ipc_thread(app_rules: AppRules, history: History, listening: ListeningState, pending_registry: PendingRegistry, event_rx: Receiver<ServerMsg>) -> std::io::Result<()> {
+fn ipc_thread(
+    app_rules: AppRules,
+    history: History,
+    listening: ListeningState,
+    pending_registry: PendingRegistry,
+    event_rx: Receiver<ServerMsg>,
+) -> std::io::Result<()> {
     if let Some(dir) = ipc::socket_path().parent() {
         fs::create_dir_all(dir)?;
     }
     let _ = fs::remove_file(ipc::socket_path()); // stale socket from a previous crashed run
     let listener = UnixListener::bind(ipc::socket_path())?;
-    eprintln!("guardit daemon: listening on {}", ipc::socket_path().display());
+    eprintln!(
+        "guardit daemon: listening on {}",
+        ipc::socket_path().display()
+    );
 
     let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
 
@@ -629,7 +720,14 @@ fn ipc_thread(app_rules: AppRules, history: History, listening: ListeningState, 
         let subscribers = subscribers.clone();
         std::thread::spawn(move || {
             eprintln!("guardit daemon: tui client connected");
-            handle_client(stream, &app_rules, &history, &listening, &pending_registry, &subscribers);
+            handle_client(
+                stream,
+                &app_rules,
+                &history,
+                &listening,
+                &pending_registry,
+                &subscribers,
+            );
             eprintln!("guardit daemon: tui client disconnected");
         });
     }
@@ -639,7 +737,14 @@ fn ipc_thread(app_rules: AppRules, history: History, listening: ListeningState, 
 /// one thread per connected client. Reads with a short timeout so the same
 /// loop can also drain this client's private ServerMsg channel (fed by
 /// `broadcast`) without needing yet another thread per connection.
-fn handle_client(stream: UnixStream, app_rules: &AppRules, history: &History, listening: &ListeningState, pending_registry: &PendingRegistry, subscribers: &Subscribers) {
+fn handle_client(
+    stream: UnixStream,
+    app_rules: &AppRules,
+    history: &History,
+    listening: &ListeningState,
+    pending_registry: &PendingRegistry,
+    subscribers: &Subscribers,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
@@ -672,7 +777,9 @@ fn handle_client(stream: UnixStream, app_rules: &AppRules, history: &History, li
                 }
             }
             Ok(None) => return, // client disconnected
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => return,
         }
 
@@ -686,7 +793,11 @@ fn handle_client(stream: UnixStream, app_rules: &AppRules, history: &History, li
 
 /// returns the new app_rule list when it changed, so the caller can echo it
 /// straight back to the client that asked for the change
-fn handle_client_msg(msg: ClientMsg, app_rules: &AppRules, pending_registry: &PendingRegistry) -> Option<Vec<AppRule>> {
+fn handle_client_msg(
+    msg: ClientMsg,
+    app_rules: &AppRules,
+    pending_registry: &PendingRegistry,
+) -> Option<Vec<AppRule>> {
     match msg {
         ClientMsg::Decide { req_id, verdict } => {
             if let Some(tx) = pending_registry.lock().unwrap().get(&req_id) {
@@ -724,7 +835,9 @@ mod tests {
     fn parses_ipv4_tcp_header() {
         // version 4, IHL 5 (20 bytes), proto 6 (tcp), then a 20-byte tcp header
         // with src port 51234 (0xC822) and dst port 443 (0x01BB)
-        let mut payload = vec![0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut payload = vec![
+            0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         payload.extend_from_slice(&[0xC8, 0x22, 0x01, 0xBB]);
         payload.extend_from_slice(&[0; 16]);
         let info = parse_packet(&payload).unwrap();
@@ -760,8 +873,14 @@ mod tests {
     #[test]
     fn parses_hex_ipv4_from_proc_net_tcp() {
         // "0100007F" is the classic /proc/net/tcp encoding for 127.0.0.1
-        assert_eq!(parse_hex_ipv4("0100007F").unwrap(), Ipv4Addr::new(127, 0, 0, 1));
-        assert_eq!(parse_hex_ipv4("00000000").unwrap(), Ipv4Addr::new(0, 0, 0, 0));
+        assert_eq!(
+            parse_hex_ipv4("0100007F").unwrap(),
+            Ipv4Addr::new(127, 0, 0, 1)
+        );
+        assert_eq!(
+            parse_hex_ipv4("00000000").unwrap(),
+            Ipv4Addr::new(0, 0, 0, 0)
+        );
         assert!(parse_hex_ipv4("bad").is_none());
     }
 
@@ -775,37 +894,57 @@ mod tests {
     }
 
     fn listen(proto: &str, addr: &str, port: u16, exe: &str) -> ipc::ListenEntry {
-        ipc::ListenEntry { proto: proto.into(), addr: addr.into(), port, exe: exe.into() }
+        ipc::ListenEntry {
+            proto: proto.into(),
+            addr: addr.into(),
+            port,
+            exe: exe.into(),
+        }
     }
 
     #[test]
     fn flags_two_different_apps_on_the_same_wildcard_port() {
-        let entries = vec![listen("tcp", "0.0.0.0", 8080, "/usr/bin/a"), listen("tcp", "0.0.0.0", 8080, "/usr/bin/b")];
+        let entries = vec![
+            listen("tcp", "0.0.0.0", 8080, "/usr/bin/a"),
+            listen("tcp", "0.0.0.0", 8080, "/usr/bin/b"),
+        ];
         assert_eq!(find_conflicts(&entries).len(), 1);
     }
 
     #[test]
     fn wildcard_overlaps_a_specific_address() {
-        let entries = vec![listen("tcp", "0.0.0.0", 8080, "/usr/bin/a"), listen("tcp", "127.0.0.1", 8080, "/usr/bin/b")];
+        let entries = vec![
+            listen("tcp", "0.0.0.0", 8080, "/usr/bin/a"),
+            listen("tcp", "127.0.0.1", 8080, "/usr/bin/b"),
+        ];
         assert_eq!(find_conflicts(&entries).len(), 1);
     }
 
     #[test]
     fn distinct_specific_addresses_do_not_conflict() {
-        let entries = vec![listen("tcp", "127.0.0.1", 8080, "/usr/bin/a"), listen("tcp", "192.168.1.50", 8080, "/usr/bin/b")];
+        let entries = vec![
+            listen("tcp", "127.0.0.1", 8080, "/usr/bin/a"),
+            listen("tcp", "192.168.1.50", 8080, "/usr/bin/b"),
+        ];
         assert!(find_conflicts(&entries).is_empty());
     }
 
     #[test]
     fn same_exe_on_same_port_is_not_a_conflict() {
         // SO_REUSEPORT-style worker sharing — same app, not a collision
-        let entries = vec![listen("tcp", "0.0.0.0", 8080, "/usr/bin/a"), listen("tcp", "0.0.0.0", 8080, "/usr/bin/a")];
+        let entries = vec![
+            listen("tcp", "0.0.0.0", 8080, "/usr/bin/a"),
+            listen("tcp", "0.0.0.0", 8080, "/usr/bin/a"),
+        ];
         assert!(find_conflicts(&entries).is_empty());
     }
 
     #[test]
     fn different_protocols_on_the_same_port_do_not_conflict() {
-        let entries = vec![listen("tcp", "0.0.0.0", 8080, "/usr/bin/a"), listen("udp", "0.0.0.0", 8080, "/usr/bin/b")];
+        let entries = vec![
+            listen("tcp", "0.0.0.0", 8080, "/usr/bin/a"),
+            listen("udp", "0.0.0.0", 8080, "/usr/bin/b"),
+        ];
         assert!(find_conflicts(&entries).is_empty());
     }
 
@@ -817,6 +956,9 @@ mod tests {
             2: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 0 1 0000000000000000 100 0 0 10 0\n";
         let rows: Vec<_> = proc_net_rows(text).collect();
         assert_eq!(rows.len(), 1, "header and inode-0 rows dropped");
-        assert_eq!((rows[0].ip_hex, rows[0].port, rows[0].state, rows[0].inode), ("0100007F", 8080, "0A", 123456));
+        assert_eq!(
+            (rows[0].ip_hex, rows[0].port, rows[0].state, rows[0].inode),
+            ("0100007F", 8080, "0A", 123456)
+        );
     }
 }

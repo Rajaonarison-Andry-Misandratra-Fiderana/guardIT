@@ -120,7 +120,9 @@ impl Config {
     pub fn load() -> Self {
         let path = config_path();
         match fs::read_to_string(&path) {
-            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| panic!("bad config {}: {e}", path.display())),
+            Ok(s) => {
+                toml::from_str(&s).unwrap_or_else(|e| panic!("bad config {}: {e}", path.display()))
+            }
             Err(_) => Config::default(),
         }
     }
@@ -153,7 +155,12 @@ impl Config {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).expect("create config dir");
         }
-        let lock_file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("toml.lock")).expect("open lock file");
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("toml.lock"))
+            .expect("open lock file");
         // released automatically when `lock_file` drops at the end of this fn
         let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
         assert_eq!(rc, 0, "flock failed: {}", std::io::Error::last_os_error());
@@ -170,20 +177,40 @@ mod tests {
     use super::*;
 
     fn rule(exe: &str, port: Option<u16>, action: Action) -> AppRule {
-        AppRule { id: 0, exe: exe.into(), port, action, enabled: true }
+        AppRule {
+            id: 0,
+            exe: exe.into(),
+            port,
+            action,
+            enabled: true,
+        }
     }
 
     #[test]
     fn port_override_wins_over_whole_app_default_only_for_its_port() {
-        let rules = vec![rule("/usr/bin/a", None, Action::Allow), rule("/usr/bin/a", Some(443), Action::Deny)];
-        assert_eq!(match_rule(&rules, "/usr/bin/a", Some(443)), Some(Action::Deny));
-        assert_eq!(match_rule(&rules, "/usr/bin/a", Some(80)), Some(Action::Allow), "other ports keep the app default");
+        let rules = vec![
+            rule("/usr/bin/a", None, Action::Allow),
+            rule("/usr/bin/a", Some(443), Action::Deny),
+        ];
+        assert_eq!(
+            match_rule(&rules, "/usr/bin/a", Some(443)),
+            Some(Action::Deny)
+        );
+        assert_eq!(
+            match_rule(&rules, "/usr/bin/a", Some(80)),
+            Some(Action::Allow),
+            "other ports keep the app default"
+        );
         assert_eq!(match_rule(&rules, "/usr/bin/b", Some(443)), None);
     }
 
     #[test]
     fn port_rule_alone_leaves_other_ports_unruled() {
         let rules = vec![rule("/usr/bin/a", Some(443), Action::Deny)];
-        assert_eq!(match_rule(&rules, "/usr/bin/a", Some(53)), None, "denying one port must not deny the app");
+        assert_eq!(
+            match_rule(&rules, "/usr/bin/a", Some(53)),
+            None,
+            "denying one port must not deny the app"
+        );
     }
 }

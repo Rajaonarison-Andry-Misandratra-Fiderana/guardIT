@@ -69,7 +69,10 @@ pub enum ServerMsg {
     /// a new row to append (a fresh ask, or an already-verdicted matched connection)
     FlowNew(FlowWire),
     /// an existing pending row (by req_id) got its final status
-    FlowResolved { req_id: u32, status: FlowStatus },
+    FlowResolved {
+        req_id: u32,
+        status: FlowStatus,
+    },
     AppRules(Vec<AppRule>),
     /// full replace — pushed whenever a periodic rescan sees the set of
     /// listening sockets change (see daemon::LISTEN_SCAN_INTERVAL)
@@ -81,16 +84,27 @@ pub enum ServerMsg {
 pub enum ClientMsg {
     /// verdict a held packet — always also persisted as a per-port rule for
     /// that app (there is no one-off decision: every answer is remembered)
-    Decide { req_id: u32, verdict: Action },
+    Decide {
+        req_id: u32,
+        verdict: Action,
+    },
     /// set (creating if needed) a rule for `exe` — `port: None` is the
     /// whole-app default (Apps/Conflicts panes), `port: Some(p)` is a
     /// per-port override (Flow pane) that wins over the default; always
     /// covers both directions, see daemon::upsert_rule
-    SetAppRule { exe: String, port: Option<u16>, action: Action },
-    ToggleAppRule { id: u32 },
+    SetAppRule {
+        exe: String,
+        port: Option<u16>,
+        action: Action,
+    },
+    ToggleAppRule {
+        id: u32,
+    },
     /// removes every rule for `exe` — the whole-app default AND every
     /// per-port override, i.e. "forget this app" rather than "remove one rule"
-    RmAppRule { exe: String },
+    RmAppRule {
+        exe: String,
+    },
 }
 
 /// writes one JSON value terminated by '\n' — the wire is line-delimited so
@@ -108,6 +122,7 @@ pub fn read_msg<T: for<'de> Deserialize<'de>>(r: &mut impl BufRead) -> std::io::
     if r.read_line(&mut line)? == 0 {
         return Ok(None);
     }
-    let msg = serde_json::from_str(line.trim_end()).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let msg = serde_json::from_str(line.trim_end())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(msg))
 }

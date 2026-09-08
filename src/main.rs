@@ -99,7 +99,10 @@ fn main() {
                 std::process::exit(1);
             }
             match ruleset::apply(&cfg) {
-                Ok(()) => println!("applied {} rule(s)", cfg.rule.iter().filter(|r| r.enabled).count()),
+                Ok(()) => println!(
+                    "applied {} rule(s)",
+                    cfg.rule.iter().filter(|r| r.enabled).count()
+                ),
                 Err(e) => {
                     eprintln!("{e}");
                     std::process::exit(1);
@@ -145,7 +148,10 @@ fn print_list(cfg: &Config) {
         println!("no rules configured");
         return;
     }
-    println!("{:<4}{:<8}{:<6}{:<20}{:<8}{:<4}", "ID", "ACTION", "PROTO", "SRC", "PORT", "ON");
+    println!(
+        "{:<4}{:<8}{:<6}{:<20}{:<8}{:<4}",
+        "ID", "ACTION", "PROTO", "SRC", "PORT", "ON"
+    );
     for r in &cfg.rule {
         println!(
             "{:<4}{:<8}{:<6}{:<20}{:<8}{:<4}",
