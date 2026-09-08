@@ -1,5 +1,6 @@
 use crate::config::{config_path, match_rule, Action, AppRule, Config, Proto, Rule};
 use crate::ipc::{self, ClientMsg, FlowStatus, FlowWire, ServerMsg};
+use crate::daemon;
 use crate::ruleset;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -294,26 +295,15 @@ enum Mode {
     Preset(usize),
 }
 
-fn history_log_path() -> std::path::PathBuf {
-    config_path().with_file_name("history.jsonl")
-}
-
-/// newest first, capped, optionally scoped to one app — same file `guardit
-/// log-app` reads, just rendered live in the TUI instead of one-shot on a
-/// terminal
+/// newest first — same reader as `guardit log-app`, just rendered live
 fn read_app_log(limit: usize, filter: Option<&str>) -> Vec<FlowWire> {
-    let Ok(text) = std::fs::read_to_string(history_log_path()) else { return Vec::new() };
-    let mut entries: Vec<FlowWire> = text
-        .lines()
-        .filter_map(|l| serde_json::from_str::<FlowWire>(l).ok())
-        .filter(|e| filter.is_none_or(|exe| e.exe == exe))
-        .collect();
-    let start = entries.len().saturating_sub(limit);
-    entries.split_off(start).into_iter().rev().collect()
+    let mut entries = daemon::read_history(limit, filter);
+    entries.reverse();
+    entries
 }
 
 fn flush_app_log() -> std::io::Result<()> {
-    std::fs::write(history_log_path(), "")
+    std::fs::write(daemon::history_log_path(), "")
 }
 
 /// canned rule specs (same format as the freeform `a` add-flow) for users
@@ -1296,18 +1286,12 @@ fn draw_throughput_spark(f: &mut Frame, area: Rect, label: &str, current: f64, h
 /// drill-down view genuinely needs the room these 7 columns take
 fn draw_app_log(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = THEMES[app.theme_idx];
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = daemon::now_ts();
     let rows: Vec<Row> = app
         .app_log
         .iter()
         .map(|e| {
-            let age = now.saturating_sub(e.ts);
-            let ago = match age {
-                0..=59 => format!("{age}s"),
-                60..=3599 => format!("{}m", age / 60),
-                3600..=86399 => format!("{}h", age / 3600),
-                _ => format!("{}d", age / 86400),
-            };
+            let ago = daemon::ago(now.saturating_sub(e.ts));
             let (status, color) = match e.status {
                 FlowStatus::Allowed => ("allow", theme.allow),
                 FlowStatus::Denied => ("deny", theme.deny),
@@ -1602,7 +1586,7 @@ fn draw_conflicts(f: &mut Frame, app: &mut App, area: Rect) {
     // will almost always be empty, because the kernel already refuses the
     // losing bind() before it ever shows up here; that's the honest,
     // correct answer, not a bug in the detector
-    let conflicts = crate::daemon::find_conflicts(&app.listening);
+    let conflicts = daemon::find_conflicts(&app.listening);
     let conflicted: HashSet<&str> = conflicts.iter().flat_map(|(a, b)| [a.exe.as_str(), b.exe.as_str()]).collect();
 
     let items: Vec<ListItem> = if app.listening.is_empty() {

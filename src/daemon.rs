@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-fn now_ts() -> u64 {
+pub fn now_ts() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
@@ -39,13 +39,6 @@ struct Decision {
     remember: bool,
 }
 
-enum DaemonEvent {
-    FlowNew(FlowWire),
-    FlowResolved { req_id: u32, status: FlowStatus },
-    AppRules(Vec<AppRule>),
-    Listening(Vec<ipc::ListenEntry>),
-}
-
 fn push_history(history: &History, entry: FlowWire) {
     let mut h = history.lock().unwrap();
     h.push(entry);
@@ -55,10 +48,12 @@ fn push_history(history: &History, entry: FlowWire) {
     }
 }
 
-fn resolve_history(history: &History, req_id: u32, status: FlowStatus) {
-    if let Some(e) = history.lock().unwrap().iter_mut().rev().find(|e| e.req_id == Some(req_id)) {
-        e.status = status;
-    }
+/// returns the updated entry so the caller can persist it
+fn resolve_history(history: &History, req_id: u32, status: FlowStatus) -> Option<FlowWire> {
+    let mut h = history.lock().unwrap();
+    let e = h.iter_mut().rev().find(|e| e.req_id == Some(req_id))?;
+    e.status = status;
+    Some(e.clone())
 }
 
 /// alongside `rules.toml` — an append-only record of every *final* flow
@@ -67,7 +62,7 @@ fn resolve_history(history: &History, req_id: u32, status: FlowStatus) {
 /// reconnect. No rotation/truncation: grows forever. Fine for how small
 /// each line is and how long a desktop box actually stays up between
 /// reinstalls; add rotation if that stops being true.
-fn history_log_path() -> std::path::PathBuf {
+pub fn history_log_path() -> std::path::PathBuf {
     config_path().with_file_name("history.jsonl")
 }
 
@@ -80,11 +75,27 @@ fn append_history_line(entry: &FlowWire) {
     }
 }
 
-fn load_history_from_disk() -> Vec<FlowWire> {
+/// the last `limit` entries of history.jsonl, oldest first, optionally only
+/// those whose exe contains `filter` — one reader shared by the daemon's
+/// startup reload, `guardit log-app`, and the TUI's log tab
+pub fn read_history(limit: usize, filter: Option<&str>) -> Vec<FlowWire> {
     let Ok(text) = fs::read_to_string(history_log_path()) else { return Vec::new() };
-    let mut entries: Vec<FlowWire> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
-    let start = entries.len().saturating_sub(HISTORY_CAP);
+    let mut entries: Vec<FlowWire> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter(|e: &FlowWire| filter.is_none_or(|f| e.exe.contains(f)))
+        .collect();
+    let start = entries.len().saturating_sub(limit);
     entries.split_off(start)
+}
+
+pub fn ago(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
 }
 
 /// `guardit log-app` — reads the full, unthrottled audit trail straight off
@@ -92,31 +103,14 @@ fn load_history_from_disk() -> Vec<FlowWire> {
 /// prints it. This is the actual answer to "what did every app try to
 /// connect to, ever" — history.jsonl is never deduped, only the live view is.
 pub fn print_log_app(exe_filter: Option<&str>, n: usize) {
-    let Ok(text) = fs::read_to_string(history_log_path()) else {
-        println!("no history yet ({}) — has the daemon run at all?", history_log_path().display());
-        return;
-    };
-    let mut entries: Vec<FlowWire> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
-    if let Some(filter) = exe_filter {
-        entries.retain(|e| e.exe.contains(filter));
-    }
-    let start = entries.len().saturating_sub(n);
-    let entries = &entries[start..];
-
+    let entries = read_history(n, exe_filter);
     if entries.is_empty() {
-        println!("no matching connection attempts logged");
+        println!("no matching connection attempts logged ({})", history_log_path().display());
         return;
     }
     let now = now_ts();
     println!("{:<8}{:<6}{:<20}{:<6}{:<6}{:<8}EXE", "AGO", "DIR", "PEER", "PROTO", "PORT", "STATUS");
     for e in entries {
-        let age = now.saturating_sub(e.ts);
-        let ago = match age {
-            0..=59 => format!("{age}s"),
-            60..=3599 => format!("{}m", age / 60),
-            3600..=86399 => format!("{}h", age / 3600),
-            _ => format!("{}d", age / 86400),
-        };
         let status = match e.status {
             FlowStatus::Allowed => "allow",
             FlowStatus::Denied => "deny",
@@ -124,7 +118,7 @@ pub fn print_log_app(exe_filter: Option<&str>, n: usize) {
         };
         println!(
             "{:<8}{:<6}{:<20}{:<6}{:<6}{:<8}{}",
-            ago,
+            ago(now.saturating_sub(e.ts)),
             e.direction.as_str(),
             e.peer_ip,
             e.proto,
@@ -231,51 +225,50 @@ fn proto_name(proto: u8) -> &'static str {
     }
 }
 
-/// local_port -> socket inode, by scanning /proc/net/{tcp,udp}[46] for the
-/// matching local port (hex-encoded "IP:PORT" in the 2nd column)
+/// one row of /proc/net/{tcp,udp}[6]: local address as the raw hex string,
+/// local port, connection state (hex, e.g. "0A" = LISTEN), socket inode
+struct ProcNetRow<'a> {
+    ip_hex: &'a str,
+    port: u16,
+    state: &'a str,
+    inode: u64,
+}
+
+/// rows with a live socket (inode != 0) — the columns every /proc/net
+/// consumer here needs, parsed once
+fn proc_net_rows(text: &str) -> impl Iterator<Item = ProcNetRow<'_>> {
+    text.lines().skip(1).filter_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 10 {
+            return None;
+        }
+        let (ip_hex, port_hex) = cols[1].split_once(':')?;
+        let port = u16::from_str_radix(port_hex, 16).ok()?;
+        let inode = cols[9].parse::<u64>().ok().filter(|&i| i != 0)?;
+        Some(ProcNetRow { ip_hex, port, state: cols[3], inode })
+    })
+}
+
+/// local_port -> socket inode, by scanning /proc/net/{tcp,udp}[46]
 fn find_inode(proto: u8, local_port: u16) -> Option<u64> {
     let files: [&str; 2] = match proto {
         6 => ["/proc/net/tcp", "/proc/net/tcp6"],
         17 => ["/proc/net/udp", "/proc/net/udp6"],
         _ => return None,
     };
-    for path in files {
-        let Ok(text) = fs::read_to_string(path) else { continue };
-        for line in text.lines().skip(1) {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 10 {
-                continue;
-            }
-            let Some((_, port_hex)) = cols[1].split_once(':') else { continue };
-            let Ok(port) = u16::from_str_radix(port_hex, 16) else { continue };
-            if port != local_port {
-                continue;
-            }
-            if let Ok(inode) = cols[9].parse::<u64>() {
-                if inode != 0 {
-                    return Some(inode);
-                }
-            }
-        }
-    }
-    None
+    files.iter().find_map(|path| {
+        let text = fs::read_to_string(path).ok()?;
+        proc_net_rows(&text).find(|r| r.port == local_port).map(|r| r.inode)
+    })
 }
 
 /// inode -> owning pid, by scanning /proc/*/fd for a `socket:[inode]` symlink
 fn find_pid_by_inode(inode: u64) -> Option<u32> {
-    let target = format!("socket:[{inode}]");
-    for entry in fs::read_dir("/proc").ok()?.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
-        let Ok(fds) = fs::read_dir(entry.path().join("fd")) else { continue };
-        for fd in fds.flatten() {
-            if let Ok(link) = fs::read_link(fd.path()) {
-                if link.to_string_lossy() == target {
-                    return Some(pid);
-                }
-            }
-        }
-    }
-    None
+    fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .find(|&pid| pid_owns_inode(pid, inode))
 }
 
 /// does `pid` still hold an fd pointing at socket `inode` right now?
@@ -335,22 +328,12 @@ fn list_listening() -> Vec<ipc::ListenEntry> {
     for (path, proto_name, want_state) in SOURCES {
         let Ok(text) = fs::read_to_string(path) else { continue };
         let is_v6 = path.ends_with('6');
-        for line in text.lines().skip(1) {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 10 || cols[3] != want_state {
-                continue;
-            }
-            let Some((ip_hex, port_hex)) = cols[1].split_once(':') else { continue };
-            let Ok(port) = u16::from_str_radix(port_hex, 16) else { continue };
-            let addr: Option<IpAddr> = if is_v6 { parse_hex_ipv6(ip_hex).map(IpAddr::V6) } else { parse_hex_ipv4(ip_hex).map(IpAddr::V4) };
+        for row in proc_net_rows(&text).filter(|r| r.state == want_state) {
+            let addr: Option<IpAddr> = if is_v6 { parse_hex_ipv6(row.ip_hex).map(IpAddr::V6) } else { parse_hex_ipv4(row.ip_hex).map(IpAddr::V4) };
             let Some(addr) = addr else { continue };
-            let Ok(inode) = cols[9].parse::<u64>() else { continue };
-            if inode == 0 {
-                continue;
-            }
-            let Some(pid) = find_pid_by_inode(inode) else { continue };
+            let Some(pid) = find_pid_by_inode(row.inode) else { continue };
             let Some(exe) = fs::read_link(format!("/proc/{pid}/exe")).ok() else { continue };
-            out.push(ipc::ListenEntry { proto: proto_name.to_string(), addr: addr.to_string(), port, exe: exe.to_string_lossy().into_owned() });
+            out.push(ipc::ListenEntry { proto: proto_name.to_string(), addr: addr.to_string(), port: row.port, exe: exe.to_string_lossy().into_owned() });
         }
     }
     out
@@ -422,12 +405,12 @@ fn to_verdict(action: Action) -> Verdict {
 pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
     eprintln!("guardit daemon: starting{}", if debug { " (--debug, always-accept)" } else { "" });
     let app_rules: AppRules = Arc::new(Mutex::new(cfg.app_rule.clone()));
-    let history: History = Arc::new(Mutex::new(load_history_from_disk()));
+    let history: History = Arc::new(Mutex::new(read_history(HISTORY_CAP, None)));
     let listening: ListeningState = Arc::new(Mutex::new(list_listening()));
     let throttle: Throttle = Arc::new(Mutex::new(HashMap::new()));
     let pending_registry: PendingRegistry = Arc::new(Mutex::new(HashMap::new()));
     let next_req_id = Arc::new(AtomicU32::new(1));
-    let (event_tx, event_rx) = mpsc::channel::<DaemonEvent>();
+    let (event_tx, event_rx) = mpsc::channel::<ServerMsg>();
     let timeout = Duration::from_secs(cfg.pending_timeout_secs as u64);
     let default_verdict = cfg.default_verdict;
 
@@ -471,7 +454,7 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
                 changed
             };
             if changed {
-                let _ = scan_event_tx.send(DaemonEvent::Listening(fresh));
+                let _ = scan_event_tx.send(ServerMsg::Listening(fresh));
             }
         });
         ipc_thread(app_rules, history, listening, pending_registry, event_rx)?;
@@ -494,7 +477,7 @@ fn queue_loop(
     throttle: Throttle,
     pending_registry: PendingRegistry,
     next_req_id: Arc<AtomicU32>,
-    event_tx: Sender<DaemonEvent>,
+    event_tx: Sender<ServerMsg>,
     timeout: Duration,
     default_verdict: Action,
     debug: bool,
@@ -511,19 +494,10 @@ fn queue_loop(
             queue.verdict(msg)?;
             continue;
         };
-        let local_port = match dir {
-            Direction::In => pkt.dst_port,
-            _ => pkt.src_port,
+        let (local_port, peer_port, peer_ip) = match dir {
+            Direction::In => (pkt.dst_port, pkt.src_port, pkt.src_ip.to_string()),
+            Direction::Out => (pkt.src_port, pkt.dst_port, pkt.dst_ip.to_string()),
         };
-        let peer_port = match dir {
-            Direction::In => pkt.src_port,
-            _ => pkt.dst_port,
-        };
-        let peer_ip = match dir {
-            Direction::In => pkt.src_ip,
-            _ => pkt.dst_ip,
-        }
-        .to_string();
 
         let exe = resolve_exe(pkt.proto, local_port);
 
@@ -571,7 +545,7 @@ fn queue_loop(
                 let throttle_key = (exe.clone(), pkt.proto, peer_port, dir == Direction::Out);
                 if should_log_matched(&throttle, throttle_key) {
                     push_history(&history, wire.clone());
-                    let _ = event_tx.send(DaemonEvent::FlowNew(wire));
+                    let _ = event_tx.send(ServerMsg::FlowNew(wire));
                 }
                 action
             }
@@ -590,7 +564,7 @@ fn queue_loop(
                     ts: now_ts(),
                 };
                 push_history(&history, wire.clone());
-                let _ = event_tx.send(DaemonEvent::FlowNew(wire));
+                let _ = event_tx.send(ServerMsg::FlowNew(wire));
 
                 let decision = rx.recv_timeout(timeout);
 
@@ -603,18 +577,17 @@ fn queue_loop(
                         // (that's Apps/Conflicts' SetAppRule with port: None)
                         let rules = upsert_rule(&exe, Some(peer_port), verdict);
                         *app_rules.lock().unwrap() = rules.clone();
-                        let _ = event_tx.send(DaemonEvent::AppRules(rules));
+                        let _ = event_tx.send(ServerMsg::AppRules(rules));
                         verdict
                     }
                     Ok(Decision { verdict, remember: false }) => verdict,
                     Err(_) => default_verdict,
                 };
                 let status = FlowStatus::from(verdict);
-                resolve_history(&history, req_id, status);
-                if let Some(resolved) = history.lock().unwrap().iter().rev().find(|e| e.req_id == Some(req_id)) {
-                    append_history_line(resolved);
+                if let Some(resolved) = resolve_history(&history, req_id, status) {
+                    append_history_line(&resolved);
                 }
-                let _ = event_tx.send(DaemonEvent::FlowResolved { req_id, status });
+                let _ = event_tx.send(ServerMsg::FlowResolved { req_id, status });
                 verdict
             }
         };
@@ -628,7 +601,7 @@ fn broadcast(subscribers: &Subscribers, msg: ServerMsg) {
     subscribers.lock().unwrap().retain(|tx| tx.send(msg.clone()).is_ok());
 }
 
-fn ipc_thread(app_rules: AppRules, history: History, listening: ListeningState, pending_registry: PendingRegistry, event_rx: Receiver<DaemonEvent>) -> std::io::Result<()> {
+fn ipc_thread(app_rules: AppRules, history: History, listening: ListeningState, pending_registry: PendingRegistry, event_rx: Receiver<ServerMsg>) -> std::io::Result<()> {
     if let Some(dir) = ipc::socket_path().parent() {
         fs::create_dir_all(dir)?;
     }
@@ -638,16 +611,10 @@ fn ipc_thread(app_rules: AppRules, history: History, listening: ListeningState, 
 
     let subscribers: Subscribers = Arc::new(Mutex::new(Vec::new()));
 
-    // fans every DaemonEvent out to whichever clients are currently connected
+    // fans every daemon event out to whichever clients are currently connected
     let fanout_subscribers = subscribers.clone();
     std::thread::spawn(move || {
-        for ev in event_rx {
-            let msg = match ev {
-                DaemonEvent::FlowNew(w) => ServerMsg::FlowNew(w),
-                DaemonEvent::FlowResolved { req_id, status } => ServerMsg::FlowResolved { req_id, status },
-                DaemonEvent::AppRules(rules) => ServerMsg::AppRules(rules),
-                DaemonEvent::Listening(entries) => ServerMsg::Listening(entries),
-            };
+        for msg in event_rx {
             broadcast(&fanout_subscribers, msg);
         }
     });
@@ -841,12 +808,13 @@ mod tests {
     }
 
     #[test]
-    fn finds_local_port_in_proc_net_tcp_line() {
+    fn parses_proc_net_tcp_rows_and_skips_header_and_dead_sockets() {
         // format straight from /proc/net/tcp: sl local_address rem_address st ... inode ...
-        let line = "1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 123456 1 0000000000000000 100 0 0 10 0";
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        let (_, port_hex) = cols[1].split_once(':').unwrap();
-        assert_eq!(u16::from_str_radix(port_hex, 16).unwrap(), 8080);
-        assert_eq!(cols[9], "123456");
+        let text = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+            1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 123456 1 0000000000000000 100 0 0 10 0\n\
+            2: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 0 1 0000000000000000 100 0 0 10 0\n";
+        let rows: Vec<_> = proc_net_rows(text).collect();
+        assert_eq!(rows.len(), 1, "header and inode-0 rows dropped");
+        assert_eq!((rows[0].ip_hex, rows[0].port, rows[0].state, rows[0].inode), ("0100007F", 8080, "0A", 123456));
     }
 }
