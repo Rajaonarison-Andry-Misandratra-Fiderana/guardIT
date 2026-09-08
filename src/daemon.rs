@@ -9,6 +9,7 @@ use std::fs;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -565,6 +566,7 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<ServerMsg>();
     let timeout = Duration::from_secs(cfg.pending_timeout_secs as u64);
     let default_verdict = cfg.default_verdict;
+    let notify = cfg.notify;
 
     let mut threads = Vec::new();
     for (dir, queue_num) in [(Direction::In, QUEUE_IN), (Direction::Out, QUEUE_OUT)] {
@@ -615,7 +617,14 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
                 }
             }
         });
-        ipc_thread(app_rules, history, listening, pending_registry, event_rx)?;
+        ipc_thread(
+            app_rules,
+            history,
+            listening,
+            pending_registry,
+            event_rx,
+            notify,
+        )?;
     } else {
         // in --debug mode there's no IPC server; just keep the process alive
         // while the queue threads print what they resolve
@@ -765,6 +774,61 @@ fn queue_loop(
     }
 }
 
+/// pops a `notify-send` in every logged-in desktop session. The daemon is
+/// root and has no session of its own, so for each /run/user/<uid>/bus it
+/// runs notify-send *as that user* against that bus — the same thing
+/// `sudo -u user DBUS_SESSION_BUS_ADDRESS=... notify-send` does by hand.
+/// Fire-and-forget: no desktop, no notify-send, no bus = nothing happens.
+fn notify_desktop(w: &FlowWire) {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::CommandExt;
+    let Ok(users) = fs::read_dir("/run/user") else {
+        return;
+    };
+    let app = w.exe.rsplit('/').next().unwrap_or(&w.exe);
+    let title = format!("{app} wants to connect ({})", w.direction.as_str());
+    let body = format!(
+        "{}\n{} port {} — {}\nsudo guardit answer {} allow|deny",
+        w.exe,
+        w.proto,
+        w.port.unwrap_or(0),
+        w.peer_ip,
+        w.req_id.unwrap_or(0)
+    );
+    for u in users.flatten() {
+        let Some(uid) = u.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let bus = u.path().join("bus");
+        let Ok(meta) = u.metadata() else { continue };
+        if !bus.exists() {
+            continue;
+        }
+        let child = Command::new("notify-send")
+            .uid(uid)
+            .gid(meta.gid())
+            .env_clear()
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", bus.display()),
+            )
+            .env("XDG_RUNTIME_DIR", u.path())
+            .args([
+                "-a", "guardit", "-u", "critical", "-t", "20000", &title, &body,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Ok(mut child) = child {
+            // reap it off-thread so it neither blocks the fanout nor zombies
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
 fn broadcast(subscribers: &Subscribers, msg: ServerMsg) {
     subscribers
         .lock()
@@ -778,6 +842,7 @@ fn ipc_thread(
     listening: ListeningState,
     pending_registry: PendingRegistry,
     event_rx: Receiver<ServerMsg>,
+    notify: bool,
 ) -> std::io::Result<()> {
     if let Some(dir) = ipc::socket_path().parent() {
         fs::create_dir_all(dir)?;
@@ -795,6 +860,12 @@ fn ipc_thread(
     let fanout_subscribers = subscribers.clone();
     std::thread::spawn(move || {
         for msg in event_rx {
+            if notify
+                && let ServerMsg::FlowNew(w) = &msg
+                && w.status == FlowStatus::Pending
+            {
+                notify_desktop(w);
+            }
             broadcast(&fanout_subscribers, msg);
         }
     });

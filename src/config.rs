@@ -137,6 +137,10 @@ fn default_verdict() -> Action {
     Action::Deny
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -149,6 +153,11 @@ pub struct Config {
     pub pending_timeout_secs: u32,
     #[serde(default = "default_verdict")]
     pub default_verdict: Action,
+    /// send a desktop notification (`notify-send`) to every logged-in
+    /// session when a new app asks — so you hear about it without the TUI
+    /// open, and can answer with `guardit answer`
+    #[serde(default = "default_true")]
+    pub notify: bool,
 }
 
 impl Default for Config {
@@ -158,6 +167,7 @@ impl Default for Config {
             app_rule: Vec::new(),
             pending_timeout_secs: default_pending_timeout(),
             default_verdict: default_verdict(),
+            notify: true,
         }
     }
 }
