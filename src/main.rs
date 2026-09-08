@@ -87,6 +87,11 @@ enum Cmd {
     /// per-application rules (what the daemon enforces)
     #[command(subcommand)]
     App(AppCmd),
+    /// print the whole config (IP/port rules, app rules, settings) as TOML
+    Export,
+    /// replace the whole config with a TOML file (`-` for stdin), then reload
+    /// the daemon; run `guardit apply` afterwards to load the IP/port rules
+    Import { file: String },
     /// connections the daemon is holding right now, waiting for a decision
     Pending,
     /// decide a pending connection by its id (see `pending`); remembered as a rule
@@ -135,7 +140,11 @@ fn main() {
     // the kernel, or connects to the root-owned daemon socket
     let read_only = matches!(
         cmd,
-        Cmd::List | Cmd::LogApp { .. } | Cmd::Apply { dry_run: true } | Cmd::App(AppCmd::List)
+        Cmd::List
+            | Cmd::Export
+            | Cmd::LogApp { .. }
+            | Cmd::Apply { dry_run: true }
+            | Cmd::App(AppCmd::List)
     );
     if !read_only && !ruleset::is_root() {
         eprintln!("guardit needs root — run with sudo");
@@ -198,6 +207,33 @@ fn main() {
                 fail(&format!("no rule for {exe}"));
             }
             println!("forgot {exe} ({} rule(s) removed)", before - rules.len());
+        }
+        Cmd::Export => print!(
+            "{}",
+            toml::to_string_pretty(&cfg).expect("serialize config")
+        ),
+        Cmd::Import { file } => {
+            let text = if file == "-" {
+                std::io::read_to_string(std::io::stdin())
+            } else {
+                std::fs::read_to_string(&file)
+            }
+            .unwrap_or_else(|e| fail(&format!("read {file}: {e}")));
+            let new: Config =
+                toml::from_str(&text).unwrap_or_else(|e| fail(&format!("bad config: {e}")));
+            let n_rules = new.rule.len();
+            let n_app = new.app_rule.len();
+            Config::update(|cfg| *cfg = new);
+            let reloaded = ipc::Client::connect()
+                .and_then(|mut c| {
+                    c.send(&ClientMsg::Reload)
+                        .and_then(|()| wait_app_rules(&mut c))
+                })
+                .is_ok();
+            println!(
+                "imported {n_rules} rule(s), {n_app} app rule(s){} — run `guardit apply` to load the IP/port rules",
+                if reloaded { ", daemon reloaded" } else { "" }
+            );
         }
         Cmd::Pending => {
             let mut c = ipc::Client::connect()

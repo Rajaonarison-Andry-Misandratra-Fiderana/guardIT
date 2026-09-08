@@ -111,6 +111,9 @@ pub enum ClientMsg {
     RmAppRule {
         exe: String,
     },
+    /// re-read rules.toml (after `guardit import` or a hand edit) and
+    /// broadcast the app rules it now holds
+    Reload,
 }
 
 /// blocking client for one-shot CLI use (`guardit app`, `pending`,

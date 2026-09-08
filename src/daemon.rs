@@ -972,6 +972,11 @@ fn handle_client_msg(
             *app_rules.lock().unwrap() = fresh.app_rule.clone();
             Some(fresh.app_rule)
         }
+        ClientMsg::Reload => {
+            let fresh = Config::load();
+            *app_rules.lock().unwrap() = fresh.app_rule.clone();
+            Some(fresh.app_rule)
+        }
         ClientMsg::RmAppRule { exe } => {
             let fresh = Config::update(|cfg| cfg.app_rule.retain(|r| r.exe != exe));
             *app_rules.lock().unwrap() = fresh.app_rule.clone();
