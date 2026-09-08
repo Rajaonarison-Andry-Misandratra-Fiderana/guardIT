@@ -9,7 +9,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
 
 if [ -f "$HERE/Cargo.toml" ]; then
     cd "$HERE"
-    cargo build --release
+    # `sudo ./install.sh` would build as root, whose rustup usually has no
+    # toolchain — build as the user who invoked sudo instead
+    if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
+        sudo -u "$SUDO_USER" -H cargo build --release
+    else
+        cargo build --release
+    fi
     cp guardit.service guardit-supervise.sh target/release/
     SRC="target/release"
 else
