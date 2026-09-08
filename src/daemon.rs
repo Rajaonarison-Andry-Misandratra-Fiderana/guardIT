@@ -528,6 +528,37 @@ fn ruled(rules: &[AppRule], exe: &str, port: u16, dir: Direction) -> Option<Acti
     Some(r.action)
 }
 
+/// picks up a hand edit (or `guardit import` with no daemon reachable) of
+/// rules.toml: `Some(rules)` when the file's mtime moved AND its app rules
+/// differ from what we hold. Our own writes move the mtime too, but then
+/// the content matches and nothing is broadcast. A malformed file is
+/// logged and ignored — the previous rules stay in force.
+/// ponytail: 5s mtime poll, inotify if the lag ever matters
+fn reload_if_edited(
+    app_rules: &AppRules,
+    last_mtime: &mut Option<std::time::SystemTime>,
+) -> Option<Vec<AppRule>> {
+    let mtime = fs::metadata(config_path()).and_then(|m| m.modified()).ok();
+    if mtime == *last_mtime {
+        return None;
+    }
+    *last_mtime = mtime;
+    let fresh = match Config::try_load() {
+        Ok(cfg) => cfg.app_rule,
+        Err(e) => {
+            eprintln!("guardit daemon: {e} — keeping the rules already loaded");
+            return None;
+        }
+    };
+    let mut cur = app_rules.lock().unwrap();
+    if *cur == fresh {
+        return None;
+    }
+    eprintln!("guardit daemon: rules.toml changed on disk, reloaded");
+    *cur = fresh.clone();
+    Some(fresh)
+}
+
 /// drops every expired rule from the file; `Some(rules)` when anything
 /// changed. match_rule already ignores expired rules, this is the cleanup
 /// that makes them disappear from the file and the TUI too.
@@ -600,8 +631,12 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
         let scan_event_tx = event_tx.clone();
         let scan_app_rules = app_rules.clone();
         std::thread::spawn(move || {
+            let mut cfg_mtime = fs::metadata(config_path()).and_then(|m| m.modified()).ok();
             loop {
                 std::thread::sleep(LISTEN_SCAN_INTERVAL);
+                if let Some(rules) = reload_if_edited(&scan_app_rules, &mut cfg_mtime) {
+                    let _ = scan_event_tx.send(ServerMsg::AppRules(rules));
+                }
                 if let Some(rules) = sweep_expired(&scan_app_rules) {
                     let _ = scan_event_tx.send(ServerMsg::AppRules(rules));
                 }

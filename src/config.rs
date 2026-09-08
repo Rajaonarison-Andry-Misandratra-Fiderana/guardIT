@@ -56,7 +56,7 @@ impl Direction {
 /// sets `None` (allow/deny everything); the Flow pane sets `Some(p)` for
 /// just the port of the request being decided — they're deliberately
 /// independent axes, not one overriding the other except port beats default.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRule {
     pub id: u32,
     pub exe: String,
@@ -180,14 +180,22 @@ pub fn config_path() -> PathBuf {
 }
 
 impl Config {
+    /// exits on a malformed file — for the CLI/TUI, where there is nothing
+    /// sensible to do with a config that can't be read
     pub fn load() -> Self {
+        Config::try_load().unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        })
+    }
+
+    /// missing file = defaults; malformed file = Err (the daemon's
+    /// hot-reload keeps its current rules rather than dying on a typo)
+    pub fn try_load() -> Result<Self, String> {
         let path = config_path();
         match fs::read_to_string(&path) {
-            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                eprintln!("bad config {}: {e}", path.display());
-                std::process::exit(1);
-            }),
-            Err(_) => Config::default(),
+            Ok(s) => toml::from_str(&s).map_err(|e| format!("bad config {}: {e}", path.display())),
+            Err(_) => Ok(Config::default()),
         }
     }
 
