@@ -27,17 +27,13 @@ type Subscribers = Arc<Mutex<Vec<Sender<ServerMsg>>>>;
 /// connections) — this is what makes a reconnecting TUI able to show "what
 /// ports has this app used" instead of starting blank every time it opens
 type History = Arc<Mutex<Vec<FlowWire>>>;
-type PendingRegistry = Arc<Mutex<HashMap<u32, Sender<Decision>>>>;
+type PendingRegistry = Arc<Mutex<HashMap<u32, Sender<Action>>>>;
 /// latest scan of every LISTENing/bound local socket, see list_listening()
 type ListeningState = Arc<Mutex<Vec<ipc::ListenEntry>>>;
 
 const HISTORY_CAP: usize = 300;
 const LISTEN_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
-struct Decision {
-    verdict: Action,
-    remember: bool,
-}
 
 fn push_history(history: &History, entry: FlowWire) {
     let mut h = history.lock().unwrap();
@@ -496,6 +492,11 @@ fn queue_loop(
             Direction::In => (pkt.dst_port, pkt.src_port, pkt.src_ip.to_string()),
             Direction::Out => (pkt.src_port, pkt.dst_port, pkt.dst_ip.to_string()),
         };
+        // the port a rule is about is always the *destination* port: the
+        // service being reached — remote for outbound, our own local one for
+        // inbound (the peer's source port is ephemeral, ruling on it would
+        // never match anything again)
+        let rule_port = pkt.dst_port;
 
         let exe = resolve_exe(pkt.proto, local_port);
 
@@ -518,7 +519,7 @@ fn queue_loop(
 
         // a per-port override (Flow pane) wins over the app's whole-app
         // default (Apps/Conflicts panes) when both exist for this app
-        let matched = match_rule(&app_rules.lock().unwrap(), &exe, Some(peer_port));
+        let matched = match_rule(&app_rules.lock().unwrap(), &exe, Some(rule_port));
 
         let verdict = match matched {
             Some(action) => {
@@ -534,13 +535,13 @@ fn queue_loop(
                     exe: exe.clone(),
                     direction: dir,
                     proto: proto_name(pkt.proto).to_string(),
-                    port: Some(peer_port),
+                    port: Some(rule_port),
                     peer_ip: peer_ip.clone(),
                     status: action.into(),
                     ts: now_ts(),
                 };
                 append_history_line(&wire);
-                let throttle_key = (exe.clone(), pkt.proto, peer_port, dir == Direction::Out);
+                let throttle_key = (exe.clone(), pkt.proto, rule_port, dir == Direction::Out);
                 if should_log_matched(&throttle, throttle_key) {
                     push_history(&history, wire.clone());
                     let _ = event_tx.send(ServerMsg::FlowNew(wire));
@@ -556,7 +557,7 @@ fn queue_loop(
                     exe: exe.clone(),
                     direction: dir,
                     proto: proto_name(pkt.proto).to_string(),
-                    port: Some(peer_port),
+                    port: Some(rule_port),
                     peer_ip: peer_ip.clone(),
                     status: FlowStatus::Pending,
                     ts: now_ts(),
@@ -569,16 +570,19 @@ fn queue_loop(
                 pending_registry.lock().unwrap().remove(&req_id);
 
                 let verdict = match decision {
-                    Ok(Decision { verdict, remember: true }) => {
-                        // this path only fires from the Flow pane's Y/N on a
-                        // live pending request — per-port, not the whole app
-                        // (that's Apps/Conflicts' SetAppRule with port: None)
-                        let rules = upsert_rule(&exe, Some(peer_port), verdict);
-                        *app_rules.lock().unwrap() = rules.clone();
-                        let _ = event_tx.send(ServerMsg::AppRules(rules));
+                    Ok(verdict) => {
+                        // every answer is remembered as a per-port rule — unless
+                        // a rule set meanwhile (e.g. the Apps pane's whole-app
+                        // y/n, which cascades a Decide to us) already gives this
+                        // exact verdict, in which case adding a redundant
+                        // per-port override would just clutter the app's rules
+                        if match_rule(&app_rules.lock().unwrap(), &exe, Some(rule_port)) != Some(verdict) {
+                            let rules = upsert_rule(&exe, Some(rule_port), verdict);
+                            *app_rules.lock().unwrap() = rules.clone();
+                            let _ = event_tx.send(ServerMsg::AppRules(rules));
+                        }
                         verdict
                     }
-                    Ok(Decision { verdict, remember: false }) => verdict,
                     Err(_) => default_verdict,
                 };
                 let status = FlowStatus::from(verdict);
@@ -684,9 +688,9 @@ fn handle_client(stream: UnixStream, app_rules: &AppRules, history: &History, li
 /// straight back to the client that asked for the change
 fn handle_client_msg(msg: ClientMsg, app_rules: &AppRules, pending_registry: &PendingRegistry) -> Option<Vec<AppRule>> {
     match msg {
-        ClientMsg::Decide { req_id, verdict, remember } => {
+        ClientMsg::Decide { req_id, verdict } => {
             if let Some(tx) = pending_registry.lock().unwrap().get(&req_id) {
-                let _ = tx.send(Decision { verdict, remember });
+                let _ = tx.send(verdict);
             }
             None
         }

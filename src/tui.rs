@@ -659,10 +659,8 @@ pub fn run(cfg: Config) {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('j') | KeyCode::Down => flow_select(&mut app, false),
                     KeyCode::Char('k') | KeyCode::Up => flow_select(&mut app, true),
-                    KeyCode::Char('y') => flow_decide(&mut app, Action::Allow, false),
-                    KeyCode::Char('n') => flow_decide(&mut app, Action::Deny, false),
-                    KeyCode::Char('Y') => flow_decide(&mut app, Action::Allow, true),
-                    KeyCode::Char('N') => flow_decide(&mut app, Action::Deny, true),
+                    KeyCode::Char('y') => flow_decide(&mut app, Action::Allow),
+                    KeyCode::Char('n') => flow_decide(&mut app, Action::Deny),
                     KeyCode::Char('l') => {
                         if let Some(exe) = app.apps_state.selected().and_then(|i| app.apps.get(i)).map(|r| r.exe.clone()) {
                             open_app_log(&mut app, Some(exe));
@@ -891,7 +889,7 @@ fn cascade_flow_rows(app: &mut App, action: Action, matches_row: impl Fn(&FlowWi
     }
     if let Some(ipc) = &mut app.ipc {
         for req_id in pending_req_ids {
-            ipc.send(&ClientMsg::Decide { req_id, verdict: action, remember: false });
+            ipc.send(&ClientMsg::Decide { req_id, verdict: action });
         }
     }
 }
@@ -953,11 +951,11 @@ fn flow_select(app: &mut App, back: bool) {
     app.flow_state.select(step(app.flow_state.selected(), len, back));
 }
 
-/// on a still-pending request this verdicts the actual held packet (and
-/// optionally remembers it as a rule); on an already-resolved history entry
-/// there's no packet left to verdict, so it just (re)sets the app's rule —
-/// this is how you flip an earlier deny back to allow, or vice versa
-fn flow_decide(app: &mut App, verdict: Action, remember: bool) {
+/// on a still-pending request this verdicts the actual held packet (the
+/// daemon persists it as a per-port rule); on an already-resolved history
+/// entry there's no packet left to verdict, so it just (re)sets that port's
+/// rule — this is how you flip an earlier deny back to allow, or vice versa
+fn flow_decide(app: &mut App, verdict: Action) {
     let idxs = current_flow_indices(app);
     let Some(sel) = app.flow_state.selected() else { return };
     let Some(&real_idx) = idxs.get(sel) else { return };
@@ -970,21 +968,13 @@ fn flow_decide(app: &mut App, verdict: Action, remember: bool) {
 
     if was_pending {
         let Some(req_id) = req_id else { return };
-        ipc.send(&ClientMsg::Decide { req_id, verdict, remember });
+        ipc.send(&ClientMsg::Decide { req_id, verdict });
     } else {
         ipc.send(&ClientMsg::SetAppRule { exe: exe.clone(), port, action: verdict });
     }
-
-    // a persistent rule got created/updated (always true once resolved, or
-    // when a still-pending ask is decided with "remember") — cascade it to
-    // this app's OTHER requests on the SAME port only (per-port control,
-    // never the whole app — that's Apps/Conflicts' job). A plain one-off
-    // y/n on a live request only touches that single row, no rule at all.
-    if !was_pending || remember {
-        cascade_flow_rows(app, verdict, |e| e.exe == exe && e.port == port);
-    } else if let Some(entry) = app.flow.get_mut(real_idx) {
-        entry.status = verdict.into();
-    }
+    // the rule covers this app's OTHER rows on the SAME port too (per-port
+    // control, never the whole app — that's Apps' job)
+    cascade_flow_rows(app, verdict, |e| e.exe == exe && e.port == port);
 }
 
 /// stable, deterministic order shared by draw_conflicts and the
@@ -1079,7 +1069,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let focus_color = focus_accent(app.focus, theme);
     let mut keys: Vec<(&str, &str)> = match (app.focus, &app.mode) {
         (Focus::Apps, _) => vec![("Tab", "pane"), ("j/k", "select"), ("Enter", "flow"), ("l", "log"), ("y/n", "allow/deny app"), ("space", "toggle"), ("d", "remove")],
-        (Focus::Flow, _) => vec![("Tab", "pane"), ("j/k", "select"), ("l", "log"), ("y/n", "allow/deny port"), ("Y/N", "+remember")],
+        (Focus::Flow, _) => vec![("Tab", "pane"), ("j/k", "select"), ("l", "log"), ("y/n", "allow/deny port")],
         (Focus::Conflicts, _) => vec![("Tab", "pane"), ("j/k", "select"), ("l", "log"), ("y/n", "allow/deny port")],
         (Focus::AppLog, _) if app.app_log_confirm_flush => vec![("y", "confirm flush"), ("n", "cancel")],
         (Focus::AppLog, _) => vec![("j/k", "move"), ("f", "flush")],

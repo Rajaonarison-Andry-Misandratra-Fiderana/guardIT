@@ -164,3 +164,26 @@ impl Config {
         cfg
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(exe: &str, port: Option<u16>, action: Action) -> AppRule {
+        AppRule { id: 0, exe: exe.into(), port, action, enabled: true }
+    }
+
+    #[test]
+    fn port_override_wins_over_whole_app_default_only_for_its_port() {
+        let rules = vec![rule("/usr/bin/a", None, Action::Allow), rule("/usr/bin/a", Some(443), Action::Deny)];
+        assert_eq!(match_rule(&rules, "/usr/bin/a", Some(443)), Some(Action::Deny));
+        assert_eq!(match_rule(&rules, "/usr/bin/a", Some(80)), Some(Action::Allow), "other ports keep the app default");
+        assert_eq!(match_rule(&rules, "/usr/bin/b", Some(443)), None);
+    }
+
+    #[test]
+    fn port_rule_alone_leaves_other_ports_unruled() {
+        let rules = vec![rule("/usr/bin/a", Some(443), Action::Deny)];
+        assert_eq!(match_rule(&rules, "/usr/bin/a", Some(53)), None, "denying one port must not deny the app");
+    }
+}

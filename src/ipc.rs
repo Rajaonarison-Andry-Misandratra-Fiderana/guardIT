@@ -79,7 +79,9 @@ pub enum ServerMsg {
 /// tui -> daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMsg {
-    Decide { req_id: u32, verdict: Action, remember: bool },
+    /// verdict a held packet — always also persisted as a per-port rule for
+    /// that app (there is no one-off decision: every answer is remembered)
+    Decide { req_id: u32, verdict: Action },
     /// set (creating if needed) a rule for `exe` — `port: None` is the
     /// whole-app default (Apps/Conflicts panes), `port: Some(p)` is a
     /// per-port override (Flow pane) that wins over the default; always

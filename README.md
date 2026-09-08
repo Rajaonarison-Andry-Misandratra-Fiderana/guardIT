@@ -65,7 +65,7 @@ a thick border:
 | **Application blocking** | one row per app, its whole-app default, and how many per-port overrides it has | `j/k` select · `Enter` jump to its Flow · `l` this app's log · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely |
 | **Listening ports** | every LISTEN/bound local socket, who owns it, and real bind conflicts (rare — the kernel already prevents most) | `j/k` select · `l` log · `y`/`n` allow/deny **this port only** |
 | **Top apps** | bar chart of the most active apps this session | informational |
-| **Network flow** | live connection history for whichever app is selected in Application blocking | `j/k` select · `y`/`n` allow/deny **this port only**, once · `Y`/`N` allow/deny this port and remember it |
+| **Network flow** | live connection history for whichever app is selected in Application blocking | `j/k` select · `y`/`n` allow/deny **this port only** (remembered as a per-port rule) |
 
 Other keys: `L` opens the full audit log as its own tab (`j/k` move, `f` flush with confirm, `q`/`L` back), `t` cycles color theme (remembered across restarts), `q` quits.
 
