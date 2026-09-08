@@ -1,0 +1,40 @@
+# Maintainer: Fiderana Rajaonarison <mirovarajaonarison@gmail.com>
+pkgname=guardit
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="nftables-backed firewall with per-app control and a live TUI dashboard"
+arch=('x86_64')
+url="https://github.com/Rajaonarison-Andry-Misandratra-Fiderana/guardIT"
+license=('MIT')
+depends=('nftables' 'gcc-libs' 'glibc')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "guardIT-$pkgver"
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+    # the unit and the supervise script assume install.sh's /usr/local/bin
+    sed -i 's|/usr/local/bin/|/usr/bin/|g' guardit.service guardit-supervise.sh
+}
+
+build() {
+    cd "guardIT-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+}
+
+check() {
+    cd "guardIT-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen --release
+}
+
+package() {
+    cd "guardIT-$pkgver"
+    install -Dm755 target/release/guardit "$pkgdir/usr/bin/guardit"
+    install -Dm755 guardit-supervise.sh "$pkgdir/usr/bin/guardit-supervise.sh"
+    install -Dm644 guardit.service "$pkgdir/usr/lib/systemd/system/guardit.service"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
