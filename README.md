@@ -2,12 +2,13 @@
 <h1 align="center">guardit</h1>
 <p align="center">An nftables-backed firewall with per-app control and a live TUI dashboard.</p>
 
-## What is GuardIT?
 
 https://github.com/user-attachments/assets/8776d1cc-61e7-4fc2-a7b5-0da06f5d8df8
 
 
 
+
+## What is GuardIT?
 GuardIT is a TUI firewall for Linux that drives `nftables` directly.
 
 - **A CLI/TUI for plain IP/port rules**, backed by `nftables` — the classic "allow this
@@ -55,6 +56,12 @@ tail -f /var/log/guardit-supervise.log   # cron fallback
 
 Config, per-app rules and the audit log live in `/etc/guardit/`. Everything except
 `list`, `log-app` and `apply --dry-run` needs root, so run the CLI and the TUI with `sudo`.
+
+## Is it HUUUGEE???
+Built with Rust — no Electron, no heavy runtime, minimal CPU and memory footprint.
+
+# HOW TO USE
+you can use CLI or TUI whatever you like
 
 ## CLI
 
