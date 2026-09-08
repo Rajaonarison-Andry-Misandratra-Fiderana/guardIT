@@ -1,10 +1,28 @@
 #!/usr/bin/env bash
+# Two ways in:
+#   ./install.sh                                   from a git clone — builds with cargo
+#   curl -fsSL <raw url>/install.sh | bash         no clone, no cargo — grabs the latest release
 set -euo pipefail
-cd "$(dirname "$0")"
 
-cargo build --release
-sudo install -Dm755 target/release/guardit /usr/local/bin/guardit
-sudo install -Dm755 guardit-supervise.sh /usr/local/bin/guardit-supervise.sh
+REPO="Rajaonarison-Andry-Misandratra-Fiderana/guardIT"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+
+if [ -f "$HERE/Cargo.toml" ]; then
+    cd "$HERE"
+    cargo build --release
+    cp guardit.service guardit-supervise.sh target/release/
+    SRC="target/release"
+else
+    TMP="$(mktemp -d)"
+    trap 'rm -rf "$TMP"' EXIT
+    URL="https://github.com/$REPO/releases/latest/download/guardit-x86_64-linux.tar.gz"
+    echo "downloading $URL"
+    curl -fsSL "$URL" | tar -xz -C "$TMP"
+    SRC="$TMP"
+fi
+
+sudo install -Dm755 "$SRC/guardit" /usr/local/bin/guardit
+sudo install -Dm755 "$SRC/guardit-supervise.sh" /usr/local/bin/guardit-supervise.sh
 
 echo "installed: $(command -v guardit)"
 
@@ -15,7 +33,7 @@ if [ ! -e /etc/guardit ] && sudo test -d /root/.config/guardit; then
 fi
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    sudo install -Dm644 guardit.service /etc/systemd/system/guardit.service
+    sudo install -Dm644 "$SRC/guardit.service" /etc/systemd/system/guardit.service
     sudo systemctl daemon-reload
     sudo systemctl enable --now guardit
     echo "daemon:    systemctl status guardit"
