@@ -1339,10 +1339,14 @@ fn draw(f: &mut Frame, app: &mut App) {
         // (not Percentage) so the halves are exactly equal — no rounding
         // drift between panes, which is what breaks top/bottom alignment
         // across columns.
+        // the middle column carries the two panes you read rather than
+        // operate — a bar chart needs width per app, and a flow row is a
+        // whole "proto/dir port peer" line — so it gets the space, taken
+        // from the two list panes that only ever show a short name
         let main = Layout::horizontal([
-            Constraint::Percentage(28),
-            Constraint::Percentage(42),
-            Constraint::Percentage(30),
+            Constraint::Percentage(24),
+            Constraint::Percentage(50),
+            Constraint::Percentage(26),
         ])
         .split(outer[1]);
         let left = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).split(main[0]);
@@ -1773,25 +1777,67 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// top apps by how many flow entries they've generated this session —
 /// a quick "who's the most active/chatty" glance, not a rule-editing view
+/// four characters at most, so a total always fits over its own bar however
+/// narrow the bar is: 1234 -> "1.2k", 5_400_000 -> "5.4M"
+fn compact(n: u64) -> String {
+    match n {
+        0..=9_999 => n.to_string(),
+        10_000..=999_999 => format!("{:.0}k", n as f64 / 1000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
 fn draw_top_apps(f: &mut Frame, app: &App, area: Rect) {
     let theme = THEMES[app.theme_idx];
     let mut top: Vec<(&str, u64)> = app.counts.iter().map(|(e, &c)| (e.as_str(), c)).collect();
     top.sort_by_key(|&(exe, c)| (Reverse(c), exe));
+
+    // the block is rendered separately from the chart so a row of totals can
+    // sit between the two: BarChart draws its own value text *inside* the
+    // bar, which is exactly what we don't want (see the bar_width comment)
+    let block = theme.pane("top apps — connection attempts, all time".into(), false);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [totals_area, chart_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+
     // every app, always — bar width adapts to how many there are instead of
     // truncating the list, so it never silently hides an app
     let n = top.len().max(1) as u16;
-    let inner_width = area.width.saturating_sub(4); // borders + horizontal padding
     let bar_gap: u16 = 1;
-    let bar_width = ((inner_width.saturating_sub(n.saturating_sub(1) * bar_gap)) / n).clamp(3, 9);
+    let bar_width = ((inner.width.saturating_sub(n.saturating_sub(1) * bar_gap)) / n).clamp(3, 9);
+
+    // the totals line is laid out on exactly the chart's own geometry —
+    // bar_width wide per app, bar_gap between — so each number lands over
+    // the bar it belongs to instead of drifting off by a column
+    let totals: String = top
+        .iter()
+        .map(|(_, count)| {
+            let text = compact(*count);
+            let w = bar_width as usize;
+            if text.chars().count() >= w {
+                text
+            } else {
+                format!("{text:^w$}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(&" ".repeat(bar_gap as usize));
+    f.render_widget(
+        Paragraph::new(Line::from(totals)).style(theme.base().fg(theme.chart)),
+        totals_area,
+    );
+
     // no in-bar digit: a number glyph drawn inside a solid block bar breaks
     // the bar's straight top edge (worst offender: "7", its shape reads as
-    // a notch/hump), so the count only shows in the label under the bar
+    // a notch/hump). The count now lives above the bar, so the label under
+    // it is just the name
     let bars: Vec<Bar> = top
         .iter()
         .map(|(exe, count)| {
             Bar::default()
                 .value(*count)
-                .label(Line::from(format!("{} ({count})", basename(exe))))
+                .label(Line::from(basename(exe).to_string()))
                 .text_value(String::new())
                 .style(Style::new().fg(theme.chart))
         })
@@ -1802,9 +1848,8 @@ fn draw_top_apps(f: &mut Frame, app: &App, area: Rect) {
         .bar_width(bar_width)
         .bar_gap(bar_gap)
         .label_style(Style::new().fg(theme.fg))
-        .style(Style::new().bg(theme.bg))
-        .block(theme.pane("top apps — connection attempts, all time".into(), false));
-    f.render_widget(chart, area);
+        .style(theme.base());
+    f.render_widget(chart, chart_area);
 }
 
 fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
