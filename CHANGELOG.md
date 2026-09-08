@@ -9,6 +9,9 @@
   rules the selected row's hostname instead of its port. Best-effort by construction: it
   rides the passive DNS tap, so a peer with no name the daemon saw resolved never matches
   a host rule (it falls through), and DoH/DoT stay invisible.
+- **Filter the Application blocking pane** with `/`: narrows the list live as you type,
+  `Enter` keeps the filter, `Esc` clears it. Flow follows the selection as before, so
+  filtering down to one app and hitting `Enter` is now the fast path on a busy machine.
 
 ## 0.2.0 — 2026-09-08
 

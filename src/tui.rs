@@ -355,6 +355,9 @@ enum Mode {
     Browse,
     Add(String),
     Preset(usize),
+    /// keystrokes go to `App::apps_filter` instead of the Apps pane's own
+    /// keys — the filter itself stays applied after leaving this mode
+    Filter,
 }
 
 /// newest first — same reader as `guardit log-app`, just rendered live
@@ -476,6 +479,10 @@ struct App {
     /// (l from Apps/Flow/Conflicts)
     app_log_filter: Option<String>,
     app_log_confirm_flush: bool,
+    /// case-insensitive substring the Apps pane is narrowed to; empty = all.
+    /// Applied in rebuild_apps, so every pane that keys off the Apps
+    /// selection (Flow above all) follows it without knowing about it
+    apps_filter: String,
 }
 
 /// total rx/tx bytes across every interface except loopback, from
@@ -599,6 +606,7 @@ pub fn run(cfg: Config) {
         prev_focus: Focus::Rules,
         app_log_filter: None,
         app_log_confirm_flush: false,
+        apps_filter: String::new(),
     };
     if !app.cfg.rule.is_empty() {
         app.state.select(Some(0));
@@ -646,7 +654,7 @@ pub fn run(cfg: Config) {
             }
             app.msg.clear();
             if (key.code == KeyCode::Tab || key.code == KeyCode::BackTab)
-                && !matches!(app.mode, Mode::Add(_) | Mode::Preset(_))
+                && !matches!(app.mode, Mode::Add(_) | Mode::Preset(_) | Mode::Filter)
             {
                 app.focus = if key.code == KeyCode::BackTab {
                     app.focus.prev()
@@ -659,14 +667,14 @@ pub fn run(cfg: Config) {
                 }
                 continue;
             }
-            if key.code == KeyCode::Char('t') && !matches!(app.mode, Mode::Add(_)) {
+            if key.code == KeyCode::Char('t') && !matches!(app.mode, Mode::Add(_) | Mode::Filter) {
                 app.theme_idx = (app.theme_idx + 1) % THEMES.len();
                 save_theme_idx(app.theme_idx);
                 continue;
             }
             // jumpable to from anywhere, same idea as `t` — the app log is
             // its own tab, not nested under any pane's local keys
-            if key.code == KeyCode::Char('L') && !matches!(app.mode, Mode::Add(_)) {
+            if key.code == KeyCode::Char('L') && !matches!(app.mode, Mode::Add(_) | Mode::Filter) {
                 if app.focus == Focus::AppLog {
                     close_app_log(&mut app);
                 } else {
@@ -702,6 +710,9 @@ pub fn run(cfg: Config) {
                         }
                         _ => {}
                     },
+                    // only ever set from the Apps pane, and Tab can't leave
+                    // it — but if it ever got here, Browse is the safe read
+                    Mode::Filter => app.mode = Mode::Browse,
                     Mode::Add(buf) => match key.code {
                         KeyCode::Esc => app.mode = Mode::Browse,
                         KeyCode::Enter => {
@@ -722,8 +733,34 @@ pub fn run(cfg: Config) {
                         _ => {}
                     },
                 },
+                // every keystroke narrows the list live, so you see what
+                // you're typing towards instead of committing blind
+                Focus::Apps if matches!(app.mode, Mode::Filter) => {
+                    match key.code {
+                        KeyCode::Enter => app.mode = Mode::Browse,
+                        KeyCode::Esc => {
+                            app.apps_filter.clear();
+                            app.mode = Mode::Browse;
+                        }
+                        KeyCode::Backspace => {
+                            app.apps_filter.pop();
+                        }
+                        KeyCode::Char(c) => app.apps_filter.push(c),
+                        _ => continue,
+                    }
+                    rebuild_apps(&mut app);
+                    reset_flow_selection(&mut app);
+                }
                 Focus::Apps => match key.code {
                     KeyCode::Char('q') => break,
+                    KeyCode::Char('/') => app.mode = Mode::Filter,
+                    // a filter left on is easy to forget about — Esc drops it
+                    // from anywhere in the pane, not only while typing
+                    KeyCode::Esc if !app.apps_filter.is_empty() => {
+                        app.apps_filter.clear();
+                        rebuild_apps(&mut app);
+                        reset_flow_selection(&mut app);
+                    }
                     KeyCode::Char('j') | KeyCode::Down => apps_select(&mut app, false),
                     KeyCode::Char('k') | KeyCode::Up => apps_select(&mut app, true),
                     KeyCode::Char('y') => apps_set_verdict(&mut app, Action::Allow),
@@ -913,6 +950,10 @@ fn rebuild_apps(app: &mut App) {
     // apps with no rule at all first: they're the ones waiting on a decision,
     // and they'd otherwise be buried alphabetically among the settled ones
     rows.sort_by_key(|r| (r.rule.is_some() || r.port_overrides > 0, r.exe.clone()));
+    if !app.apps_filter.is_empty() {
+        let needle = app.apps_filter.to_lowercase();
+        rows.retain(|r| r.exe.to_lowercase().contains(&needle));
+    }
     app.apps = rows;
 
     let restored = selected_exe.and_then(|exe| app.apps.iter().position(|r| r.exe == exe));
@@ -1334,6 +1375,25 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let theme = THEMES[app.theme_idx];
     let base = theme.base();
 
+    if matches!(app.mode, Mode::Filter) {
+        let spans = vec![
+            Span::styled(
+                " FILTER APPS ",
+                Style::new()
+                    .bg(theme.accents[1])
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Enter keep · Esc clear  ", base),
+            Span::styled(
+                format!("> {}", app.apps_filter),
+                base.add_modifier(Modifier::BOLD),
+            ),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
+        return;
+    }
+
     if let Mode::Add(buf) = &app.mode {
         let spans = vec![
             Span::styled(
@@ -1367,6 +1427,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("y/n", "allow/deny app"),
             ("space", "toggle"),
             ("d", "remove"),
+            ("/", "filter"),
         ],
         (Focus::Flow, _) => vec![
             ("Tab", "pane"),
@@ -1696,7 +1757,15 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
         .style(theme.base())
         .highlight_style(Style::new().bg(theme.border_idle))
         .block(theme.pane(
-            "application blocking — undecided first".into(),
+            if app.apps_filter.is_empty() {
+                "application blocking — undecided first".into()
+            } else {
+                format!(
+                    "application blocking — /{} ({} shown)",
+                    app.apps_filter,
+                    app.apps.len()
+                )
+            },
             app.focus == Focus::Apps,
         ));
     f.render_stateful_widget(list, area, &mut app.apps_state);
