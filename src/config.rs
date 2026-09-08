@@ -34,13 +34,14 @@ pub struct Rule {
 pub enum Direction {
     In,
     Out,
-    Both,
 }
 
 impl Direction {
-    /// does a rule set for `self` apply to traffic actually flowing in `dir`?
-    pub fn covers(self, dir: Direction) -> bool {
-        self == Direction::Both || self == dir
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Direction::In => "in",
+            Direction::Out => "out",
+        }
     }
 }
 
@@ -58,11 +59,23 @@ impl Direction {
 pub struct AppRule {
     pub id: u32,
     pub exe: String,
-    pub direction: Direction,
     #[serde(default)]
     pub port: Option<u16>,
     pub action: Action,
     pub enabled: bool,
+}
+
+/// the one matching rule for (exe, port): a per-port override wins over the
+/// app's whole-app default (`port: None`) when both exist — used by the
+/// daemon to verdict and by the TUI to show what would happen right now
+pub fn match_rule(rules: &[AppRule], exe: &str, port: Option<u16>) -> Option<Action> {
+    let applicable = |r: &&AppRule| r.enabled && r.exe == exe;
+    rules
+        .iter()
+        .filter(applicable)
+        .find(|r| r.port == port)
+        .or_else(|| rules.iter().filter(applicable).find(|r| r.port.is_none()))
+        .map(|r| r.action)
 }
 
 fn default_pending_timeout() -> u32 {

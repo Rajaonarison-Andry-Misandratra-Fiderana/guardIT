@@ -1,4 +1,4 @@
-use crate::config::{config_path, Action, AppRule, Config, Direction, Proto, Rule};
+use crate::config::{config_path, match_rule, Action, AppRule, Config, Proto, Rule};
 use crate::ipc::{self, ClientMsg, FlowStatus, FlowWire, ServerMsg};
 use crate::ruleset;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -948,7 +948,7 @@ fn cascade_port_verdict_to_flow(app: &mut App, exe: &str, port: Option<u16>, act
 }
 
 fn cascade_flow_rows(app: &mut App, action: Action, matches_row: impl Fn(&FlowEntry) -> bool) {
-    let new_status = if action == Action::Allow { FlowStatus::Allowed } else { FlowStatus::Denied };
+    let new_status = FlowStatus::from(action);
     let mut pending_req_ids = Vec::new();
     for e in app.flow.iter_mut().filter(|e| matches_row(e)) {
         if matches!(e.status, FlowStatus::Pending) {
@@ -978,18 +978,7 @@ fn effective_status(e: &FlowEntry, app_rules: &[AppRule]) -> FlowStatus {
     if matches!(e.status, FlowStatus::Pending) {
         return FlowStatus::Pending;
     }
-    let applicable = |r: &&AppRule| r.enabled && r.exe == e.exe;
-    let action = app_rules
-        .iter()
-        .filter(applicable)
-        .find(|r| r.port == e.port)
-        .or_else(|| app_rules.iter().filter(applicable).find(|r| r.port.is_none()))
-        .map(|r| r.action);
-    match action {
-        Some(Action::Allow) => FlowStatus::Allowed,
-        Some(Action::Deny) => FlowStatus::Denied,
-        None => e.status,
-    }
+    match_rule(app_rules, &e.exe, e.port).map(FlowStatus::from).unwrap_or(e.status)
 }
 
 /// force this app to allow/deny everything, whether or not it already had a
@@ -1096,7 +1085,7 @@ fn flow_decide(app: &mut App, verdict: Action, remember: bool) {
     if !was_pending || remember {
         cascade_port_verdict_to_flow(app, &exe, port, verdict);
     } else if let Some(entry) = app.flow.get_mut(real_idx) {
-        entry.status = if verdict == Action::Allow { FlowStatus::Allowed } else { FlowStatus::Denied };
+        entry.status = verdict.into();
     }
 }
 
@@ -1319,11 +1308,6 @@ fn draw_app_log(f: &mut Frame, app: &mut App, area: Rect) {
                 3600..=86399 => format!("{}h", age / 3600),
                 _ => format!("{}d", age / 86400),
             };
-            let dir = match e.direction {
-                Direction::In => "in",
-                Direction::Out => "out",
-                Direction::Both => "both",
-            };
             let (status, color) = match e.status {
                 FlowStatus::Allowed => ("allow", theme.allow),
                 FlowStatus::Denied => ("deny", theme.deny),
@@ -1331,7 +1315,7 @@ fn draw_app_log(f: &mut Frame, app: &mut App, area: Rect) {
             };
             Row::new(vec![
                 Cell::from(ago),
-                Cell::from(dir),
+                Cell::from(e.direction.as_str()),
                 Cell::from(basename(&e.exe).to_string()),
                 Cell::from(e.proto.clone()),
                 Cell::from(e.port.map(|p| p.to_string()).unwrap_or_default()),
@@ -1587,15 +1571,10 @@ fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
                 FlowStatus::Allowed => ("[ UP ]", theme.allow),
                 FlowStatus::Denied => ("[DROP]", theme.deny),
             };
-            let dir = match e.direction {
-                Direction::In => "in",
-                Direction::Out => "out",
-                Direction::Both => "both",
-            };
             let text = format!(
                 "{tag}  {:<4}/{:<4}  port {:<6}  {}",
                 e.proto,
-                dir,
+                e.direction.as_str(),
                 e.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
                 e.peer_ip,
             );

@@ -1,4 +1,4 @@
-use crate::config::{config_path, Action, AppRule, Config, Direction};
+use crate::config::{config_path, match_rule, Action, AppRule, Config, Direction};
 use crate::ipc::{self, ClientMsg, FlowStatus, FlowWire, ServerMsg};
 use crate::ruleset::{QUEUE_IN, QUEUE_OUT};
 use nfq::{Queue, Verdict};
@@ -117,11 +117,6 @@ pub fn print_log_app(exe_filter: Option<&str>, n: usize) {
             3600..=86399 => format!("{}h", age / 3600),
             _ => format!("{}d", age / 86400),
         };
-        let dir = match e.direction {
-            Direction::In => "in",
-            Direction::Out => "out",
-            Direction::Both => "both",
-        };
         let status = match e.status {
             FlowStatus::Allowed => "allow",
             FlowStatus::Denied => "deny",
@@ -130,7 +125,7 @@ pub fn print_log_app(exe_filter: Option<&str>, n: usize) {
         println!(
             "{:<8}{:<6}{:<20}{:<6}{:<6}{:<8}{}",
             ago,
-            dir,
+            e.direction.as_str(),
             e.peer_ip,
             e.proto,
             e.port.map(|p| p.to_string()).unwrap_or_default(),
@@ -412,7 +407,7 @@ fn upsert_rule(exe: &str, port: Option<u16>, action: Action) -> Vec<AppRule> {
             Some(p) => cfg.app_rule.retain(|r| !(r.exe == exe && r.port == Some(p))),
         }
         let id = cfg.next_app_id();
-        cfg.app_rule.push(AppRule { id, exe: exe.to_string(), direction: Direction::Both, port, action, enabled: true });
+        cfg.app_rule.push(AppRule { id, exe: exe.to_string(), port, action, enabled: true });
     })
     .app_rule
 }
@@ -551,16 +546,7 @@ fn queue_loop(
 
         // a per-port override (Flow pane) wins over the app's whole-app
         // default (Apps/Conflicts panes) when both exist for this app
-        let matched = {
-            let rules = app_rules.lock().unwrap();
-            let applicable = |r: &&AppRule| r.enabled && r.exe == exe && r.direction.covers(dir);
-            rules
-                .iter()
-                .filter(applicable)
-                .find(|r| r.port == Some(peer_port))
-                .or_else(|| rules.iter().filter(applicable).find(|r| r.port.is_none()))
-                .map(|r| r.action)
-        };
+        let matched = match_rule(&app_rules.lock().unwrap(), &exe, Some(peer_port));
 
         let verdict = match matched {
             Some(action) => {
@@ -578,7 +564,7 @@ fn queue_loop(
                     proto: proto_name(pkt.proto).to_string(),
                     port: Some(peer_port),
                     peer_ip: peer_ip.clone(),
-                    status: if action == Action::Allow { FlowStatus::Allowed } else { FlowStatus::Denied },
+                    status: action.into(),
                     ts: now_ts(),
                 };
                 append_history_line(&wire);
@@ -623,7 +609,7 @@ fn queue_loop(
                     Ok(Decision { verdict, remember: false }) => verdict,
                     Err(_) => default_verdict,
                 };
-                let status = if verdict == Action::Allow { FlowStatus::Allowed } else { FlowStatus::Denied };
+                let status = FlowStatus::from(verdict);
                 resolve_history(&history, req_id, status);
                 if let Some(resolved) = history.lock().unwrap().iter().rev().find(|e| e.req_id == Some(req_id)) {
                     append_history_line(resolved);

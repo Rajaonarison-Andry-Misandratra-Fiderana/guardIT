@@ -14,6 +14,15 @@ pub enum FlowStatus {
     Denied,
 }
 
+impl From<Action> for FlowStatus {
+    fn from(a: Action) -> Self {
+        match a {
+            Action::Allow => FlowStatus::Allowed,
+            Action::Deny => FlowStatus::Denied,
+        }
+    }
+}
+
 /// one connection attempt: either still awaiting a decision (`req_id: Some`,
 /// `status: Pending`) or already verdicted — either because it matched an
 /// existing AppRule immediately (`req_id: None`) or because a pending one
