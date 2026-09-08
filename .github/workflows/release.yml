@@ -1,0 +1,25 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: |
+          mkdir dist
+          cp target/x86_64-unknown-linux-musl/release/guardit guardit.service guardit-supervise.sh dist/
+          tar -czf guardit-x86_64-linux.tar.gz -C dist .
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: guardit-x86_64-linux.tar.gz
+          body_path: CHANGELOG.md
