@@ -1,6 +1,7 @@
 use crate::config::{Action, AppRule, Direction};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 pub fn socket_path() -> PathBuf {
@@ -110,6 +111,33 @@ pub enum ClientMsg {
     RmAppRule {
         exe: String,
     },
+}
+
+/// blocking client for one-shot CLI use (`guardit app`, `pending`,
+/// `answer`): the daemon sends a Snapshot first, which `connect` leaves
+/// unread for the caller. Err = daemon not running (or not root).
+pub struct Client {
+    pub reader: BufReader<UnixStream>,
+    pub writer: UnixStream,
+}
+
+impl Client {
+    pub fn connect() -> std::io::Result<Self> {
+        let stream = UnixStream::connect(socket_path())?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        Ok(Client {
+            writer: stream.try_clone()?,
+            reader: BufReader::new(stream),
+        })
+    }
+
+    pub fn send(&mut self, msg: &ClientMsg) -> std::io::Result<()> {
+        send_msg(&mut self.writer, msg)
+    }
+
+    pub fn recv(&mut self) -> std::io::Result<Option<ServerMsg>> {
+        read_msg(&mut self.reader)
+    }
 }
 
 /// writes one JSON value terminated by '\n' — the wire is line-delimited so

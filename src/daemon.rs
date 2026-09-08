@@ -487,7 +487,7 @@ fn resolve_exe_cached(proto: u8, local_port: u16) -> Option<String> {
 /// (per-port, from Flow) only replaces that one port's existing override
 /// for the same direction, leaving the app-wide default and every other
 /// port alone.
-fn upsert_rule(
+pub fn upsert_rule(
     exe: &str,
     port: Option<u16>,
     direction: Option<Direction>,
