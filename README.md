@@ -20,14 +20,22 @@ connections are dropped, not silently let through.
 
 ## How to install
 
+One line, no Rust toolchain needed (static x86_64 binary from the latest release):
+
+```
+curl -fsSL https://raw.githubusercontent.com/Rajaonarison-Andry-Misandratra-Fiderana/guardIT/main/install.sh | bash
+```
+
+Or from source:
+
 ```
 git clone https://github.com/Rajaonarison-Andry-Misandratra-Fiderana/guardIT.git
 cd guardIT
 ./install.sh
 ```
 
-`install.sh` builds the release binary, installs it to `/usr/local/bin/guardit`, and sets
-up the daemon to survive reboots. It works with or without systemd — the installer
+Either way `install.sh` puts the binary in `/usr/local/bin/guardit` and sets up the daemon
+to survive reboots. It works with or without systemd — the installer
 autodetects which one you have:
 
 - **systemd present** → installs and enables `guardit.service` (`Restart=always`).
