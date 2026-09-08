@@ -89,6 +89,22 @@ pub fn read_history(limit: usize, filter: Option<&str>) -> Vec<FlowWire> {
     entries.split_off(start)
 }
 
+/// connection attempts per app over the whole audit trail, streamed so a
+/// large history.jsonl is never held in memory at once
+pub fn count_history() -> HashMap<String, u64> {
+    use std::io::BufRead;
+    let mut counts = HashMap::new();
+    let Ok(f) = fs::File::open(history_log_path()) else {
+        return counts;
+    };
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
+        if let Ok(e) = serde_json::from_str::<FlowWire>(&line) {
+            *counts.entry(e.exe).or_default() += 1;
+        }
+    }
+    counts
+}
+
 pub fn ago(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs}s"),

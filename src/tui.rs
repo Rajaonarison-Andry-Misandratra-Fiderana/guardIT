@@ -18,7 +18,7 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 use std::cmp::Reverse;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Read as _, stdout};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -450,6 +450,9 @@ struct App {
     app_rules: Vec<AppRule>,
     flow: Vec<FlowWire>,
     flow_state: ListState,
+    /// connection attempts per app since the audit log was last flushed —
+    /// seeded from history.jsonl, then bumped live; what Top apps charts
+    counts: HashMap<String, u64>,
     focus: Focus,
     ipc: Option<IpcClient>,
     mode: Mode,
@@ -575,6 +578,7 @@ pub fn run(cfg: Config) {
         apps_state: ListState::default(),
         flow: Vec::new(),
         flow_state: ListState::default(),
+        counts: daemon::count_history(),
         focus: Focus::Rules,
         ipc: IpcClient::connect(),
         mode: Mode::Browse,
@@ -786,6 +790,7 @@ pub fn run(cfg: Config) {
                             app.msg = format!("flush failed: {e}");
                         }
                         app.app_log_confirm_flush = false;
+                        app.counts.clear();
                         app.app_log = read_app_log(APP_LOG_LIMIT, app.app_log_filter.as_deref());
                         app.app_log_state.select(None);
                     }
@@ -835,7 +840,10 @@ fn drain_ipc(app: &mut App) {
                 app.listening = listening;
                 sort_listening(&mut app.listening);
             }
-            ServerMsg::FlowNew(w) => app.flow.push(w),
+            ServerMsg::FlowNew(w) => {
+                *app.counts.entry(w.exe.clone()).or_default() += 1;
+                app.flow.push(w);
+            }
             ServerMsg::FlowResolved { req_id, status } => {
                 if let Some(entry) = app.flow.iter_mut().find(|e| e.req_id == Some(req_id)) {
                     entry.status = status;
@@ -1641,12 +1649,8 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
 /// a quick "who's the most active/chatty" glance, not a rule-editing view
 fn draw_top_apps(f: &mut Frame, app: &App, area: Rect) {
     let theme = THEMES[app.theme_idx];
-    let mut counts: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
-    for e in &app.flow {
-        *counts.entry(e.exe.as_str()).or_default() += 1;
-    }
-    let mut top: Vec<(&str, u64)> = counts.into_iter().collect();
-    top.sort_by_key(|&(_, c)| Reverse(c));
+    let mut top: Vec<(&str, u64)> = app.counts.iter().map(|(e, &c)| (e.as_str(), c)).collect();
+    top.sort_by_key(|&(exe, c)| (Reverse(c), exe));
     // every app, always — bar width adapts to how many there are instead of
     // truncating the list, so it never silently hides an app
     let n = top.len().max(1) as u16;
@@ -1673,7 +1677,7 @@ fn draw_top_apps(f: &mut Frame, app: &App, area: Rect) {
         .bar_gap(bar_gap)
         .label_style(Style::new().fg(theme.fg))
         .style(Style::new().bg(theme.bg))
-        .block(theme.pane("top apps — connection attempts".into(), false));
+        .block(theme.pane("top apps — connection attempts, all time".into(), false));
     f.render_widget(chart, area);
 }
 
