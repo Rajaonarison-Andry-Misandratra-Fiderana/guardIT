@@ -118,6 +118,10 @@ pub fn status() -> String {
     }
 }
 
+pub fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,8 +221,4 @@ mod tests {
         let out = render(&cfg);
         assert!(out.contains("tcp dport 443 accept"));
     }
-}
-
-pub fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
 }
