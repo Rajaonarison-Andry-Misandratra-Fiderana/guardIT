@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub fn now_ts() -> u64 {
@@ -36,6 +36,7 @@ type ListeningState = Arc<Mutex<Vec<ipc::ListenEntry>>>;
 
 const HISTORY_CAP: usize = 300;
 const LISTEN_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+const EXE_CACHE_TTL: Duration = Duration::from_secs(3);
 
 fn push_history(history: &History, entry: FlowWire) {
     let mut h = history.lock().unwrap();
@@ -288,6 +289,42 @@ fn find_inode(proto: u8, local_port: u16) -> Option<u64> {
     })
 }
 
+/// every socket inode -> owning pid, from a single pass over /proc/*/fd.
+/// `find_pid_by_inode` walks all of /proc per lookup, so resolving a whole
+/// /proc/net table one socket at a time re-walked it once per socket — this
+/// walks it once for the lot. Lowest fd wins a shared inode (fork/dup), same
+/// as the sequential scan's /proc read order.
+fn inode_pid_map() -> HashMap<u64, u32> {
+    let mut map = HashMap::new();
+    let Ok(procs) = fs::read_dir("/proc") else {
+        return map;
+    };
+    for proc_entry in procs.flatten() {
+        let Some(pid) = proc_entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = fs::read_dir(proc_entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if let Ok(link) = fs::read_link(fd.path())
+                && let Some(inode) = link
+                    .to_str()
+                    .and_then(|l| l.strip_prefix("socket:["))
+                    .and_then(|l| l.strip_suffix(']'))
+                    .and_then(|i| i.parse().ok())
+            {
+                map.entry(inode).or_insert(pid);
+            }
+        }
+    }
+    map
+}
+
 /// inode -> owning pid, by scanning /proc/*/fd for a `socket:[inode]` symlink
 fn find_pid_by_inode(inode: u64) -> Option<u32> {
     fs::read_dir("/proc")
@@ -359,6 +396,7 @@ fn list_listening() -> Vec<ipc::ListenEntry> {
         ("/proc/net/udp", "udp", "07"),
         ("/proc/net/udp6", "udp", "07"),
     ];
+    let pids = inode_pid_map();
     let mut out = Vec::new();
     for (path, proto_name, want_state) in SOURCES {
         let Ok(text) = fs::read_to_string(path) else {
@@ -372,7 +410,7 @@ fn list_listening() -> Vec<ipc::ListenEntry> {
                 parse_hex_ipv4(row.ip_hex).map(IpAddr::V4)
             };
             let Some(addr) = addr else { continue };
-            let Some(pid) = find_pid_by_inode(row.inode) else {
+            let Some(&pid) = pids.get(&row.inode) else {
                 continue;
             };
             let Some(exe) = fs::read_link(format!("/proc/{pid}/exe")).ok() else {
@@ -430,6 +468,22 @@ fn resolve_exe(proto: u8, local_port: u16) -> Option<String> {
         return None;
     }
     Some(exe.to_string_lossy().into_owned())
+}
+
+/// `resolve_exe`, but the /proc/*/fd scan it does per packet is the hot path
+/// — TTL-cache it per (proto, port).
+fn resolve_exe_cached(proto: u8, local_port: u16) -> Option<String> {
+    type Cache = HashMap<(u8, u16), (Option<String>, Instant)>;
+    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| Mutex::new(Cache::new()));
+    let (key, now) = ((proto, local_port), Instant::now());
+    if let Some((exe, at)) = CACHE.lock().unwrap().get(&key)
+        && now.duration_since(*at) < EXE_CACHE_TTL
+    {
+        return exe.clone();
+    }
+    let exe = resolve_exe(proto, local_port);
+    CACHE.lock().unwrap().insert(key, (exe.clone(), now));
+    exe
 }
 
 /// `port: None` (whole-app, from Apps/Conflicts) wipes every existing rule
@@ -575,7 +629,7 @@ fn queue_loop(
         // never match anything again)
         let rule_port = pkt.dst_port;
 
-        let exe = resolve_exe(pkt.proto, local_port);
+        let exe = resolve_exe_cached(pkt.proto, local_port);
 
         if debug {
             println!(
@@ -830,6 +884,24 @@ fn handle_client_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the one check that fails if inode_pid_map stops agreeing with the
+    /// per-inode scan it replaced: bind a real socket, then look it up both ways
+    #[test]
+    fn inode_map_finds_our_own_listening_socket() {
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let inode = find_inode(6, port).expect("our listener is in /proc/net/tcp");
+        assert_eq!(
+            inode_pid_map().get(&inode).copied(),
+            find_pid_by_inode(inode),
+            "map disagrees with the sequential scan"
+        );
+        assert_eq!(
+            inode_pid_map().get(&inode).copied(),
+            Some(std::process::id())
+        );
+    }
 
     #[test]
     fn parses_ipv4_tcp_header() {
