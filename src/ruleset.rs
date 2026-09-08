@@ -13,9 +13,8 @@ pub const LOG_PREFIX_OUT: &str = "guardit-out: ";
 /// crashed or was never started. The real cost is real too — `guardit
 /// apply` without a running `guardit daemon` kills all new connections
 /// stone dead (IP/port `Rule`s above still get evaluated first and still
-/// work; it's only the fallback to per-app matching that goes dark). Run
-/// the daemon as a real supervised service (systemd, a restart loop,
-/// whatever) if that trade-off matters to you — it isn't done here.
+/// work; it's only the fallback to per-app matching that goes dark) —
+/// install.sh keeps it supervised (systemd or cron) for exactly that reason.
 pub const QUEUE_IN: u16 = 0;
 pub const QUEUE_OUT: u16 = 1;
 
@@ -186,13 +185,5 @@ mod tests {
 }
 
 pub fn is_root() -> bool {
-    // no getuid in std; shell out is overkill, read /proc/self/status
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Uid:"))
-                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u32>().ok())
-        })
-        == Some(0)
+    unsafe { libc::geteuid() == 0 }
 }
