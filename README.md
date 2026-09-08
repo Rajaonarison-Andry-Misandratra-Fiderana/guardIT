@@ -91,3 +91,7 @@ one connection/port".
 - **PID resolution has a narrow TOCTOU window** (the same one every `/proc`-based tool
   has) — a re-check right before trusting the result shrinks it, doesn't erase it. A truly
   atomic answer needs a kernel-level hook (eBPF at `connect()`), out of scope here.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
