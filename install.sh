@@ -8,6 +8,12 @@ sudo install -Dm755 guardit-supervise.sh /usr/local/bin/guardit-supervise.sh
 
 echo "installed: $(command -v guardit)"
 
+# config moved from root's $HOME to a fixed /etc path — carry an existing one over once
+if [ ! -e /etc/guardit ] && sudo test -d /root/.config/guardit; then
+    sudo mv /root/.config/guardit /etc/guardit
+    echo "migrated /root/.config/guardit -> /etc/guardit"
+fi
+
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     sudo install -Dm644 guardit.service /etc/systemd/system/guardit.service
     sudo systemctl daemon-reload
