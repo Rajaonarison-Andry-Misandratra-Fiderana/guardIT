@@ -1,3 +1,4 @@
+use crate::blocklist;
 use crate::config::{Action, Config, Proto, Rule};
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -53,11 +54,69 @@ fn rule_line(r: &Rule) -> String {
     }
 }
 
+/// The nft half of `blocklist.block_encrypted_dns`: shut the doors an app
+/// can use to resolve names the daemon's DNS tap will never see.
+///
+/// Names are handled elsewhere (blocklist::DOH_BOOTSTRAP and the `hagezi:doh`
+/// list, both blocked at the DNS layer). This covers the case name blocking
+/// structurally cannot: a client with the resolver's address compiled in,
+/// which never asks a question anyone can filter.
+///
+/// This half is the table-level set definitions; `encrypted_dns_chain` emits
+/// the rules that use them. nft wants the two in those two places.
+fn encrypted_dns_sets(out: &mut String) {
+    for (family, set, addrs) in doh_sets() {
+        let elements = addrs
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "  set {set} {{ type {family}; elements = {{ {elements} }} }}\n"
+        ));
+    }
+}
+
+/// the cached DoH addresses split by family, skipping an empty family — nft
+/// rejects a set declared with no element type in use
+fn doh_sets() -> Vec<(&'static str, &'static str, Vec<std::net::IpAddr>)> {
+    let ips = blocklist::doh_ips();
+    let (v4, v6): (Vec<_>, Vec<_>) = ips.into_iter().partition(|ip| ip.is_ipv4());
+    [("ipv4_addr", "doh4", v4), ("ipv6_addr", "doh6", v6)]
+        .into_iter()
+        .filter(|(_, _, a)| !a.is_empty())
+        .collect()
+}
+
+/// Output-chain rules for the same thing.
+///
+/// `reject` rather than `drop` on purpose. A dropped packet leaves the client
+/// retrying until its own timeout, which reads to the user as a hang; a
+/// refused one makes it fall back to plain DNS immediately, which is exactly
+/// where these lists can act. Only ports 853 (DoT/DoQ) and 443 to a known
+/// DoH address (DoH, and DoH3 over QUIC) are touched, so a resolver ip that
+/// also serves a website stays reachable for everything else.
+fn encrypted_dns_chain(out: &mut String) {
+    out.push_str("    tcp dport 853 reject with tcp reset\n");
+    out.push_str("    udp dport 853 reject\n");
+    for (_, set, _) in doh_sets() {
+        let family = if set == "doh4" { "ip" } else { "ip6" };
+        out.push_str(&format!(
+            "    {family} daddr @{set} tcp dport 443 reject with tcp reset\n"
+        ));
+        out.push_str(&format!("    {family} daddr @{set} udp dport 443 reject\n"));
+    }
+}
+
 /// Renders the config as an nft ruleset (plain nft syntax, not JSON —
 /// simpler to read/debug than hand-building the -j schema).
 pub fn render(cfg: &Config) -> String {
+    let block_dns = cfg.blocklist.enabled && cfg.blocklist.block_encrypted_dns;
     let mut out = String::new();
     out.push_str(&format!("table inet {TABLE} {{\n"));
+    if block_dns {
+        encrypted_dns_sets(&mut out);
+    }
     out.push_str("  chain input {\n");
     out.push_str("    type filter hook input priority 0; policy drop;\n");
     // before `iif lo`: a local resolver's replies to apps come over lo
@@ -79,6 +138,11 @@ pub fn render(cfg: &Config) -> String {
     // per-app rules can actually deny outgoing traffic
     out.push_str("  chain output {\n");
     out.push_str("    type filter hook output priority 0; policy accept;\n");
+    // before the queue: an encrypted-dns attempt is refused outright rather
+    // than held open waiting for a per-app decision nobody wants to make
+    if block_dns {
+        encrypted_dns_chain(&mut out);
+    }
     out.push_str(&format!(
         "    ct state new log prefix \"{LOG_PREFIX_OUT}\" queue num {QUEUE_OUT}\n"
     ));
@@ -187,6 +251,28 @@ mod tests {
         };
         let out = render(&cfg);
         assert!(out.contains("ip6 saddr fd00::1/64 tcp dport 22 accept"));
+    }
+
+    #[test]
+    fn encrypted_dns_is_only_refused_when_asked_for() {
+        let mut cfg = Config::default();
+        assert!(
+            !render(&cfg).contains("853"),
+            "off by default, like the whole blocklist"
+        );
+
+        cfg.blocklist.enabled = true;
+        cfg.blocklist.block_encrypted_dns = true;
+        let out = render(&cfg);
+        assert!(out.contains("tcp dport 853 reject with tcp reset\n"));
+        assert!(out.contains("udp dport 853 reject\n"));
+        // refused, never dropped: a dropped packet hangs the client until its
+        // own timeout instead of falling back to the dns we can filter
+        let chain = out.split("chain output").nth(1).unwrap();
+        assert!(!chain.contains("853 drop"));
+
+        cfg.blocklist.block_encrypted_dns = false;
+        assert!(!render(&cfg).contains("853"));
     }
 
     #[test]

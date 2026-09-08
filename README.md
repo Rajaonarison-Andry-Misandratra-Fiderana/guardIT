@@ -132,20 +132,92 @@ app doing DoH/DoT, or answering from its own cache, is invisible to the tap and 
 to host rules. Treat them as a convenience over named destinations, not a containment
 boundary — for that, deny the app and allow the ports you mean.
 
+## Ads and tracking blocking
+
+Curated domain blocklists, matched against every DNS lookup the daemon sees. A blocked
+name's answer is rewritten to NXDOMAIN, so the app never learns an address and never opens
+the connection.
+
+```
+sudo guardit blocklist on                   # enables hagezi:pro
+sudo guardit blocklist update                # download now (the daemon also does it daily)
+guardit blocklist sources                    # the catalogue, * = enabled
+sudo guardit blocklist enable hagezi:tif     # add malware/phishing coverage
+sudo guardit blocklist disable hagezi:tif
+guardit blocklist status                     # what's on, domains loaded, how stale
+guardit blocklist check ads.example.com      # would this be blocked, right now
+sudo guardit blocklist allow cdn.example.com # never block this name, nor anything under it
+sudo guardit blocklist off
+```
+
+Lists come from HaGeZi, StevenBlack, OISD, AdGuard and Peter Lowe, each in several levels
+(`hagezi:light` … `hagezi:ultimate`, plus focused ones: `tif` for malware/phishing, `fake`,
+`gambling`, `nsfw`, `native.tiktok`, `native.winoffice`; `stevenblack:porn`,
+`stevenblack:social`, and so on). `guardit blocklist sources` lists them all with what each
+covers. Enabled lists are merged into one set, so several can be on at once. Downloads live
+in `/var/lib/guardit/blocklists/`.
+
+A listed name covers everything under it, and an allowlist entry beats the lists and
+rescues its own subtree — so `allow good.example.com` still works with `example.com`
+blocked.
+
+### Encrypted DNS
+
+Name-based blocking only reaches lookups the daemon can read. An app doing DNS-over-HTTPS
+or DNS-over-TLS resolves names guardit never sees, and ignores blocking entirely — which
+is most browsers, by default, in some regions.
+
+So `block_encrypted_dns` is on by default. It refuses DoT/DoQ (port 853) and port 443 to
+the maintained list of DoH resolver addresses, and returns NXDOMAIN for the DoH bootstrap
+names and for Mozilla's `use-application-dns.net` canary, which is the documented signal
+for Firefox to turn its own DoH off. `reject`, not `drop`, so a client falls back to plain
+DNS immediately instead of hanging. Turn it off with `block_encrypted_dns = false` if you
+run your own encrypted resolver on purpose.
+
+### Configuration
+
+```toml
+[blocklist]
+enabled = true
+sources = ["hagezi:pro", "hagezi:tif"]
+allow = ["cdn.example.com"]
+block_encrypted_dns = true
+update_hours = 24            # 0 to never auto-update
+```
+
+Edited by hand or by `guardit blocklist`; either way the daemon picks it up within
+seconds.
+
+### What it does not cover
+
+The DNS tap sees plain DNS over UDP only. A name an app already had cached, resolved over
+a channel guardit could not read, or looked up over DNS-over-TCP, is not filtered — nor is
+a connection made straight to a hardcoded ip with no lookup at all. Blocking works on names, so treat it as an ad and
+tracker blocker, which is what it is, rather than as a containment boundary; for that,
+deny the app and allow the ports you mean.
+
 ## The TUI
 
-Five panes in a fixed grid, `Tab` / `Shift+Tab` to move between them — the focused one gets
-a thick border:
+Five panes in a fixed grid — three of them focusable, `Tab` / `Shift+Tab` to move between
+them, the focused one gets a thick border:
 
 | Pane | What it shows | Keys |
 |---|---|---|
 | **System rules** | IP/port `Rule`s (nftables-level) | `j/k` move · `space` toggle · `d` delete · `a` add · `p` presets (changes apply immediately) |
 | **Application blocking** | one row per app, its whole-app default, and how many per-port overrides it has — apps with no rule yet sort to the top | `j/k` select · `Enter` jump to its Flow · `l` this app's log · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely · `/` filter by name (live; `Enter` keeps it, `Esc` clears) |
-| **Listening ports** | every LISTEN/bound local socket, who owns it, and real bind conflicts (rare — the kernel already prevents most) | `j/k` select · `l` log · `y`/`n` allow/deny **this port only** |
-| **Top apps** | bar chart of the apps with the most connection attempts, over the whole audit log (reset by `f` flush) | informational |
+| **Top apps** | bar chart of the apps with the most connection attempts, over the whole audit log (reset by `f` flush), each app's total above its bar | informational |
+| **Ads & tracking** | how the blocklists are doing: a ring of DNS lookups allowed vs blocked with the block rate in the middle, then each figure under its own label — lookups, blocked, allowed, domains loaded, lists enabled, last update, whether encrypted DNS is refused, and the last name blocked | informational |
 | **Network flow** | live connection history for whichever app is selected in Application blocking | `j/k` select · `y`/`n` allow/deny **this port and direction only** (remembered as a per-port rule) · `Y`/`N` allow/deny **this peer's hostname**, any port (needs a resolved name; uses the exact name — `--host '*.foo.com'` on the CLI for a whole domain) |
 
-Other keys: `L` opens the full audit log as its own tab (`j/k` move, `f` flush with confirm, `q`/`L` back), `t` cycles color theme (remembered across restarts), `q` quits.
+`L` opens a second tab holding the two "what has been going on" views side by side —
+`Tab` switches between them, `q`/`L` goes back:
+
+| Pane | What it shows | Keys |
+|---|---|---|
+| **App log** | the full unthrottled audit trail from `history.jsonl` | `j/k` move · `/` filter by port, ip or name (live; a number is matched against the port, anything else as a substring of the address, resolved name or app path) · `f` flush with confirm |
+| **Listening ports** | every LISTEN/bound local socket, who owns it, and real bind conflicts (rare — the kernel already prevents most) | `j/k` select · `l` this app's log · `y`/`n` allow/deny **this port only** |
+
+Other keys: `t` cycles color theme (remembered across restarts), `q` quits.
 
 ## License
 

@@ -1,18 +1,19 @@
+use crate::blocklist;
 use crate::config::{
     Action, AppRule, Config, Direction, config_path, fingerprint, match_rule, now_ts,
 };
 use crate::ipc::{self, ClientMsg, FlowStatus, FlowWire, ServerMsg};
 use crate::ruleset::{QUEUE_DNS, QUEUE_IN, QUEUE_OUT};
 use nfq::{Queue, Verdict};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 type AppRules = Arc<Mutex<Vec<AppRule>>>;
@@ -263,28 +264,73 @@ pub fn peer_name(ip: &IpAddr) -> Option<String> {
     DNS_NAMES.lock().unwrap().get(ip).cloned()
 }
 
-/// passive DNS tap on QUEUE_DNS: every UDP reply from port 53 is parsed
-/// for A/AAAA answers and accepted untouched. Only ever a display aid —
-/// DoH/DoT and anything the app already had cached go unseen.
+/// DNS tap on QUEUE_DNS: every UDP reply from port 53 passes through here.
+///
+/// Two jobs, in this order. If the name is on an enabled blocklist the reply
+/// is rewritten to NXDOMAIN, so the app never learns an address and never
+/// opens the connection. Otherwise the A/AAAA answers are recorded as the
+/// ip -> name map the dashboard and host rules read.
+///
+/// Both are blind to anything the daemon can't read: DoH/DoT, and names the
+/// app already had cached. `blocklist.block_encrypted_dns` exists to shrink
+/// the first of those to nothing.
+/// ponytail: udp only — a stub resolver that falls back to DNS over TCP
+/// (truncated reply, or one configured to prefer it) is unfiltered; queue
+/// `tcp sport 53` and length-prefix the same rewrite if that ever shows up
 fn dns_loop() -> std::io::Result<()> {
     let mut queue = Queue::open()?;
     queue.bind(QUEUE_DNS)?;
     loop {
         let mut msg = queue.recv()?;
-        if let Some(pkt) = parse_packet(msg.get_payload())
-            && pkt.proto == 17
-            && pkt.src_port == 53
-            && let Some(dns) = msg.get_payload().get(pkt.l4 + 8..)
-            && let Some((name, ips)) = parse_dns_answers(dns)
-        {
-            let mut map = DNS_NAMES.lock().unwrap();
-            if map.len() >= DNS_NAMES_CAP {
-                map.clear();
+
+        // decided against the borrowed payload, applied after it is dropped
+        enum Act {
+            Nothing,
+            Learn(String, Vec<IpAddr>),
+            Nxdomain(String, Vec<u8>),
+        }
+        let act = {
+            let payload = msg.get_payload();
+            match parse_packet(payload) {
+                Some(pkt) if pkt.proto == 17 && pkt.src_port == 53 => {
+                    DNS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    match payload.get(pkt.l4 + 8..) {
+                        Some(dns) => match dns_question(dns) {
+                            Some((name, q_end)) if BLOCKLIST.read().unwrap().blocked(&name) => {
+                                match nxdomain_reply(payload, pkt.l4, q_end) {
+                                    Some(new) => Act::Nxdomain(name, new),
+                                    None => Act::Nothing,
+                                }
+                            }
+                            _ => match parse_dns_answers(dns) {
+                                Some((name, ips)) => Act::Learn(name, ips),
+                                None => Act::Nothing,
+                            },
+                        },
+                        None => Act::Nothing,
+                    }
+                }
+                _ => Act::Nothing,
             }
-            for ip in ips {
-                map.insert(ip, name.clone());
+        };
+
+        match act {
+            Act::Nothing => {}
+            Act::Learn(name, ips) => {
+                let mut map = DNS_NAMES.lock().unwrap();
+                if map.len() >= DNS_NAMES_CAP {
+                    map.clear();
+                }
+                for ip in ips {
+                    map.insert(ip, name.clone());
+                }
+            }
+            Act::Nxdomain(name, new) => {
+                msg.set_payload(new);
+                note_blocked(&name);
             }
         }
+
         msg.set_verdict(Verdict::Accept);
         queue.verdict(msg)?;
     }
@@ -355,6 +401,187 @@ fn dns_read_name(msg: &[u8], mut pos: usize) -> Option<(String, usize)> {
         pos += 1 + len;
     }
     Some((name, end.unwrap_or(pos)))
+}
+
+/// The question a DNS message asks: the name, and the offset just past the
+/// question section. Only single-question messages, which in practice is
+/// every DNS message on a real network — multi-question is unimplemented in
+/// every resolver worth the name, and rewriting one would mean answering a
+/// question we didn't read.
+fn dns_question(msg: &[u8]) -> Option<(String, usize)> {
+    if msg.len() < 12 || u16::from_be_bytes([msg[4], msg[5]]) != 1 {
+        return None;
+    }
+    let (name, end) = dns_read_name(msg, 12)?;
+    let end = end + 4; // QTYPE + QCLASS
+    (end <= msg.len()).then_some((name, end))
+}
+
+/// RFC 1071 ones' complement sum over a sequence of byte runs, folded to 16
+/// bits. Takes runs rather than one slice so the udp pseudo-header can be
+/// summed without ever being materialised.
+fn ones_complement(runs: &[&[u8]]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut carry_byte: Option<u8> = None;
+    for run in runs {
+        let mut i = 0;
+        if let Some(hi) = carry_byte.take() {
+            let lo = *run.first().unwrap_or(&0);
+            sum += u16::from_be_bytes([hi, lo]) as u32;
+            i = 1;
+        }
+        while i + 1 < run.len() {
+            sum += u16::from_be_bytes([run[i], run[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < run.len() {
+            carry_byte = Some(run[i]);
+        }
+    }
+    if let Some(hi) = carry_byte {
+        sum += u16::from_be_bytes([hi, 0]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Rewrites a DNS *reply* packet into an NXDOMAIN for the same question.
+///
+/// The reply is already addressed to the app that asked, and we hold it in
+/// the queue, so this needs no raw socket and no address juggling: keep the
+/// ip and udp headers, replace the DNS body with header + question and the
+/// NXDOMAIN rcode, then fix up the two lengths and both checksums. Returns
+/// None (leave the packet alone) rather than emitting anything malformed.
+fn nxdomain_reply(payload: &[u8], l4: usize, q_end: usize) -> Option<Vec<u8>> {
+    let dns = payload.get(l4 + 8..)?;
+    let question = dns.get(12..q_end)?;
+
+    let mut body = Vec::with_capacity(12 + question.len());
+    body.extend_from_slice(&dns[0..2]); // same transaction id
+    // QR=1, opcode 0, AA=0, TC=0, RD copied from the exchange; RA=1, rcode 3
+    body.push(0x80 | (dns[2] & 0x01));
+    body.push(0x83);
+    body.extend_from_slice(&[0, 1]); // QDCOUNT — the question is kept
+    body.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // AN, NS, AR: nothing
+    body.extend_from_slice(question);
+
+    let udp_len = (8 + body.len()) as u16;
+    let mut out = Vec::with_capacity(l4 + udp_len as usize);
+    out.extend_from_slice(payload.get(..l4 + 8)?);
+    out.extend_from_slice(&body);
+
+    // udp length, then checksum over the pseudo-header + udp header + body
+    out[l4 + 4..l4 + 6].copy_from_slice(&udp_len.to_be_bytes());
+    out[l4 + 6..l4 + 8].copy_from_slice(&[0, 0]);
+    let ck = match payload[0] >> 4 {
+        4 => {
+            let total = (l4 + udp_len as usize) as u16;
+            out[2..4].copy_from_slice(&total.to_be_bytes());
+            out[10..12].copy_from_slice(&[0, 0]);
+            let ip_ck = ones_complement(&[&out[..l4]]);
+            out[10..12].copy_from_slice(&ip_ck.to_be_bytes());
+            ones_complement(&[
+                &out[12..20],                 // src + dst
+                &[0, 17],                     // zero + protocol
+                &udp_len.to_be_bytes(),       // udp length, again
+                &out[l4..l4 + udp_len as usize],
+            ])
+        }
+        6 => {
+            out[4..6].copy_from_slice(&udp_len.to_be_bytes()); // payload length
+            ones_complement(&[
+                &out[8..40],                            // src + dst
+                &(udp_len as u32).to_be_bytes(),        // upper-layer length
+                &[0, 0, 0, 17],                         // zeroes + next header
+                &out[l4..l4 + udp_len as usize],
+            ])
+        }
+        _ => return None,
+    };
+    // 0 means "no checksum" on ipv4 udp and is illegal on ipv6, so the
+    // all-ones form is transmitted instead (RFC 768)
+    let ck = if ck == 0 { 0xFFFF } else { ck };
+    out[l4 + 6..l4 + 8].copy_from_slice(&ck.to_be_bytes());
+    Some(out)
+}
+
+/// the lists in force, swapped wholesale on a config reload or an update —
+/// read on every DNS reply, written a couple of times a day
+pub static BLOCKLIST: LazyLock<RwLock<blocklist::Blocklist>> =
+    LazyLock::new(|| RwLock::new(blocklist::Blocklist::default()));
+static BLOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// every DNS reply the tap saw, blocked or not — the denominator the
+/// dashboard's block rate is a fraction of
+static DNS_TOTAL: AtomicU64 = AtomicU64::new(0);
+const BLOCKED_RECENT_CAP: usize = 200;
+/// newest last; what the TUI's blocklist tab shows so a false positive is
+/// visible the moment it happens instead of being inferred from a broken page
+static BLOCKED_RECENT: LazyLock<Mutex<VecDeque<(u64, String)>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+/// the blocklist section the loaded lists were built from, so a config
+/// write that didn't touch it (every rule edit does write the file) doesn't
+/// re-read tens of megabytes of domains off disk
+static BLOCKLIST_CFG: LazyLock<Mutex<crate::config::BlocklistConfig>> =
+    LazyLock::new(|| Mutex::new(crate::config::BlocklistConfig::default()));
+
+pub fn reload_blocklist(cfg: &Config) {
+    let fresh = blocklist::Blocklist::load(&cfg.blocklist);
+    let n = fresh.len();
+    *BLOCKLIST.write().unwrap() = fresh;
+    *BLOCKLIST_CFG.lock().unwrap() = cfg.blocklist.clone();
+    if cfg.blocklist.enabled {
+        eprintln!(
+            "guardit daemon: blocklist on — {n} domains from {} list(s)",
+            cfg.blocklist.sources.len()
+        );
+    }
+}
+
+/// same, but only when the section actually changed. The list *files* can
+/// change under an unchanged section (an update ran), so callers that just
+/// downloaded something use `reload_blocklist` directly.
+fn reload_blocklist_if_changed(cfg: &Config) {
+    let changed = *BLOCKLIST_CFG.lock().unwrap() != cfg.blocklist;
+    if changed {
+        reload_blocklist(cfg);
+    }
+}
+
+pub fn blocked_recent() -> Vec<(u64, String)> {
+    BLOCKED_RECENT.lock().unwrap().iter().cloned().collect()
+}
+
+/// the dashboard payload, assembled from the live counters and the config
+pub fn blocklist_stats(cfg: &crate::config::BlocklistConfig) -> ipc::BlocklistStats {
+    ipc::BlocklistStats {
+        enabled: cfg.enabled,
+        encrypted_dns_blocked: cfg.enabled && cfg.block_encrypted_dns,
+        sources: cfg.sources.clone(),
+        domains: BLOCKLIST.read().unwrap().len(),
+        queries: DNS_TOTAL.load(Ordering::Relaxed),
+        blocked: BLOCKED_TOTAL.load(Ordering::Relaxed),
+        recent: blocked_recent(),
+        // the oldest list is the one that decides how stale the set is, and
+        // a never-downloaded list makes the whole thing unknown
+        updated_at: cfg
+            .sources
+            .iter()
+            .map(|k| blocklist::cached_at(k))
+            .try_fold(u64::MAX, |acc, t| t.map(|t| acc.min(t)))
+            .filter(|_| !cfg.sources.is_empty()),
+    }
+}
+
+fn note_blocked(name: &str) {
+    BLOCKED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let mut recent = BLOCKED_RECENT.lock().unwrap();
+    if recent.len() >= BLOCKED_RECENT_CAP {
+        recent.pop_front();
+    }
+    recent.push_back((now_ts(), name.to_string()));
 }
 
 fn proto_name(proto: u8) -> &'static str {
@@ -725,7 +952,12 @@ fn reload_if_edited(
     }
     *last_mtime = mtime;
     let fresh = match Config::try_load() {
-        Ok(cfg) => cfg.app_rule,
+        Ok(cfg) => {
+            // the same file carries the blocklist section, and a hand edit
+            // there has to take effect as surely as one to a rule
+            reload_blocklist_if_changed(&cfg);
+            cfg.app_rule
+        }
         Err(e) => {
             eprintln!("guardit daemon: {e} — keeping the rules already loaded");
             return None;
@@ -751,6 +983,60 @@ fn sweep_expired(app_rules: &AppRules) -> Option<Vec<AppRule>> {
     let fresh = Config::update(|cfg| cfg.app_rule.retain(|r| !r.expired(now)));
     *app_rules.lock().unwrap() = fresh.app_rule.clone();
     Some(fresh.app_rule)
+}
+
+/// how often the auto-updater wakes to ask whether anything is stale. The
+/// interval that matters is `blocklist.update_hours`; this only bounds how
+/// late an update can be, and how soon one starts after the config is turned
+/// on, so it wants to be short relative to hours and cheap enough to ignore.
+const BLOCKLIST_CHECK_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Refetches the enabled lists when they are older than `update_hours`.
+///
+/// Re-reads the config each pass rather than capturing it: blocking can be
+/// switched on, and lists added, while the daemon runs. A list that has
+/// never been downloaded is due immediately, which is what makes `guardit
+/// blocklist enable` work without a separate update command.
+fn blocklist_update_loop() {
+    loop {
+        std::thread::sleep(BLOCKLIST_CHECK_INTERVAL);
+        let cfg = match Config::try_load() {
+            Ok(c) => c,
+            Err(_) => continue, // reload_if_edited already reports a bad file
+        };
+        if !cfg.blocklist.enabled || cfg.blocklist.update_hours == 0 {
+            continue;
+        }
+        let max_age = cfg.blocklist.update_hours as u64 * 3600;
+        let now = now_ts();
+        let mut keys: Vec<String> = cfg.blocklist.sources.clone();
+        if cfg.blocklist.block_encrypted_dns {
+            keys.push(blocklist::DOH_IPS_KEY.to_string());
+        }
+        let due = keys.iter().any(|k| {
+            blocklist::cached_at(k).is_none_or(|t| now.saturating_sub(t) >= max_age)
+        });
+        if !due {
+            continue;
+        }
+        eprintln!("guardit daemon: refreshing blocklists");
+        let mut doh_ips_changed = false;
+        for (key, res) in blocklist::update_all(&cfg.blocklist) {
+            match res {
+                Ok(n) => {
+                    eprintln!("guardit daemon: {key}: {n} entries");
+                    doh_ips_changed |= key == blocklist::DOH_IPS_KEY;
+                }
+                Err(e) => eprintln!("guardit daemon: {key}: {e}"),
+            }
+        }
+        reload_blocklist(&cfg);
+        // the DoH addresses are compiled into the nft ruleset, not read at
+        // match time, so a new set of them only takes effect on a reload
+        if doh_ips_changed && let Err(e) = crate::ruleset::apply(&cfg) {
+            eprintln!("guardit daemon: reapplying ruleset after doh ip update: {e}");
+        }
+    }
 }
 
 fn to_verdict(action: Action) -> Verdict {
@@ -808,6 +1094,8 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
         }));
     }
 
+    reload_blocklist(&cfg);
+
     std::thread::spawn(|| {
         if let Err(e) = dns_loop() {
             eprintln!(
@@ -817,11 +1105,16 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
     });
 
     if !debug {
+        std::thread::spawn(blocklist_update_loop);
+    }
+
+    if !debug {
         let scan_listening = listening.clone();
         let scan_event_tx = event_tx.clone();
         let scan_app_rules = app_rules.clone();
         std::thread::spawn(move || {
             let mut cfg_mtime = fs::metadata(config_path()).and_then(|m| m.modified()).ok();
+            let mut last_stats = ipc::BlocklistStats::default();
             loop {
                 std::thread::sleep(LISTEN_SCAN_INTERVAL);
                 if let Some(rules) = reload_if_edited(&scan_app_rules, &mut cfg_mtime) {
@@ -839,6 +1132,11 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
                 };
                 if changed {
                     let _ = scan_event_tx.send(ServerMsg::Listening(fresh));
+                }
+                let stats = blocklist_stats(&BLOCKLIST_CFG.lock().unwrap().clone());
+                if stats != last_stats {
+                    last_stats = stats.clone();
+                    let _ = scan_event_tx.send(ServerMsg::Blocklist(stats));
                 }
             }
         });
@@ -1161,6 +1459,7 @@ fn handle_client(
         app_rules: app_rules.lock().unwrap().clone(),
         flow: history.lock().unwrap().clone(),
         listening: listening.lock().unwrap().clone(),
+        blocklist: blocklist_stats(&BLOCKLIST_CFG.lock().unwrap().clone()),
     };
     if ipc::send_msg(&mut writer, &snapshot).is_err() {
         return;
@@ -1274,6 +1573,86 @@ mod tests {
         let cg = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/snap.code-insiders.code-insiders-9f8a1c2e-3b4d-4e5f-8a9b-0c1d2e3f4a5b.scope\n";
         assert_eq!(snap_id(cg), Some("code-insiders.code-insiders"));
         assert_eq!(snap_id("0::/user.slice/app-ghostty-26675.scope\n"), None);
+    }
+
+    /// a minimal ipv4/udp/dns reply: one question, one A answer
+    fn dns_reply_packet() -> Vec<u8> {
+        let mut dns = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        for label in ["ads", "example", "com"] {
+            dns.push(label.len() as u8);
+            dns.extend_from_slice(label.as_bytes());
+        }
+        dns.push(0);
+        dns.extend_from_slice(&[0, 1, 0, 1]); // QTYPE A, QCLASS IN
+        dns.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34]);
+
+        let udp_len = (8 + dns.len()) as u16;
+        let total = (20 + udp_len) as u16;
+        let mut p = vec![0x45, 0];
+        p.extend_from_slice(&total.to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
+        p.extend_from_slice(&[1, 1, 1, 1]); // src: the resolver
+        p.extend_from_slice(&[10, 0, 0, 2]); // dst: us
+        p.extend_from_slice(&53u16.to_be_bytes());
+        p.extend_from_slice(&40000u16.to_be_bytes());
+        p.extend_from_slice(&udp_len.to_be_bytes());
+        p.extend_from_slice(&[0, 0]);
+        p.extend_from_slice(&dns);
+        p
+    }
+
+    #[test]
+    fn reads_the_question_out_of_a_reply() {
+        let p = dns_reply_packet();
+        let dns = &p[28..];
+        let (name, end) = dns_question(dns).unwrap();
+        assert_eq!(name, "ads.example.com");
+        assert_eq!(end, 12 + 17 + 4, "header + name + qtype/qclass");
+    }
+
+    #[test]
+    fn rewrites_a_reply_into_a_well_formed_nxdomain() {
+        let p = dns_reply_packet();
+        let (_, q_end) = dns_question(&p[28..]).unwrap();
+        let out = nxdomain_reply(&p, 20, q_end).unwrap();
+
+        let dns = &out[28..];
+        assert_eq!(&dns[0..2], &[0x12, 0x34], "same transaction id");
+        assert_eq!(dns[2] & 0x80, 0x80, "QR: it is an answer");
+        assert_eq!(dns[3] & 0x0F, 3, "NXDOMAIN");
+        assert_eq!(u16::from_be_bytes([dns[4], dns[5]]), 1, "question kept");
+        assert_eq!(u16::from_be_bytes([dns[6], dns[7]]), 0, "no answer records");
+        assert_eq!(
+            dns_question(dns).unwrap().0,
+            "ads.example.com",
+            "answers the question that was asked"
+        );
+        assert_eq!(dns.len(), q_end, "the answer section is gone, not just zeroed");
+
+        // lengths agree with the bytes actually present
+        assert_eq!(u16::from_be_bytes([out[2], out[3]]) as usize, out.len());
+        assert_eq!(
+            u16::from_be_bytes([out[24], out[25]]) as usize,
+            out.len() - 20
+        );
+        // a correct checksum makes the sum over the covered bytes come out 0
+        assert_eq!(ones_complement(&[&out[..20]]), 0, "ip header checksum");
+        let udp_len = (out.len() - 20) as u16;
+        assert_eq!(
+            ones_complement(&[
+                &out[12..20],
+                &[0, 17],
+                &udp_len.to_be_bytes(),
+                &out[20..],
+            ]),
+            0,
+            "udp checksum"
+        );
+    }
+
+    #[test]
+    fn leaves_a_packet_it_cannot_rewrite_alone() {
+        assert!(nxdomain_reply(&[0u8; 8], 20, 20).is_none());
     }
 
     #[test]

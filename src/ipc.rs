@@ -74,6 +74,29 @@ pub struct ListenEntry {
     pub exe: String,
 }
 
+/// What the ads/tracking dashboard shows. Counters are since the daemon
+/// started — this is a "what is it doing right now" panel, not an audit
+/// trail; the per-connection trail is history.jsonl.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlocklistStats {
+    pub enabled: bool,
+    pub encrypted_dns_blocked: bool,
+    /// `id:level` keys currently in force
+    pub sources: Vec<String>,
+    /// domains loaded across all of them, after merging
+    pub domains: usize,
+    /// DNS replies the daemon saw at all
+    pub queries: u64,
+    /// how many of those it rewrote to NXDOMAIN
+    pub blocked: u64,
+    /// most recent blocked names, oldest first — a false positive is
+    /// supposed to be visible here the moment a page breaks
+    pub recent: Vec<(u64, String)>,
+    /// unix seconds of the oldest enabled list's last download; None = at
+    /// least one list has never been fetched
+    pub updated_at: Option<u64>,
+}
+
 /// daemon -> tui
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMsg {
@@ -82,7 +105,11 @@ pub enum ServerMsg {
         app_rules: Vec<AppRule>,
         flow: Vec<FlowWire>,
         listening: Vec<ListenEntry>,
+        #[serde(default)]
+        blocklist: BlocklistStats,
     },
+    /// refreshed counters for the ads/tracking dashboard
+    Blocklist(BlocklistStats),
     /// a new row to append (a fresh ask, or an already-verdicted matched connection)
     FlowNew(FlowWire),
     /// an existing pending row (by req_id) got its final status

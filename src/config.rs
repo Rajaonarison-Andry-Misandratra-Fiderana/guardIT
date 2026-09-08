@@ -219,6 +219,46 @@ fn default_true() -> bool {
     true
 }
 
+fn default_update_hours() -> u32 {
+    24
+}
+
+/// Ads / tracking blocking (see src/blocklist.rs). Off until someone turns
+/// it on: it changes what every DNS lookup on the machine resolves to, which
+/// is not something an install should start doing on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlocklistConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `id:level` keys from blocklist::SOURCES, merged into one set
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// names that are never blocked, whatever the lists say — an entry also
+    /// rescues everything under it (blocklist::Blocklist::blocked)
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// refuse DoT/DoQ and known DoH endpoints, so apps fall back to the
+    /// plain DNS these lists can actually filter. Without it a browser doing
+    /// its own DoH ignores blocking entirely — see the README
+    #[serde(default = "default_true")]
+    pub block_encrypted_dns: bool,
+    /// how often the daemon refetches the enabled lists; 0 = never
+    #[serde(default = "default_update_hours")]
+    pub update_hours: u32,
+}
+
+impl Default for BlocklistConfig {
+    fn default() -> Self {
+        BlocklistConfig {
+            enabled: false,
+            sources: Vec::new(),
+            allow: Vec::new(),
+            block_encrypted_dns: true,
+            update_hours: default_update_hours(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -236,6 +276,8 @@ pub struct Config {
     /// open, and can answer with `guardit answer`
     #[serde(default = "default_true")]
     pub notify: bool,
+    #[serde(default)]
+    pub blocklist: BlocklistConfig,
 }
 
 impl Default for Config {
@@ -246,6 +288,7 @@ impl Default for Config {
             pending_timeout_secs: default_pending_timeout(),
             default_verdict: default_verdict(),
             notify: true,
+            blocklist: BlocklistConfig::default(),
         }
     }
 }

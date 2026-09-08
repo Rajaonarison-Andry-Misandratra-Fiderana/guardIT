@@ -1,3 +1,4 @@
+mod blocklist;
 mod config;
 mod daemon;
 mod ipc;
@@ -91,7 +92,34 @@ enum AppCmd {
 }
 
 #[derive(Subcommand)]
+enum BlocklistCmd {
+    /// every list you can enable, with what it covers
+    Sources,
+    /// what is on, how many domains are loaded, when each list was fetched
+    Status,
+    /// turn ads/tracking blocking on (enables the recommended list if none is chosen)
+    On,
+    /// turn it off — the downloaded lists are kept
+    Off,
+    /// add a list, e.g. `hagezi:pro` (see `sources`)
+    Enable { key: String },
+    /// remove a list
+    Disable { key: String },
+    /// download the enabled lists now
+    Update,
+    /// never block this name, or anything under it
+    Allow { domain: String },
+    /// undo `allow`
+    Unallow { domain: String },
+    /// would this name be blocked right now, and why
+    Check { domain: String },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
+    /// ads and tracking blocking: curated domain lists, matched on every DNS lookup
+    #[command(subcommand)]
+    Blocklist(BlocklistCmd),
     /// per-application rules (what the daemon enforces)
     #[command(subcommand)]
     App(AppCmd),
@@ -159,6 +187,9 @@ fn main() {
             | Cmd::App(AppCmd::List)
             | Cmd::Completions { .. }
             | Cmd::Man
+            | Cmd::Blocklist(
+                BlocklistCmd::Sources | BlocklistCmd::Status | BlocklistCmd::Check { .. }
+            )
     );
     if !read_only && !ruleset::is_root() {
         eprintln!("guardit needs root — run with sudo");
@@ -205,6 +236,7 @@ fn main() {
             }
         }
         Cmd::LogApp { n, exe } => daemon::print_log_app(exe.as_deref(), n),
+        Cmd::Blocklist(sub) => blocklist_cmd(cfg, sub),
         Cmd::App(AppCmd::List) => print_app_list(&cfg),
         Cmd::App(AppCmd::Allow(args)) => set_app_rule(RuleAction::Allow, args),
         Cmd::App(AppCmd::Deny(args)) => set_app_rule(RuleAction::Deny, args),
@@ -416,6 +448,170 @@ fn set_app_rule(action: RuleAction, args: AppRuleArgs) {
             " (daemon not running — saved, applies when it starts)"
         }
     );
+}
+
+/// Applies a change to the blocklist section, then makes it take effect:
+/// the daemon re-reads rules.toml on its own within seconds, but the nft
+/// half of `block_encrypted_dns` lives in the kernel ruleset and only moves
+/// when the ruleset is reloaded.
+fn save_blocklist(mut cfg: Config, mutate: impl FnOnce(&mut config::BlocklistConfig)) {
+    let mut section = cfg.blocklist.clone();
+    mutate(&mut section);
+    let reapply = section.enabled != cfg.blocklist.enabled
+        || section.block_encrypted_dns != cfg.blocklist.block_encrypted_dns;
+    cfg = Config::update(|fresh| fresh.blocklist = section);
+    if reapply && let Err(e) = ruleset::apply(&cfg) {
+        eprintln!("warning: could not reload the kernel ruleset: {e}");
+    }
+    if let Ok(mut c) = ipc::Client::connect() {
+        let _ = c.send(&ClientMsg::Reload);
+    }
+}
+
+fn blocklist_cmd(cfg: Config, sub: BlocklistCmd) {
+    match sub {
+        BlocklistCmd::Sources => {
+            println!("{:<28}COVERS", "LIST");
+            for s in blocklist::SOURCES {
+                let on = cfg.blocklist.sources.contains(&s.key());
+                println!(
+                    "{} {:<26}{}",
+                    if on { "*" } else { " " },
+                    s.key(),
+                    s.about
+                );
+            }
+            println!("\n* = enabled. `guardit blocklist enable <list>` to add one.");
+        }
+        BlocklistCmd::Status => {
+            let b = &cfg.blocklist;
+            println!("blocking:      {}", if b.enabled { "on" } else { "off" });
+            println!(
+                "encrypted dns: {}",
+                if b.block_encrypted_dns {
+                    "refused (DoT/DoQ, and :443 to known DoH addresses)"
+                } else {
+                    "allowed — apps using DoH bypass blocking entirely"
+                }
+            );
+            println!(
+                "auto-update:   {}",
+                match b.update_hours {
+                    0 => "off".to_string(),
+                    h => format!("every {h}h"),
+                }
+            );
+            if b.sources.is_empty() {
+                println!("lists:         none — `guardit blocklist enable hagezi:pro`");
+            } else {
+                println!("lists:");
+                for key in &b.sources {
+                    let age = match blocklist::cached_at(key) {
+                        Some(t) => format!("updated {} ago", daemon::ago(now_ts().saturating_sub(t))),
+                        None => "not downloaded — `guardit blocklist update`".into(),
+                    };
+                    println!("  {key:<26}{age}");
+                }
+            }
+            println!("domains:       {}", blocklist::Blocklist::load(b).len());
+            if !b.allow.is_empty() {
+                println!("allowed:       {}", b.allow.join(", "));
+            }
+        }
+        BlocklistCmd::On => {
+            let seed = cfg.blocklist.sources.is_empty();
+            save_blocklist(cfg, |b| {
+                b.enabled = true;
+                if seed {
+                    b.sources = blocklist::DEFAULT_SOURCES.iter().map(|s| s.to_string()).collect();
+                }
+            });
+            if seed {
+                println!(
+                    "blocking on, with {}",
+                    blocklist::DEFAULT_SOURCES.join(", ")
+                );
+            } else {
+                println!("blocking on");
+            }
+            println!("run `guardit blocklist update` to download the lists now (the daemon does it on its own within 10 minutes)");
+        }
+        BlocklistCmd::Off => {
+            save_blocklist(cfg, |b| b.enabled = false);
+            println!("blocking off (downloaded lists kept)");
+        }
+        BlocklistCmd::Enable { key } => {
+            if blocklist::source(&key).is_none() {
+                fail(&format!(
+                    "unknown list {key:?} — see `guardit blocklist sources`"
+                ));
+            }
+            if cfg.blocklist.sources.contains(&key) {
+                println!("{key} is already enabled");
+                return;
+            }
+            save_blocklist(cfg, |b| b.sources.push(key.clone()));
+            println!("{key} enabled — `guardit blocklist update` to download it now");
+        }
+        BlocklistCmd::Disable { key } => {
+            if !cfg.blocklist.sources.contains(&key) {
+                fail(&format!("{key} is not enabled"));
+            }
+            save_blocklist(cfg, |b| b.sources.retain(|k| *k != key));
+            println!("{key} disabled");
+        }
+        BlocklistCmd::Update => {
+            let results = blocklist::update_all(&cfg.blocklist);
+            if results.is_empty() {
+                fail("no lists enabled — `guardit blocklist enable hagezi:pro`");
+            }
+            let mut failed = 0;
+            for (key, res) in &results {
+                match res {
+                    Ok(n) => println!("{key}: {n} entries"),
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("{key}: {e}");
+                    }
+                }
+            }
+            if let Ok(mut c) = ipc::Client::connect() {
+                let _ = c.send(&ClientMsg::Reload);
+            }
+            if failed > 0 {
+                std::process::exit(1);
+            }
+        }
+        BlocklistCmd::Allow { domain } => {
+            if let Err(e) = config::validate_host(&domain) {
+                fail(&e);
+            }
+            if cfg.blocklist.allow.contains(&domain) {
+                println!("{domain} is already allowed");
+                return;
+            }
+            save_blocklist(cfg, |b| b.allow.push(domain.clone()));
+            println!("{domain} will never be blocked (nor anything under it)");
+        }
+        BlocklistCmd::Unallow { domain } => {
+            if !cfg.blocklist.allow.contains(&domain) {
+                fail(&format!("{domain} is not in the allowlist"));
+            }
+            save_blocklist(cfg, |b| b.allow.retain(|d| *d != domain));
+            println!("{domain} removed from the allowlist");
+        }
+        BlocklistCmd::Check { domain } => {
+            let list = blocklist::Blocklist::load(&cfg.blocklist);
+            if !cfg.blocklist.enabled {
+                println!("(blocking is off — this is what would happen if it were on)");
+            }
+            if list.blocked(&domain) {
+                println!("{domain}: BLOCKED");
+            } else {
+                println!("{domain}: allowed");
+            }
+        }
+    }
 }
 
 fn print_app_list(cfg: &Config) {

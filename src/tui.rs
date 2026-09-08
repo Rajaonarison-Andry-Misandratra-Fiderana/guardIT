@@ -13,6 +13,8 @@ use crossterm::terminal::{
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::symbols::Marker;
+use ratatui::widgets::canvas::{Canvas, Context, Points};
 use ratatui::widgets::{
     Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, List, ListItem, ListState, Padding,
     Paragraph, Row, Sparkline, Table, TableState,
@@ -315,38 +317,50 @@ fn save_theme_idx(idx: usize) {
     let _ = std::fs::write(theme_path(), THEMES[idx].name);
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
     Apps,
     Flow,
     Rules,
+    /// listening ports — inside the log tab, not the grid: it answers the
+    /// same "what has been going on" question the audit trail does, and
+    /// pairing them frees the grid's third column for the live flow
     Conflicts,
-    /// the full audit trail — its own tab, rendered full-screen (not part of
-    /// the bento grid, it needs the room) and jumpable to from anywhere via
-    /// the global `L` key, same idea as `t` for theme
+    /// the full audit trail — its own tab, rendered over the whole grid area
+    /// and jumpable to from anywhere via the global `L` key, same idea as
+    /// `t` for theme
     AppLog,
 }
 
-// Tab order: system rules -> apps -> flow (live) -> listening ports, then
-// back to rules. Top apps is informational only (nothing to focus), and
-// AppLog is reached only via the global `L`/`l` keys — a drill-down, not a
+/// the log tab: the audit trail and the listening ports, Tab switching
+/// between them. Everything else is the bento grid.
+fn in_log_tab(focus: Focus) -> bool {
+    matches!(focus, Focus::AppLog | Focus::Conflicts)
+}
+
+// Grid tab order: system rules -> apps -> network flow, then back. Top apps
+// and the blocking dashboard are informational (nothing to focus), and the
+// log tab is reached only via the global `L`/`l` keys — a drill-down, not a
 // pane you'd casually cycle through.
 impl Focus {
     fn next(self) -> Focus {
         match self {
             Focus::Rules => Focus::Apps,
             Focus::Apps => Focus::Flow,
-            Focus::Flow => Focus::Conflicts,
-            Focus::Conflicts | Focus::AppLog => Focus::Rules,
+            Focus::Flow => Focus::Rules,
+            // inside the tab, Tab is a toggle between its two halves
+            Focus::AppLog => Focus::Conflicts,
+            Focus::Conflicts => Focus::AppLog,
         }
     }
 
     fn prev(self) -> Focus {
         match self {
-            Focus::Rules | Focus::AppLog => Focus::Conflicts,
+            Focus::Rules => Focus::Flow,
             Focus::Apps => Focus::Rules,
             Focus::Flow => Focus::Apps,
-            Focus::Conflicts => Focus::Flow,
+            Focus::AppLog => Focus::Conflicts,
+            Focus::Conflicts => Focus::AppLog,
         }
     }
 }
@@ -358,6 +372,8 @@ enum Mode {
     /// keystrokes go to `App::apps_filter` instead of the Apps pane's own
     /// keys — the filter itself stays applied after leaving this mode
     Filter,
+    /// the same, for the log tab's own filter (`App::log_filter`)
+    LogFilter,
 }
 
 /// newest first — same reader as `guardit log-app`, just rendered live
@@ -483,6 +499,13 @@ struct App {
     /// Applied in rebuild_apps, so every pane that keys off the Apps
     /// selection (Flow above all) follows it without knowing about it
     apps_filter: String,
+    /// every row read from history.jsonl for the current `app_log_filter`;
+    /// `app_log` is this narrowed by `log_filter`, and is what the tab
+    /// renders and what its selection indexes into
+    app_log_all: Vec<FlowWire>,
+    /// port / ip / name the log tab is narrowed to; empty = all
+    log_filter: String,
+    blocklist: ipc::BlocklistStats,
 }
 
 /// total rx/tx bytes across every interface except loopback, from
@@ -573,12 +596,7 @@ fn parse_spec(line: &str) -> Result<Rule, String> {
     })
 }
 
-pub fn run(cfg: Config) {
-    enable_raw_mode().expect("raw mode");
-    stdout().execute(EnterAlternateScreen).expect("alt screen");
-    let backend = ratatui::backend::CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend).expect("terminal");
-
+fn new_app(cfg: Config) -> App {
     let mut app = App {
         app_rules: cfg.app_rule.clone(),
         cfg,
@@ -607,11 +625,23 @@ pub fn run(cfg: Config) {
         app_log_filter: None,
         app_log_confirm_flush: false,
         apps_filter: String::new(),
+        app_log_all: Vec::new(),
+        log_filter: String::new(),
+        blocklist: ipc::BlocklistStats::default(),
     };
     if !app.cfg.rule.is_empty() {
         app.state.select(Some(0));
     }
     rebuild_apps(&mut app);
+    app
+}
+
+pub fn run(cfg: Config) {
+    enable_raw_mode().expect("raw mode");
+    stdout().execute(EnterAlternateScreen).expect("alt screen");
+    let backend = ratatui::backend::CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut app = new_app(cfg);
 
     loop {
         terminal.draw(|f| draw(f, &mut app)).expect("draw");
@@ -619,9 +649,15 @@ pub fn run(cfg: Config) {
         // no key ready within the tick → refresh live views instead of blocking
         if !event::poll(std::time::Duration::from_millis(500)).unwrap_or(false) {
             if app.focus == Focus::AppLog {
-                app.app_log = read_app_log(APP_LOG_LIMIT, app.app_log_filter.as_deref());
-                if app.app_log_state.selected().is_none() && !app.app_log.is_empty() {
-                    app.app_log_state.select(Some(0));
+                let keep = app.app_log_state.selected();
+                app.app_log_all = read_app_log(APP_LOG_LIMIT, app.app_log_filter.as_deref());
+                apply_log_filter(&mut app);
+                // apply_log_filter resets to the top; a live refresh must not
+                // yank the selection out from under someone scrolling
+                if let Some(i) = keep
+                    && i < app.app_log.len()
+                {
+                    app.app_log_state.select(Some(i));
                 }
             }
             drain_ipc(&mut app);
@@ -654,7 +690,10 @@ pub fn run(cfg: Config) {
             }
             app.msg.clear();
             if (key.code == KeyCode::Tab || key.code == KeyCode::BackTab)
-                && !matches!(app.mode, Mode::Add(_) | Mode::Preset(_) | Mode::Filter)
+                && !matches!(
+                    app.mode,
+                    Mode::Add(_) | Mode::Preset(_) | Mode::Filter | Mode::LogFilter
+                )
             {
                 app.focus = if key.code == KeyCode::BackTab {
                     app.focus.prev()
@@ -667,15 +706,19 @@ pub fn run(cfg: Config) {
                 }
                 continue;
             }
-            if key.code == KeyCode::Char('t') && !matches!(app.mode, Mode::Add(_) | Mode::Filter) {
+            if key.code == KeyCode::Char('t')
+                && !matches!(app.mode, Mode::Add(_) | Mode::Filter | Mode::LogFilter)
+            {
                 app.theme_idx = (app.theme_idx + 1) % THEMES.len();
                 save_theme_idx(app.theme_idx);
                 continue;
             }
             // jumpable to from anywhere, same idea as `t` — the app log is
             // its own tab, not nested under any pane's local keys
-            if key.code == KeyCode::Char('L') && !matches!(app.mode, Mode::Add(_) | Mode::Filter) {
-                if app.focus == Focus::AppLog {
+            if key.code == KeyCode::Char('L')
+                && !matches!(app.mode, Mode::Add(_) | Mode::Filter | Mode::LogFilter)
+            {
+                if in_log_tab(app.focus) {
                     close_app_log(&mut app);
                 } else {
                     open_app_log(&mut app, None);
@@ -710,9 +753,10 @@ pub fn run(cfg: Config) {
                         }
                         _ => {}
                     },
-                    // only ever set from the Apps pane, and Tab can't leave
-                    // it — but if it ever got here, Browse is the safe read
-                    Mode::Filter => app.mode = Mode::Browse,
+                    // only ever set from the Apps pane / the log tab, and Tab
+                    // can't leave either — but if one got here, Browse is the
+                    // safe read
+                    Mode::Filter | Mode::LogFilter => app.mode = Mode::Browse,
                     Mode::Add(buf) => match key.code {
                         KeyCode::Esc => app.mode = Mode::Browse,
                         KeyCode::Enter => {
@@ -807,7 +851,7 @@ pub fn run(cfg: Config) {
                     _ => {}
                 },
                 Focus::Conflicts => match key.code {
-                    KeyCode::Char('q') => break,
+                    KeyCode::Char('q') => close_app_log(&mut app),
                     KeyCode::Char('j') | KeyCode::Down => conflicts_select(&mut app, false),
                     KeyCode::Char('k') | KeyCode::Up => conflicts_select(&mut app, true),
                     KeyCode::Char('y') => conflicts_decide(&mut app, Action::Allow),
@@ -833,14 +877,36 @@ pub fn run(cfg: Config) {
                         }
                         app.app_log_confirm_flush = false;
                         app.counts.clear();
-                        app.app_log = read_app_log(APP_LOG_LIMIT, app.app_log_filter.as_deref());
+                        app.app_log_all =
+                            read_app_log(APP_LOG_LIMIT, app.app_log_filter.as_deref());
+                        apply_log_filter(&mut app);
                         app.app_log_state.select(None);
                     }
                     KeyCode::Char('n') | KeyCode::Esc => app.app_log_confirm_flush = false,
                     _ => {}
                 },
+                Focus::AppLog if matches!(app.mode, Mode::LogFilter) => {
+                    match key.code {
+                        KeyCode::Enter => app.mode = Mode::Browse,
+                        KeyCode::Esc => {
+                            app.log_filter.clear();
+                            app.mode = Mode::Browse;
+                        }
+                        KeyCode::Backspace => {
+                            app.log_filter.pop();
+                        }
+                        KeyCode::Char(c) => app.log_filter.push(c),
+                        _ => continue,
+                    }
+                    apply_log_filter(&mut app);
+                }
                 Focus::AppLog => match key.code {
                     KeyCode::Char('q') => close_app_log(&mut app),
+                    KeyCode::Char('/') => app.mode = Mode::LogFilter,
+                    KeyCode::Esc if !app.log_filter.is_empty() => {
+                        app.log_filter.clear();
+                        apply_log_filter(&mut app);
+                    }
                     KeyCode::Char('f') => app.app_log_confirm_flush = true,
                     KeyCode::Char('j') | KeyCode::Down => app.app_log_state.select(step(
                         app.app_log_state.selected(),
@@ -876,12 +942,15 @@ fn drain_ipc(app: &mut App) {
                 app_rules,
                 flow,
                 listening,
+                blocklist,
             } => {
                 app.app_rules = app_rules;
                 app.flow = flow;
                 app.listening = listening;
+                app.blocklist = blocklist;
                 sort_listening(&mut app.listening);
             }
+            ServerMsg::Blocklist(stats) => app.blocklist = stats,
             ServerMsg::FlowNew(w) => {
                 *app.counts.entry(w.exe.clone()).or_default() += 1;
                 app.flow.push(w);
@@ -1047,13 +1116,44 @@ fn delete_selected(app: &mut App) {
 const APP_LOG_LIMIT: usize = 300;
 
 fn open_app_log(app: &mut App, filter: Option<String>) {
-    if app.focus != Focus::AppLog {
+    if !in_log_tab(app.focus) {
         app.prev_focus = app.focus;
     }
     app.app_log_filter = filter;
     app.app_log_confirm_flush = false;
     app.focus = Focus::AppLog;
-    app.app_log = read_app_log(APP_LOG_LIMIT, app.app_log_filter.as_deref());
+    app.app_log_all = read_app_log(APP_LOG_LIMIT, app.app_log_filter.as_deref());
+    apply_log_filter(app);
+}
+
+/// Narrows the tab to one port, address or name.
+///
+/// A digits-only needle is matched against the port as a whole number, so
+/// `/443` is port 443 and not "every port and address containing 443";
+/// anything else is a substring of the peer address, the resolved name or
+/// the app path, which is how you'd type an ip prefix or a domain.
+fn log_row_matches(e: &FlowWire, needle: &str) -> bool {
+    if needle.chars().all(|c| c.is_ascii_digit()) {
+        return e.port.is_some_and(|p| p.to_string() == needle);
+    }
+    let needle = needle.to_lowercase();
+    e.peer_ip.to_lowercase().contains(&needle)
+        || e.peer_name
+            .as_deref()
+            .is_some_and(|n| n.to_lowercase().contains(&needle))
+        || e.exe.to_lowercase().contains(&needle)
+}
+
+fn apply_log_filter(app: &mut App) {
+    app.app_log = if app.log_filter.is_empty() {
+        app.app_log_all.clone()
+    } else {
+        app.app_log_all
+            .iter()
+            .filter(|e| log_row_matches(e, &app.log_filter))
+            .cloned()
+            .collect()
+    };
     app.app_log_state.select(if app.app_log.is_empty() {
         None
     } else {
@@ -1064,6 +1164,7 @@ fn open_app_log(app: &mut App, filter: Option<String>) {
 fn close_app_log(app: &mut App) {
     app.focus = app.prev_focus;
     app.app_log_filter = None;
+    app.log_filter.clear();
     app.app_log_confirm_flush = false;
 }
 
@@ -1330,9 +1431,15 @@ fn draw(f: &mut Frame, app: &mut App) {
     .split(area);
 
     draw_header(f, app, outer[0]);
-    if app.focus == Focus::AppLog {
-        // its own tab, full-screen — not part of the bento grid below
-        draw_app_log(f, app, outer[1]);
+    if in_log_tab(app.focus) {
+        // its own tab over the whole grid area: the audit trail and the
+        // listening ports, which answer the same "what has been going on"
+        // question and are both wider than a grid cell
+        let cols =
+            Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)])
+                .split(outer[1]);
+        draw_app_log(f, app, cols[0]);
+        draw_conflicts(f, app, cols[1]);
     } else {
         // bento grid: all panes always visible, Tab/Shift+Tab just moves the
         // highlighted border — nothing goes full-screen/modal otherwise. Fill
@@ -1340,9 +1447,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         // drift between panes, which is what breaks top/bottom alignment
         // across columns.
         // the middle column carries the two panes you read rather than
-        // operate — a bar chart needs width per app, and a flow row is a
-        // whole "proto/dir port peer" line — so it gets the space, taken
-        // from the two list panes that only ever show a short name
+        // operate — a bar chart needs width per app and a donut needs to be
+        // round — so it gets the space, taken from the list panes either side
         let main = Layout::horizontal([
             Constraint::Percentage(24),
             Constraint::Percentage(50),
@@ -1354,8 +1460,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_rules(f, app, left[0]);
         draw_apps(f, app, left[1]);
         draw_top_apps(f, app, mid[0]);
-        draw_flow(f, app, mid[1]);
-        draw_conflicts(f, app, main[2]);
+        draw_blocking(f, app, mid[1]);
+        draw_flow(f, app, main[2]);
     }
 
     draw_footer(f, app, outer[2]);
@@ -1379,20 +1485,22 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let theme = THEMES[app.theme_idx];
     let base = theme.base();
 
-    if matches!(app.mode, Mode::Filter) {
+    if matches!(app.mode, Mode::Filter | Mode::LogFilter) {
+        let (label, buf) = if matches!(app.mode, Mode::Filter) {
+            (" FILTER APPS ", &app.apps_filter)
+        } else {
+            (" FILTER LOG — port, ip or name ", &app.log_filter)
+        };
         let spans = vec![
             Span::styled(
-                " FILTER APPS ",
+                label,
                 Style::new()
                     .bg(theme.accents[1])
                     .fg(Color::Black)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  Enter keep · Esc clear  ", base),
-            Span::styled(
-                format!("> {}", app.apps_filter),
-                base.add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(format!("> {buf}"), base.add_modifier(Modifier::BOLD)),
         ];
         f.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
         return;
@@ -1441,15 +1549,20 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("Y/N", "allow/deny host"),
         ],
         (Focus::Conflicts, _) => vec![
-            ("Tab", "pane"),
+            ("Tab", "log"),
             ("j/k", "select"),
-            ("l", "log"),
+            ("l", "this app"),
             ("y/n", "allow/deny port"),
         ],
         (Focus::AppLog, _) if app.app_log_confirm_flush => {
             vec![("y", "confirm flush"), ("n", "cancel")]
         }
-        (Focus::AppLog, _) => vec![("j/k", "move"), ("f", "flush")],
+        (Focus::AppLog, _) => vec![
+            ("Tab", "ports"),
+            ("j/k", "move"),
+            ("/", "filter"),
+            ("f", "flush"),
+        ],
         (Focus::Rules, Mode::Preset(_)) => {
             vec![("j/k", "move"), ("Enter", "add"), ("Esc", "cancel")]
         }
@@ -1462,13 +1575,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("p", "presets"),
         ],
     };
-    let in_app_log = app.focus == Focus::AppLog;
-    if !in_app_log {
-        keys.push(("L", "app log"));
+    let in_tab = in_log_tab(app.focus);
+    if !in_tab {
+        keys.push(("L", "log + ports"));
     }
     keys.push(("t", "theme"));
-    if !(in_app_log && app.app_log_confirm_flush) {
-        keys.push(("q", if in_app_log { "back" } else { "quit" }));
+    if !(in_tab && app.app_log_confirm_flush) {
+        keys.push(("q", if in_tab { "back" } else { "quit" }));
     }
 
     let mut spans = vec![Span::styled(
@@ -1591,15 +1704,19 @@ fn draw_app_log(f: &mut Frame, app: &mut App, area: Rect) {
     .style(theme.base())
     .row_highlight_style(Style::new().bg(theme.border_idle))
     .block(theme.pane(
-        match &app.app_log_filter {
-            Some(exe) => format!(
-                "app log — {} ({} entries)",
-                basename(exe),
-                app.app_log.len()
-            ),
-            None => format!("app log — full audit trail ({} entries)", app.app_log.len()),
+        {
+            let scope = match &app.app_log_filter {
+                Some(exe) => basename(exe).to_string(),
+                None => "full audit trail".to_string(),
+            };
+            let needle = if app.log_filter.is_empty() {
+                String::new()
+            } else {
+                format!(" /{}", app.log_filter)
+            };
+            format!("app log — {scope}{needle} ({} entries)", app.app_log.len())
         },
-        true,
+        app.focus == Focus::AppLog,
     ));
     f.render_stateful_widget(table, area, &mut app.app_log_state);
 
@@ -1777,13 +1894,29 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// top apps by how many flow entries they've generated this session —
 /// a quick "who's the most active/chatty" glance, not a rule-editing view
-/// four characters at most, so a total always fits over its own bar however
-/// narrow the bar is: 1234 -> "1.2k", 5_400_000 -> "5.4M"
+/// A total in at most five columns, so it always fits over its own bar
+/// however narrow the bar is: 12345 -> "12k", 5_400_000 -> "5.4M".
+///
+/// The ranges are cut just below each rounding boundary rather than at it,
+/// so 999_999 reads "1.0M" and never "1000k".
 fn compact(n: u64) -> String {
-    match n {
-        0..=9_999 => n.to_string(),
-        10_000..=999_999 => format!("{:.0}k", n as f64 / 1000.0),
-        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    const UNITS: [&str; 7] = ["", "k", "M", "G", "T", "P", "E"];
+    if n < 10_000 {
+        return n.to_string();
+    }
+    let mut v = n as f64;
+    let mut unit = 0;
+    // step up *before* the value would round to four digits, so 999_999
+    // reads "1.0M" and never "1000k"
+    while v >= 999.95 && unit + 1 < UNITS.len() {
+        v /= 1000.0;
+        unit += 1;
+    }
+    let suffix = UNITS[unit];
+    if v < 10.0 {
+        format!("{v:.1}{suffix}")
+    } else {
+        format!("{v:.0}{suffix}")
     }
 }
 
@@ -1850,6 +1983,220 @@ fn draw_top_apps(f: &mut Frame, app: &App, area: Rect) {
         .label_style(Style::new().fg(theme.fg))
         .style(theme.base());
     f.render_widget(chart, chart_area);
+}
+
+/// 1234567 -> "1 234 567" — a raw run of digits is the one thing on this
+/// dashboard you actually have to read a number off, so it gets separators
+fn group(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A ring chart of `segments`, drawn with braille dots on a Canvas.
+///
+/// `area` must be twice as wide as it is tall for the ring to come out
+/// round: a braille dot is half a cell wide and a quarter of one tall, and
+/// a terminal cell is about twice as tall as it is wide, so the dot grid is
+/// square only when there are twice as many cells across as down.
+fn draw_ring(f: &mut Frame, area: Rect, segments: Vec<(u64, Color)>, empty: Color) {
+    let total: u64 = segments.iter().map(|(v, _)| v).sum();
+    let canvas = Canvas::default()
+        .marker(Marker::Braille)
+        .x_bounds([-1.0, 1.0])
+        .y_bounds([-1.0, 1.0])
+        .paint(move |ctx| {
+            if total == 0 {
+                // an empty ring, not an empty pane: the shape is the label
+                ring_arc(ctx, 0.0, std::f64::consts::TAU, empty);
+                return;
+            }
+            // start at 12 o'clock and go clockwise, the way a share of a
+            // whole is read on paper
+            let mut from = std::f64::consts::FRAC_PI_2;
+            for (value, color) in &segments {
+                if *value == 0 {
+                    continue;
+                }
+                let sweep = -(*value as f64 / total as f64) * std::f64::consts::TAU;
+                ring_arc(ctx, from, sweep, *color);
+                from += sweep;
+            }
+        });
+    f.render_widget(canvas, area);
+}
+
+/// one band of the ring, sampled densely enough that it reads as solid at
+/// the handful of rows this pane gets
+fn ring_arc(ctx: &mut Context, from: f64, sweep: f64, color: Color) {
+    const INNER: f64 = 0.52;
+    const OUTER: f64 = 0.94;
+    const BANDS: usize = 14;
+    let steps = (sweep.abs() * 260.0).ceil().max(2.0) as usize;
+    let mut pts = Vec::with_capacity(steps * (BANDS + 1));
+    for i in 0..=steps {
+        let a = from + sweep * (i as f64 / steps as f64);
+        let (sin, cos) = a.sin_cos();
+        for b in 0..=BANDS {
+            let r = INNER + (OUTER - INNER) * (b as f64 / BANDS as f64);
+            pts.push((cos * r, sin * r));
+        }
+    }
+    ctx.draw(&Points {
+        coords: &pts,
+        color,
+    });
+}
+
+/// The ads / tracking dashboard: what the blocklists are doing right now.
+///
+/// The ring is DNS lookups since the daemon started, split allowed vs
+/// blocked, with the block rate in the hole; the column beside it repeats
+/// each figure under its own label, because a ring answers "roughly how
+/// much" and the number under it answers "how much".
+fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
+    let theme = THEMES[app.theme_idx];
+    let b = &app.blocklist;
+    let title = if b.enabled {
+        "ads & tracking — blocked lookups".to_string()
+    } else {
+        "ads & tracking — off".to_string()
+    };
+    let block = theme.pane(title, false);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    if !b.enabled {
+        let hint = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  blocking is off",
+                Style::new().fg(theme.warn).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("  sudo guardit blocklist on"),
+            Line::from("  sudo guardit blocklist update"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  ads, trackers and telemetry are refused at",
+                Style::new().fg(theme.border_idle),
+            )),
+            Line::from(Span::styled(
+                "  the DNS answer, before anything connects",
+                Style::new().fg(theme.border_idle),
+            )),
+        ];
+        f.render_widget(Paragraph::new(hint).style(theme.base()), inner);
+        return;
+    }
+
+    let allowed = b.queries.saturating_sub(b.blocked);
+    let rate = if b.queries == 0 {
+        0.0
+    } else {
+        b.blocked as f64 / b.queries as f64 * 100.0
+    };
+
+    // the ring takes a 2:1 rect as wide as it can be without crowding the
+    // figures out; below ~6 rows there is no room for one at all
+    let ring_h = inner.height.min(inner.width / 4).min(9);
+    let ring_w = ring_h * 2;
+    let [ring_area, text_area] =
+        Layout::horizontal([Constraint::Length(ring_w), Constraint::Min(0)]).areas(inner);
+    if ring_h >= 3 {
+        let ring_area = Rect {
+            y: ring_area.y + inner.height.saturating_sub(ring_h) / 2,
+            height: ring_h,
+            ..ring_area
+        };
+        draw_ring(
+            f,
+            ring_area,
+            vec![(b.blocked, theme.deny), (allowed, theme.allow)],
+            theme.border_idle,
+        );
+        // the rate goes in the hole, where a donut chart puts its headline
+        let mid = Rect {
+            x: ring_area.x,
+            y: ring_area.y + ring_area.height / 2,
+            width: ring_area.width,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(format!("{rate:.1}%"))
+                .alignment(Alignment::Center)
+                .style(theme.base().fg(theme.deny).add_modifier(Modifier::BOLD)),
+            mid,
+        );
+    }
+
+    let updated = match b.updated_at {
+        Some(t) => format!("{} ago", ago(now_ts().saturating_sub(t))),
+        None => "never — run `blocklist update`".into(),
+    };
+    let dim = Style::new().fg(theme.border_idle);
+    let mut lines = vec![
+        Line::from(Span::styled("● lookups", dim)),
+        Line::from(Span::styled(
+            format!("  {}", group(b.queries)),
+            Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled("● blocked", dim)),
+        Line::from(Span::styled(
+            format!("  {}", group(b.blocked)),
+            Style::new().fg(theme.deny).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled("● allowed", dim)),
+        Line::from(Span::styled(
+            format!("  {}", group(allowed)),
+            Style::new().fg(theme.allow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("domains  ", dim),
+            Span::styled(group(b.domains as u64), Style::new().fg(theme.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("lists    ", dim),
+            Span::styled(b.sources.len().to_string(), Style::new().fg(theme.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("updated  ", dim),
+            Span::styled(updated, Style::new().fg(theme.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("enc dns  ", dim),
+            Span::styled(
+                if b.encrypted_dns_blocked {
+                    "refused"
+                } else {
+                    "allowed — apps can bypass"
+                },
+                Style::new().fg(if b.encrypted_dns_blocked {
+                    theme.allow
+                } else {
+                    theme.warn
+                }),
+            ),
+        ]),
+    ];
+    // the newest block, so a false positive shows up here the moment a page
+    // breaks instead of having to be guessed at
+    if let Some((_, name)) = b.recent.last() {
+        lines.push(Line::from(vec![
+            Span::styled("last     ", dim),
+            Span::styled(name.clone(), Style::new().fg(theme.deny)),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines).style(theme.base()), text_area);
 }
 
 fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1938,4 +2285,134 @@ fn draw_conflicts(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(Style::new().bg(theme.border_idle))
         .block(theme.pane(title, app.focus == Focus::Conflicts));
     f.render_stateful_widget(list, area, &mut app.conflicts_state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn flow(port: u16, ip: &str, name: Option<&str>, exe: &str) -> FlowWire {
+        FlowWire {
+            req_id: None,
+            exe: exe.into(),
+            direction: Direction::Out,
+            proto: "tcp".into(),
+            port: Some(port),
+            peer_ip: ip.into(),
+            peer_name: name.map(|n| n.into()),
+            status: FlowStatus::Allowed,
+            ts: 0,
+        }
+    }
+
+    #[test]
+    fn a_numeric_log_filter_is_a_port_not_a_substring() {
+        let e = flow(443, "140.82.121.4", Some("github.com"), "/usr/bin/curl");
+        assert!(log_row_matches(&e, "443"));
+        assert!(!log_row_matches(&e, "44"), "not a prefix of the port");
+        assert!(!log_row_matches(&e, "4"), "nor a digit inside the address");
+        assert!(!log_row_matches(&e, "80"));
+    }
+
+    #[test]
+    fn a_text_log_filter_matches_address_name_or_app() {
+        let e = flow(443, "140.82.121.4", Some("github.com"), "/usr/bin/curl");
+        assert!(log_row_matches(&e, "140.82"));
+        assert!(log_row_matches(&e, "github"));
+        assert!(log_row_matches(&e, "GitHub.COM"), "case-insensitive");
+        assert!(log_row_matches(&e, "curl"));
+        assert!(!log_row_matches(&e, "gitlab"));
+        // a row the tap never resolved still matches on its address
+        let bare = flow(443, "140.82.121.4", None, "/usr/bin/curl");
+        assert!(log_row_matches(&bare, "140.82"));
+        assert!(!log_row_matches(&bare, "github"));
+    }
+
+    #[test]
+    fn totals_are_grouped_and_compacted() {
+        assert_eq!(group(0), "0");
+        assert_eq!(group(999), "999");
+        assert_eq!(group(1_234), "1 234");
+        assert_eq!(group(1_234_567), "1 234 567");
+        // the bar labels have four columns at most, whatever the count
+        for n in [0, 9_999, 10_000, 999_999, 1_000_000, 9_999_999_999, u64::MAX] {
+            assert!(compact(n).len() <= 5, "{n} -> {}", compact(n));
+        }
+        assert_eq!(compact(999), "999");
+        assert_eq!(compact(12_345), "12k");
+        assert_eq!(compact(999_999), "1.0M", "never rounds up into 1000k");
+        assert_eq!(compact(5_400_000), "5.4M");
+        assert_eq!(compact(9_999_999_999), "10.0G");
+    }
+
+    /// Draws every screen at a range of terminal sizes.
+    ///
+    /// The grid and the dashboard do their own Rect arithmetic — a ring that
+    /// wants twice its height in columns, a totals row carved off a pane's
+    /// inner area — and getting that wrong is a panic in ratatui, not a
+    /// cosmetic problem. Small sizes are the point: that is where a
+    /// saturating_sub that should have been one is found.
+    #[test]
+    fn every_screen_renders_at_any_terminal_size() {
+        for (w, h) in [(200, 60), (120, 40), (80, 24), (60, 20), (40, 12), (20, 8)] {
+            let mut app = new_app(Config::default());
+            app.blocklist = ipc::BlocklistStats {
+                enabled: true,
+                encrypted_dns_blocked: true,
+                sources: vec!["hagezi:pro".into()],
+                domains: 224_039,
+                queries: 12_345,
+                blocked: 2_345,
+                recent: vec![(0, "ads.example.com".into())],
+                updated_at: Some(1),
+            };
+            app.flow = vec![flow(443, "140.82.121.4", Some("github.com"), "/usr/bin/curl")];
+            app.listening = vec![ipc::ListenEntry {
+                proto: "tcp".into(),
+                addr: "0.0.0.0".into(),
+                port: 22,
+                exe: "/usr/bin/sshd".into(),
+            }];
+            app.counts.insert("/usr/bin/curl".into(), 1_234_567);
+            app.counts.insert("/usr/bin/firefox".into(), 42);
+            rebuild_apps(&mut app);
+
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            for focus in [
+                Focus::Rules,
+                Focus::Apps,
+                Focus::Flow,
+                Focus::AppLog,
+                Focus::Conflicts,
+            ] {
+                app.focus = focus;
+                term.draw(|f| draw(f, &mut app))
+                    .unwrap_or_else(|e| panic!("{focus:?} at {w}x{h}: {e}"));
+            }
+            // and the modal-ish states, which replace the footer
+            app.focus = Focus::Apps;
+            app.mode = Mode::Filter;
+            app.apps_filter = "fire".into();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            app.focus = Focus::AppLog;
+            app.mode = Mode::LogFilter;
+            app.log_filter = "443".into();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            app.mode = Mode::Browse;
+            app.app_log_confirm_flush = true;
+            term.draw(|f| draw(f, &mut app)).unwrap();
+        }
+    }
+
+    /// blocking off is a different pane entirely, and an empty ring is the
+    /// one that divides by a zero total
+    #[test]
+    fn the_dashboard_renders_with_nothing_to_show() {
+        let mut app = new_app(Config::default());
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        app.blocklist.enabled = true;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+    }
 }

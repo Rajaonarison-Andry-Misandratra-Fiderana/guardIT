@@ -1,0 +1,642 @@
+//! Ads / tracking blocking: curated domain blocklists, downloaded to disk and
+//! matched against every DNS lookup the daemon already sees.
+//!
+//! The enforcement point is the DNS reply, not the connection: `daemon::
+//! dns_loop` is already on the wire for every plain-DNS answer (that's what
+//! puts `github.com` next to an ip in the dashboard), so rewriting a blocked
+//! name's reply to NXDOMAIN costs one lookup per answer and no new hook. The
+//! app never learns an address, so it never opens the connection — which is
+//! the same end state as a sinkhole, one round trip later.
+//!
+//! Everything here is name-based, so it inherits the DNS tap's blind spot:
+//! a resolver the daemon can't read (DoH, DoT, an app's own cache) can't be
+//! filtered. That is what `block_encrypted_dns` exists to close — see
+//! `ruleset::render` and `DOH_BOOTSTRAP`.
+
+use crate::config::BlocklistConfig;
+use std::collections::HashSet;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+/// One downloadable list. `id` is the maintainer, `level` the flavour —
+/// together they form the `id:level` key used in the config and the CLI.
+pub struct Source {
+    pub id: &'static str,
+    pub level: &'static str,
+    pub url: &'static str,
+    pub about: &'static str,
+}
+
+impl Source {
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.id, self.level)
+    }
+}
+
+/// The catalogue the TUI and `guardit blocklist sources` show.
+///
+/// Every hagezi entry is a `wildcard/*-onlydomains.txt`: a plain domain per
+/// line, meaning "this name and everything under it" — exactly the matching
+/// `Blocklist::blocked` does, so no format-specific handling is needed. The
+/// hosts-format lists (StevenBlack, Peter Lowe) are exact-name lists; the
+/// same suffix walk still matches them, it just never fires above a listed
+/// name because their subdomains are listed individually.
+pub const SOURCES: &[Source] = &[
+    Source {
+        id: "hagezi",
+        level: "light",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt",
+        about: "ads + trackers, size-optimised, near-zero breakage",
+    },
+    Source {
+        id: "hagezi",
+        level: "normal",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/multi-onlydomains.txt",
+        about: "ads, trackers, telemetry, some badware",
+    },
+    Source {
+        id: "hagezi",
+        level: "pro",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt",
+        about: "ads, trackers, telemetry, badware — the recommended default",
+    },
+    Source {
+        id: "hagezi",
+        level: "pro.plus",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro.plus-onlydomains.txt",
+        about: "pro, plus aggressive tracking and telemetry",
+    },
+    Source {
+        id: "hagezi",
+        level: "ultimate",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/ultimate-onlydomains.txt",
+        about: "maximum coverage — expect to need the allowlist",
+    },
+    Source {
+        id: "hagezi",
+        level: "popupads",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/popupads-onlydomains.txt",
+        about: "pop-up ads and redirect chains",
+    },
+    Source {
+        id: "hagezi",
+        level: "tif",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif-onlydomains.txt",
+        about: "threat intelligence: malware, phishing, scam, cryptojacking",
+    },
+    Source {
+        id: "hagezi",
+        level: "fake",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/fake-onlydomains.txt",
+        about: "fake shops, fake streaming, fake support",
+    },
+    Source {
+        id: "hagezi",
+        level: "gambling",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/gambling-onlydomains.txt",
+        about: "gambling and betting",
+    },
+    Source {
+        id: "hagezi",
+        level: "nsfw",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/nsfw-onlydomains.txt",
+        about: "pornography",
+    },
+    Source {
+        id: "hagezi",
+        level: "doh",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/doh-vpn-proxy-bypass-onlydomains.txt",
+        about: "DoH / VPN / proxy endpoints used to bypass DNS filtering",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.tiktok",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.tiktok-onlydomains.txt",
+        about: "TikTok's own telemetry endpoints",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.winoffice",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.winoffice-onlydomains.txt",
+        about: "Windows / Office telemetry endpoints",
+    },
+    Source {
+        id: "stevenblack",
+        level: "unified",
+        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+        about: "the classic unified hosts list: ads + malware",
+    },
+    Source {
+        id: "stevenblack",
+        level: "fakenews",
+        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews/hosts",
+        about: "unified, plus fake-news sites",
+    },
+    Source {
+        id: "stevenblack",
+        level: "gambling",
+        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/gambling/hosts",
+        about: "unified, plus gambling",
+    },
+    Source {
+        id: "stevenblack",
+        level: "porn",
+        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts",
+        about: "unified, plus pornography",
+    },
+    Source {
+        id: "stevenblack",
+        level: "social",
+        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/social/hosts",
+        about: "unified, plus social networks",
+    },
+    Source {
+        id: "oisd",
+        level: "small",
+        url: "https://small.oisd.nl/domainswild2",
+        about: "ads + trackers, tuned hard against false positives",
+    },
+    Source {
+        id: "oisd",
+        level: "big",
+        url: "https://big.oisd.nl/domainswild2",
+        about: "ads, trackers, malware, phishing, scam",
+    },
+    Source {
+        id: "oisd",
+        level: "nsfw",
+        url: "https://nsfw.oisd.nl/domainswild2",
+        about: "pornography",
+    },
+    Source {
+        id: "adguard",
+        level: "dns",
+        url: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt",
+        about: "AdGuard's own DNS filter: ads + trackers",
+    },
+    Source {
+        id: "peterlowe",
+        level: "ads",
+        url: "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext",
+        about: "Peter Lowe's ad and tracking server list",
+    },
+];
+
+/// what `guardit blocklist enable` suggests, and what the TUI ticks when you
+/// turn blocking on with nothing selected: the best ads/tracking coverage
+/// that does not routinely need an allowlist entry to use the web
+pub const DEFAULT_SOURCES: &[&str] = &["hagezi:pro"];
+
+/// Names that make encrypted DNS give up and fall back to the plain DNS this
+/// can actually filter. `use-application-dns.net` is Mozilla's canary: an
+/// NXDOMAIN on it is the documented signal for Firefox to disable its own
+/// DoH. The rest are the bootstrap names the major DoH clients resolve
+/// before they can talk DoH at all — deny those and the client never gets
+/// off the ground. `hagezi:doh` covers far more; this is the floor that
+/// applies with no list downloaded yet.
+pub const DOH_BOOTSTRAP: &[&str] = &[
+    "use-application-dns.net",
+    "mozilla.cloudflare-dns.com",
+    "cloudflare-dns.com",
+    "chrome.cloudflare-dns.com",
+    "dns.google",
+    "dns.google.com",
+    "dns.quad9.net",
+    "dns.nextdns.io",
+    "dns.adguard.com",
+    "dns.adguard-dns.com",
+    "doh.opendns.com",
+    "doh.cleanbrowsing.org",
+    "dns.cloudflare.com",
+    "doh.dns.sb",
+    "dns.controld.com",
+    "doh.mullvad.net",
+    "dns.alidns.com",
+    "doh.pub",
+    "dns.twnic.tw",
+    "odvr.nic.cz",
+];
+
+/// The maintained list of ip addresses that answer DoH, used to build the
+/// nft set that closes the "hardcoded resolver ip" bypass — the one case
+/// name blocking cannot reach, because no lookup ever happens.
+pub const DOH_IPS_URL: &str =
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/ips/doh.txt";
+/// key under which the ip list is cached, kept out of SOURCES because it is
+/// addresses rather than names and is driven by `block_encrypted_dns`
+pub const DOH_IPS_KEY: &str = "doh-ips";
+
+pub fn source(key: &str) -> Option<&'static Source> {
+    SOURCES.iter().find(|s| s.key() == key)
+}
+
+/// downloaded lists are data, not configuration — they are refetched, never
+/// hand-edited, and are far too big to sit in /etc next to rules.toml.
+/// `GUARDIT_BLOCKLIST_DIR` moves them, which is the only way to exercise
+/// downloading and matching without being root.
+pub fn cache_dir() -> PathBuf {
+    match std::env::var_os("GUARDIT_BLOCKLIST_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => PathBuf::from("/var/lib/guardit/blocklists"),
+    }
+}
+
+pub fn cache_path(key: &str) -> PathBuf {
+    cache_dir().join(format!("{}.txt", key.replace([':', '/'], "_")))
+}
+
+/// unix mtime of a cached list, for "last updated" and for deciding whether
+/// an auto-update is due
+pub fn cached_at(key: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(cache_path(key)).ok().map(|m| m.mtime() as u64)
+}
+
+/// One line of any of the formats in SOURCES, reduced to the domain it
+/// blocks — or None for everything that isn't one.
+///
+/// Accepts hosts lines (`0.0.0.0 ads.example`), bare domains, and the
+/// AdBlock-style `||ads.example^` that AdGuard's DNS filter uses. Lines that
+/// carry element-hiding or regex syntax are dropped rather than guessed at:
+/// this is a domain matcher, and half-understanding a cosmetic rule would
+/// block a name nobody asked to block.
+pub fn parse_line(line: &str) -> Option<&str> {
+    // AdBlock cosmetic/scriptlet rules (`example.com##.ad`, `#@#`, `#?#`,
+    // `#$#`) start with a domain, so they have to be rejected before `#` is
+    // treated as a comment — otherwise every one of them silently becomes a
+    // rule blocking the site it was meant to only hide an element on
+    if ["##", "#@#", "#?#", "#$#", "#%#"].iter().any(|m| line.contains(m)) {
+        return None;
+    }
+    let line = line.split('#').next()?.trim();
+    if line.is_empty() || line.starts_with('!') || line.starts_with('/') {
+        return None;
+    }
+    let candidate = if let Some(rest) = line.strip_prefix("||") {
+        // ||ads.example^ / ||ads.example^$third-party — only a plain domain
+        // anchor is a domain rule; anything with options or a path is not
+        let rest = rest.split('^').next()?;
+        if rest.contains('/') || rest.contains('*') {
+            return None;
+        }
+        rest
+    } else {
+        // hosts format is "<ip> <name>"; a bare domain has no whitespace
+        let mut fields = line.split_whitespace();
+        let first = fields.next()?;
+        match fields.next() {
+            Some(name) => name,
+            None => first,
+        }
+    };
+    let candidate = candidate.trim_end_matches('.');
+    // hosts files are full of loopback housekeeping and of the ip column
+    // itself when a line had only one field
+    if candidate.is_empty()
+        || !candidate.contains('.')
+        || candidate.parse::<std::net::IpAddr>().is_ok()
+        || matches!(
+            candidate,
+            "localhost" | "localhost.localdomain" | "local" | "broadcasthost" | "ip6-localhost"
+        )
+        || !candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(candidate)
+}
+
+pub fn parse_into(text: &str, into: &mut HashSet<Box<str>>) -> usize {
+    let before = into.len();
+    for line in text.lines() {
+        if let Some(d) = parse_line(line) {
+            into.insert(d.to_ascii_lowercase().into_boxed_str());
+        }
+    }
+    into.len() - before
+}
+
+/// Every enabled list, merged, plus the user's allowlist.
+///
+/// One flat set for all sources: which list a name came from is not worth
+/// the memory of keeping them apart on the hot path, and `check` re-reads
+/// the files when someone actually asks that question.
+#[derive(Default)]
+pub struct Blocklist {
+    blocked: HashSet<Box<str>>,
+    allow: HashSet<Box<str>>,
+}
+
+impl Blocklist {
+    /// reads whatever is already downloaded; a listed-but-missing source is
+    /// simply absent (the daemon must start and filter with the lists it
+    /// has, not refuse to run because one was never fetched)
+    pub fn load(cfg: &BlocklistConfig) -> Blocklist {
+        let mut blocked = HashSet::new();
+        if cfg.enabled {
+            for key in &cfg.sources {
+                if let Ok(text) = fs::read_to_string(cache_path(key)) {
+                    parse_into(&text, &mut blocked);
+                }
+            }
+            if cfg.block_encrypted_dns {
+                for name in DOH_BOOTSTRAP {
+                    blocked.insert((*name).into());
+                }
+            }
+        }
+        Blocklist {
+            blocked,
+            allow: cfg
+                .allow
+                .iter()
+                .map(|d| d.trim_end_matches('.').to_ascii_lowercase().into_boxed_str())
+                .collect(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.blocked.len()
+    }
+
+    /// Walks the name from most to least specific — `ads.a.example.com`,
+    /// `a.example.com`, `example.com`, `com` — and takes the first verdict
+    /// found. Allow is checked before block at each level, so an allowlist
+    /// entry beats a blocklist entry on the same name *and* rescues a
+    /// subdomain of a blocked parent, which is the whole point of having one.
+    /// At most one hash lookup per label, so cost is the depth of the name,
+    /// not the size of the list.
+    pub fn blocked(&self, name: &str) -> bool {
+        if self.blocked.is_empty() {
+            return false;
+        }
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        let mut rest = name.as_str();
+        loop {
+            if self.allow.contains(rest) {
+                return false;
+            }
+            if self.blocked.contains(rest) {
+                return true;
+            }
+            match rest.split_once('.') {
+                Some((_, tail)) if tail.contains('.') => rest = tail,
+                _ => return false,
+            }
+        }
+    }
+}
+
+/// Downloads `url` to the cache under `key`, atomically.
+///
+/// Shelling out to curl rather than linking an HTTP stack: guardit ships as
+/// a static musl binary and curl is already a hard requirement of the
+/// installer, so an async runtime plus a TLS stack would be ~150 crates
+/// bought for one GET a day.
+/// ponytail: curl/wget subprocess, only worth replacing if guardit ever
+/// needs to fetch something on a path where a subprocess is too expensive
+pub fn fetch(key: &str, url: &str) -> Result<usize, String> {
+    let dir = cache_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let tmp = dir.join(format!(".{}.part", key.replace([':', '/'], "_")));
+
+    let out = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--compressed",
+            "--max-time",
+            "120",
+            "--retry",
+            "2",
+            "-o",
+        ])
+        .arg(&tmp)
+        .arg(url)
+        .output()
+        .map_err(|e| format!("spawn curl: {e} (is curl installed?)"))?;
+    if !out.status.success() {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "download failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    // a list that parses to nothing is a server error page or a moved URL,
+    // not an empty blocklist — refuse it rather than silently replacing a
+    // working list with zero domains
+    let text = fs::read_to_string(&tmp).map_err(|e| format!("read download: {e}"))?;
+    let mut parsed = HashSet::new();
+    let n = parse_into(&text, &mut parsed);
+    if n == 0 {
+        let _ = fs::remove_file(&tmp);
+        return Err("downloaded file contains no domains — wrong url?".into());
+    }
+    fs::rename(&tmp, cache_path(key)).map_err(|e| format!("install list: {e}"))?;
+    Ok(n)
+}
+
+/// the same, for the DoH ip list — which is addresses, so the domain parser
+/// would (correctly) reject every line of it
+pub fn fetch_doh_ips() -> Result<usize, String> {
+    let dir = cache_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let tmp = dir.join(".doh-ips.part");
+    let out = Command::new("curl")
+        .args(["-fsSL", "--compressed", "--max-time", "120", "-o"])
+        .arg(&tmp)
+        .arg(DOH_IPS_URL)
+        .output()
+        .map_err(|e| format!("spawn curl: {e} (is curl installed?)"))?;
+    if !out.status.success() {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "download failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = fs::read_to_string(&tmp).map_err(|e| format!("read download: {e}"))?;
+    let n = parse_ips(&text).len();
+    if n == 0 {
+        let _ = fs::remove_file(&tmp);
+        return Err("downloaded file contains no ip addresses — wrong url?".into());
+    }
+    fs::rename(&tmp, cache_path(DOH_IPS_KEY)).map_err(|e| format!("install list: {e}"))?;
+    Ok(n)
+}
+
+pub fn parse_ips(text: &str) -> Vec<std::net::IpAddr> {
+    text.lines()
+        .filter_map(|l| l.split('#').next())
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
+}
+
+/// the cached DoH addresses, for `ruleset::render` to turn into an nft set
+pub fn doh_ips() -> Vec<std::net::IpAddr> {
+    fs::read_to_string(cache_path(DOH_IPS_KEY))
+        .map(|t| parse_ips(&t))
+        .unwrap_or_default()
+}
+
+/// Refetches every enabled list (and the DoH addresses when that is on),
+/// returning one result per key so a single dead url is reported instead of
+/// failing the whole update.
+pub fn update_all(cfg: &BlocklistConfig) -> Vec<(String, Result<usize, String>)> {
+    let mut out = Vec::new();
+    for key in &cfg.sources {
+        let r = match source(key) {
+            Some(s) => fetch(key, s.url),
+            None => Err("unknown list — see `guardit blocklist sources`".into()),
+        };
+        out.push((key.clone(), r));
+    }
+    if cfg.block_encrypted_dns {
+        out.push((DOH_IPS_KEY.to_string(), fetch_doh_ips()));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(blocked: &[&str], allow: &[&str]) -> Blocklist {
+        Blocklist {
+            blocked: blocked.iter().map(|s| (*s).into()).collect(),
+            allow: allow.iter().map(|s| (*s).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn parses_every_format_in_the_catalogue() {
+        // hosts
+        assert_eq!(parse_line("0.0.0.0 ads.example.com"), Some("ads.example.com"));
+        assert_eq!(parse_line("127.0.0.1\tads.example.com # why"), Some("ads.example.com"));
+        // bare domain (hagezi wildcard, oisd)
+        assert_eq!(parse_line("ads.example.com"), Some("ads.example.com"));
+        assert_eq!(parse_line("ads.example.com."), Some("ads.example.com"));
+        // adblock domain anchor (adguard)
+        assert_eq!(parse_line("||ads.example.com^"), Some("ads.example.com"));
+        assert_eq!(parse_line("||ads.example.com^$third-party"), Some("ads.example.com"));
+    }
+
+    #[test]
+    fn skips_everything_that_is_not_a_domain() {
+        for line in [
+            "",
+            "   ",
+            "# a comment",
+            "! adblock comment",
+            "/regex.*rule/",
+            "0.0.0.0 localhost",
+            "::1 ip6-localhost",
+            "255.255.255.255 broadcasthost",
+            "0.0.0.0",
+            "127.0.0.1",
+            "example.com##.ad-banner",
+            "||example.com/path^",
+            "||*.example.com^",
+            "notadomain",
+        ] {
+            assert_eq!(parse_line(line), None, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_listed_name_blocks_its_subdomains() {
+        let l = list(&["ads.example.com"], &[]);
+        assert!(l.blocked("ads.example.com"));
+        assert!(l.blocked("deep.cdn.ads.example.com"));
+        assert!(l.blocked("ADS.EXAMPLE.COM."), "case and trailing dot");
+        assert!(!l.blocked("example.com"), "the parent is not implied");
+        assert!(!l.blocked("notads.example.com"));
+    }
+
+    #[test]
+    fn the_allowlist_rescues_a_subdomain_of_a_blocked_parent() {
+        let l = list(&["example.com"], &["good.example.com"]);
+        assert!(l.blocked("example.com"));
+        assert!(l.blocked("bad.example.com"));
+        assert!(!l.blocked("good.example.com"));
+        assert!(!l.blocked("sub.good.example.com"), "allow covers its subtree too");
+    }
+
+    #[test]
+    fn never_blocks_on_a_bare_tld() {
+        // "com" in a list must not take the whole tld down with it
+        let l = list(&["com"], &[]);
+        assert!(!l.blocked("example.com"));
+    }
+
+    #[test]
+    fn an_empty_list_blocks_nothing() {
+        assert!(!Blocklist::default().blocked("ads.example.com"));
+    }
+
+    /// The one check that a url in SOURCES is still real and still in a
+    /// format the parser understands — everything else here is offline, so
+    /// a list that quietly moved would otherwise only show up as "blocking
+    /// stopped working" on someone's machine.
+    ///
+    /// Needs the network, so it stays out of the normal run:
+    /// `cargo test -- --ignored`
+    #[test]
+    #[ignore = "downloads every list in the catalogue"]
+    fn every_catalogue_url_downloads_and_parses() {
+        let dir = std::env::temp_dir().join(format!("guardit-bl-{}", std::process::id()));
+        // SAFETY: single-threaded by construction — this test is the only
+        // one that touches the variable, and it runs alone under --ignored
+        unsafe { std::env::set_var("GUARDIT_BLOCKLIST_DIR", &dir) };
+        let mut failures = Vec::new();
+        for src in SOURCES {
+            match fetch(&src.key(), src.url) {
+                Ok(n) => assert!(n > 100, "{} parsed only {n} domains", src.key()),
+                Err(e) => failures.push(format!("{}: {e}", src.key())),
+            }
+        }
+        assert!(fetch_doh_ips().is_ok(), "doh ip list");
+        assert!(failures.is_empty(), "{failures:#?}");
+
+        // a list that downloads but blocks nothing recognisable is a format
+        // change the parser did not notice
+        // these are apex entries in hagezi:pro; the list deliberately does
+        // NOT carry every ad apex (doubleclick.net is listed only per
+        // subdomain), so picking names it actually has is the point
+        let cfg = BlocklistConfig {
+            enabled: true,
+            sources: vec!["hagezi:pro".into()],
+            allow: vec!["ok.criteo.com".into()],
+            ..Default::default()
+        };
+        let list = Blocklist::load(&cfg);
+        for blocked in ["google-analytics.com", "scorecardresearch.com", "criteo.com"] {
+            assert!(list.blocked(blocked), "{blocked}");
+        }
+        assert!(
+            list.blocked("www.google-analytics.com"),
+            "a listed name covers its subdomains"
+        );
+        assert!(!list.blocked("ok.criteo.com"), "allowlist wins");
+        for allowed in ["github.com", "wikipedia.org", "kernel.org"] {
+            assert!(!list.blocked(allowed), "{allowed}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn catalogue_keys_are_unique_and_well_formed() {
+        let mut seen = HashSet::new();
+        for s in SOURCES {
+            assert!(seen.insert(s.key()), "duplicate {}", s.key());
+            assert!(s.url.starts_with("https://"), "{} is not https", s.key());
+            assert!(!s.about.is_empty());
+        }
+        for d in DEFAULT_SOURCES {
+            assert!(source(d).is_some(), "default {d} is not in the catalogue");
+        }
+    }
+}

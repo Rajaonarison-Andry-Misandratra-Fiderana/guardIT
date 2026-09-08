@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **Ads and tracking blocking** (`guardit blocklist`): curated domain lists from HaGeZi,
+  StevenBlack, OISD, AdGuard and Peter Lowe, each in several levels, merged into one set
+  and matched against every DNS lookup the daemon sees. A blocked name's reply is rewritten
+  to NXDOMAIN in the queue, so the app never learns an address and never connects — no
+  sinkhole process, no new hook, one lookup per DNS answer. A listed name covers everything
+  under it; an allowlist entry beats the lists and rescues its own subtree. Lists are
+  downloaded to `/var/lib/guardit/blocklists/` and refreshed daily by the daemon
+  (`update_hours`).
+- **Encrypted DNS is refused by default** when blocking is on (`block_encrypted_dns`).
+  Name-based filtering can't reach an app doing DoH or DoT, which is most browsers by
+  default; so DoT/DoQ (853) and :443 to the maintained list of DoH resolver addresses are
+  rejected, and the DoH bootstrap names plus Mozilla's `use-application-dns.net` canary
+  return NXDOMAIN. `reject`, not `drop`, so clients fall back to plain DNS at once rather
+  than hanging.
+- **New TUI layout**: the audit log tab (`L`) now holds the listening ports alongside the
+  log, `Tab` switching between them; Network flow takes the full-height right column that
+  frees up; and the middle column's lower half is a new **ads & tracking** dashboard — a
+  ring of lookups allowed vs blocked with the block rate in the hole, and every figure
+  repeated under its own label.
+- **Filter the audit log** with `/`: a number matches the port exactly, anything else is a
+  substring of the peer address, the resolved name or the app path.
 - **Rules by domain**: `guardit app deny <exe> --host '*.doubleclick.net'` restricts a
   rule to peers that resolved to a name, exactly or under a wildcard. A host rule is the
   most specific kind — it beats a per-port rule, which beats the whole-app default — so
