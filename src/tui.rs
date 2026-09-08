@@ -1601,6 +1601,10 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
             let missing = !Path::new(&row.exe).exists();
             if missing {
                 status.push_str(" [gone]");
+            } else if row.rule.as_ref().is_some_and(|r| r.stale()) {
+                // binary changed since the rule was made — the daemon will
+                // ask again on its next connection (config::AppRule::stale)
+                status.push_str(" [changed]");
             }
             // this default doesn't tell the whole story if some of the app's
             // ports have their own override — say so instead of looking wrong

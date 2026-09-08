@@ -46,8 +46,9 @@ impl Direction {
 }
 
 /// A per-application rule: matched by canonical executable path, resolved at
-/// connection time by the daemon (see src/daemon.rs) via /proc — no notion
-/// of app identity beyond that (no hash/signature; breaks on binary updates).
+/// connection time by the daemon (see src/daemon.rs) via /proc, and pinned
+/// to the binary's size+mtime (`fingerprint`) so an updated or swapped
+/// binary gets asked again instead of inheriting the rule.
 ///
 /// `port: None` is a whole-app default (every port); `port: Some(p)` is a
 /// per-port override that wins over the app's default when both exist for
@@ -73,12 +74,33 @@ pub struct AppRule {
     /// app allow --for 1h`); the daemon sweeps expired rules out of the file
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<u64>,
+    /// `fingerprint(exe)` at the time the rule was made. When the binary
+    /// changes afterwards (update, or something replaced it) the daemon
+    /// treats the rule as absent and asks again; `None` = never checked
+    /// (hand-written rule). See `stale`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 impl AppRule {
     pub fn expired(&self, now: u64) -> bool {
         self.expires.is_some_and(|t| t <= now)
     }
+
+    /// the binary this rule was made for is not the one on disk any more
+    pub fn stale(&self) -> bool {
+        self.fingerprint.is_some() && self.fingerprint != fingerprint(&self.exe)
+    }
+}
+
+/// cheap identity of a binary: size and mtime. Catches package updates and
+/// swapped binaries, not an attacker who forges both — a hash would cost a
+/// full read of the exe per new connection.
+/// ponytail: size:mtime, upgrade to a cached sha256 if forgery matters
+pub fn fingerprint(exe: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(exe).ok()?;
+    Some(format!("{}:{}", m.len(), m.mtime()))
 }
 
 pub fn now_ts() -> u64 {
@@ -217,6 +239,7 @@ mod tests {
             action,
             enabled: true,
             expires: None,
+            fingerprint: None,
         }
     }
 
@@ -265,6 +288,22 @@ mod tests {
             act(match_rule(&[r], "/usr/bin/a", Some(80), None)),
             Some(Action::Allow)
         );
+    }
+
+    #[test]
+    fn fingerprint_tracks_size_and_mtime() {
+        let dir = std::env::temp_dir().join(format!("guardit-fp-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("bin");
+        fs::write(&exe, b"v1").unwrap();
+        let mut r = rule(exe.to_str().unwrap(), None, Action::Allow);
+        assert!(!r.stale(), "no fingerprint = never stale");
+        r.fingerprint = fingerprint(&r.exe);
+        assert!(!r.stale());
+        fs::write(&exe, b"v2 longer").unwrap();
+        assert!(r.stale(), "size changed");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(r.stale(), "gone binary is stale too");
     }
 
     #[test]

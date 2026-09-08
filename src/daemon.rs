@@ -1,4 +1,6 @@
-use crate::config::{Action, AppRule, Config, Direction, config_path, match_rule, now_ts};
+use crate::config::{
+    Action, AppRule, Config, Direction, config_path, fingerprint, match_rule, now_ts,
+};
 use crate::ipc::{self, ClientMsg, FlowStatus, FlowWire, ServerMsg};
 use crate::ruleset::{QUEUE_IN, QUEUE_OUT};
 use nfq::{Queue, Verdict};
@@ -508,9 +510,21 @@ fn upsert_rule(
             action,
             enabled: true,
             expires,
+            fingerprint: fingerprint(exe),
         });
     })
     .app_rule
+}
+
+/// what the rules say for this connection — `None` also when the matching
+/// rule was made for a binary that has since changed, so the app is asked
+/// again (and the answer replaces the rule with a fresh fingerprint)
+fn ruled(rules: &[AppRule], exe: &str, port: u16, dir: Direction) -> Option<Action> {
+    let r = match_rule(rules, exe, Some(port), Some(dir))?;
+    if r.stale() {
+        return None;
+    }
+    Some(r.action)
 }
 
 /// drops every expired rule from the file; `Some(rules)` when anything
@@ -669,8 +683,7 @@ fn queue_loop(
 
         // a per-port override (Flow pane) wins over the app's whole-app
         // default (Apps/Conflicts panes) when both exist for this app
-        let matched = match_rule(&app_rules.lock().unwrap(), &exe, Some(rule_port), Some(dir))
-            .map(|r| r.action);
+        let matched = ruled(&app_rules.lock().unwrap(), &exe, rule_port, dir);
 
         let verdict = match matched {
             Some(action) => {
@@ -727,9 +740,7 @@ fn queue_loop(
                         // y/n, which cascades a Decide to us) already gives this
                         // exact verdict, in which case adding a redundant
                         // per-port override would just clutter the app's rules
-                        if match_rule(&app_rules.lock().unwrap(), &exe, Some(rule_port), Some(dir))
-                            .map(|r| r.action)
-                            != Some(verdict)
+                        if ruled(&app_rules.lock().unwrap(), &exe, rule_port, dir) != Some(verdict)
                         {
                             let rules =
                                 upsert_rule(&exe, Some(rule_port), Some(dir), verdict, None);
