@@ -1598,7 +1598,8 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
             // (common for Flatpak, AppImage, some auto-updaters) leaves a
             // rule pointing at nothing; flag it instead of pretending it's
             // still meaningful
-            let missing = !Path::new(&row.exe).exists();
+            // "flatpak:…" / "snap:…" identities aren't paths (daemon::app_identity)
+            let missing = row.exe.starts_with('/') && !Path::new(&row.exe).exists();
             if missing {
                 status.push_str(" [gone]");
             } else if row.rule.as_ref().is_some_and(|r| r.stale()) {

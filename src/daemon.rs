@@ -463,7 +463,55 @@ fn resolve_exe(proto: u8, local_port: u16) -> Option<String> {
     if !pid_owns_inode(pid, inode) {
         return None;
     }
-    Some(exe.to_string_lossy().into_owned())
+    Some(app_identity(pid).unwrap_or_else(|| exe.to_string_lossy().into_owned()))
+}
+
+/// a sandboxed app's /proc/<pid>/exe is a path inside its own mount
+/// namespace ("/app/bin/firefox"), meaningless on the host and shared by
+/// every flatpak — so those get ruled by app id instead:
+/// "flatpak:org.mozilla.firefox" (from the .flatpak-info the sandbox
+/// mounts at its root) or "snap:firefox.firefox" (from the cgroup scope
+/// snapd puts it in). None = plain host process, use the exe path.
+fn app_identity(pid: u32) -> Option<String> {
+    if let Ok(info) = fs::read_to_string(format!("/proc/{pid}/root/.flatpak-info"))
+        && let Some(id) = flatpak_id(&info)
+    {
+        return Some(format!("flatpak:{id}"));
+    }
+    let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    snap_id(&cgroup).map(|id| format!("snap:{id}"))
+}
+
+/// `name=` under `[Application]` of a .flatpak-info file
+fn flatpak_id(info: &str) -> Option<&str> {
+    let app = info.split("[Application]").nth(1)?;
+    app.lines()
+        .map(str::trim)
+        .take_while(|l| !l.starts_with('['))
+        .find_map(|l| l.strip_prefix("name="))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// "snap.<snap>.<app>" out of a cgroup path segment like
+/// "snap.firefox.firefox-0f4e…(uuid).scope"
+fn snap_id(cgroup: &str) -> Option<&str> {
+    cgroup
+        .split(['/', '\n'])
+        .find_map(|seg| seg.strip_prefix("snap.")?.strip_suffix(".scope"))
+        // snap and app names may contain '-', the uuid is fixed-width: cut it
+        .map(|rest| match rest.len().checked_sub(37) {
+            Some(cut)
+                if rest.as_bytes()[cut] == b'-'
+                    && rest[cut + 1..]
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit() || c == '-') =>
+            {
+                &rest[..cut]
+            }
+            _ => rest,
+        })
+        .filter(|id| id.contains('.'))
 }
 
 /// `resolve_exe`, but the /proc/*/fd scan it does per packet is the hot path
@@ -1051,6 +1099,16 @@ mod tests {
             inode_pid_map().get(&inode).copied(),
             Some(std::process::id())
         );
+    }
+
+    #[test]
+    fn sandbox_identities() {
+        let info = "[Application]\nname=org.mozilla.firefox\nruntime=org.freedesktop.Platform/x86_64/23.08\n\n[Instance]\nname=ignored\n";
+        assert_eq!(flatpak_id(info), Some("org.mozilla.firefox"));
+        assert_eq!(flatpak_id("[Instance]\nname=x\n"), None);
+        let cg = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/snap.code-insiders.code-insiders-9f8a1c2e-3b4d-4e5f-8a9b-0c1d2e3f4a5b.scope\n";
+        assert_eq!(snap_id(cg), Some("code-insiders.code-insiders"));
+        assert_eq!(snap_id("0::/user.slice/app-ghostty-26675.scope\n"), None);
     }
 
     #[test]
