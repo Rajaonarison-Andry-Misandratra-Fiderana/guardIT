@@ -489,21 +489,28 @@ fn resolve_exe_cached(proto: u8, local_port: u16) -> Option<String> {
 /// `port: None` (whole-app, from Apps/Conflicts) wipes every existing rule
 /// for `exe` — the app-wide port-specific overrides too, since "allow the
 /// whole app" is meant to actually mean every port. `port: Some(p)`
-/// (per-port, from Flow) only replaces that one port's existing override,
-/// leaving the app-wide default and every other port alone.
-fn upsert_rule(exe: &str, port: Option<u16>, action: Action) -> Vec<AppRule> {
+/// (per-port, from Flow) only replaces that one port's existing override
+/// for the same direction, leaving the app-wide default and every other
+/// port alone.
+fn upsert_rule(
+    exe: &str,
+    port: Option<u16>,
+    direction: Option<Direction>,
+    action: Action,
+) -> Vec<AppRule> {
     Config::update(|cfg| {
         match port {
             None => cfg.app_rule.retain(|r| r.exe != exe),
             Some(p) => cfg
                 .app_rule
-                .retain(|r| !(r.exe == exe && r.port == Some(p))),
+                .retain(|r| !(r.exe == exe && r.port == Some(p) && r.direction == direction)),
         }
         let id = cfg.next_app_id();
         cfg.app_rule.push(AppRule {
             id,
             exe: exe.to_string(),
             port,
+            direction,
             action,
             enabled: true,
         });
@@ -650,7 +657,8 @@ fn queue_loop(
 
         // a per-port override (Flow pane) wins over the app's whole-app
         // default (Apps/Conflicts panes) when both exist for this app
-        let matched = match_rule(&app_rules.lock().unwrap(), &exe, Some(rule_port));
+        let matched = match_rule(&app_rules.lock().unwrap(), &exe, Some(rule_port), Some(dir))
+            .map(|r| r.action);
 
         let verdict = match matched {
             Some(action) => {
@@ -707,10 +715,11 @@ fn queue_loop(
                         // y/n, which cascades a Decide to us) already gives this
                         // exact verdict, in which case adding a redundant
                         // per-port override would just clutter the app's rules
-                        if match_rule(&app_rules.lock().unwrap(), &exe, Some(rule_port))
+                        if match_rule(&app_rules.lock().unwrap(), &exe, Some(rule_port), Some(dir))
+                            .map(|r| r.action)
                             != Some(verdict)
                         {
-                            let rules = upsert_rule(&exe, Some(rule_port), verdict);
+                            let rules = upsert_rule(&exe, Some(rule_port), Some(dir), verdict);
                             *app_rules.lock().unwrap() = rules.clone();
                             let _ = event_tx.send(ServerMsg::AppRules(rules));
                         }
@@ -873,8 +882,13 @@ fn handle_client_msg(
             *app_rules.lock().unwrap() = fresh.app_rule.clone();
             Some(fresh.app_rule)
         }
-        ClientMsg::SetAppRule { exe, port, action } => {
-            let rules = upsert_rule(&exe, port, action);
+        ClientMsg::SetAppRule {
+            exe,
+            port,
+            direction,
+            action,
+        } => {
+            let rules = upsert_rule(&exe, port, direction, action);
             *app_rules.lock().unwrap() = rules.clone();
             Some(rules)
         }

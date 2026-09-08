@@ -1,4 +1,4 @@
-use crate::config::{Action, AppRule, Config, Proto, Rule, config_path, match_rule};
+use crate::config::{Action, AppRule, Config, Direction, Proto, Rule, config_path, match_rule};
 use crate::daemon;
 use crate::ipc::{self, ClientMsg, FlowStatus, FlowWire, ServerMsg};
 use crate::ruleset;
@@ -1055,8 +1055,8 @@ fn effective_status(e: &FlowWire, app_rules: &[AppRule]) -> FlowStatus {
     if matches!(e.status, FlowStatus::Pending) {
         return FlowStatus::Pending;
     }
-    match_rule(app_rules, &e.exe, e.port)
-        .map(FlowStatus::from)
+    match_rule(app_rules, &e.exe, e.port, Some(e.direction))
+        .map(|r| FlowStatus::from(r.action))
         .unwrap_or(e.status)
 }
 
@@ -1076,6 +1076,7 @@ fn apps_set_verdict(app: &mut App, action: Action) {
     ipc.send(&ClientMsg::SetAppRule {
         exe: exe.clone(),
         port: None,
+        direction: None,
         action,
     });
     cascade_flow_rows(app, action, |e| e.exe == exe);
@@ -1138,6 +1139,7 @@ fn flow_decide(app: &mut App, verdict: Action) {
     };
     let exe = entry.exe.clone();
     let port = entry.port;
+    let direction = entry.direction;
     let was_pending = matches!(entry.status, FlowStatus::Pending);
     let req_id = entry.req_id;
     let Some(ipc) = &mut app.ipc else { return };
@@ -1149,12 +1151,15 @@ fn flow_decide(app: &mut App, verdict: Action) {
         ipc.send(&ClientMsg::SetAppRule {
             exe: exe.clone(),
             port,
+            direction: Some(direction),
             action: verdict,
         });
     }
-    // the rule covers this app's OTHER rows on the SAME port too (per-port
-    // control, never the whole app — that's Apps' job)
-    cascade_flow_rows(app, verdict, |e| e.exe == exe && e.port == port);
+    // the rule covers this app's OTHER rows on the SAME port and direction
+    // too (per-port control, never the whole app — that's Apps' job)
+    cascade_flow_rows(app, verdict, |e| {
+        e.exe == exe && e.port == port && e.direction == direction
+    });
 }
 
 /// stable, deterministic order shared by draw_conflicts and the
@@ -1191,12 +1196,16 @@ fn conflicts_decide(app: &mut App, action: Action) {
     let exe = entry.exe.clone();
     let port = Some(entry.port);
     let Some(ipc) = &mut app.ipc else { return };
+    // a listening socket is only ever reached inbound
     ipc.send(&ClientMsg::SetAppRule {
         exe: exe.clone(),
         port,
+        direction: Some(Direction::In),
         action,
     });
-    cascade_flow_rows(app, action, |e| e.exe == exe && e.port == port);
+    cascade_flow_rows(app, action, |e| {
+        e.exe == exe && e.port == port && e.direction == Direction::In
+    });
 }
 
 fn draw(f: &mut Frame, app: &mut App) {

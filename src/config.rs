@@ -61,21 +61,32 @@ pub struct AppRule {
     pub exe: String,
     #[serde(default)]
     pub port: Option<u16>,
+    /// `None` = both directions. `Some(Out)` is "this app reaching port P
+    /// somewhere", `Some(In)` is "someone reaching this app's local port P"
+    /// — same number, different meaning, so the daemon records the direction
+    /// of the request it answered
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<Direction>,
     pub action: Action,
     pub enabled: bool,
 }
 
-/// the one matching rule for (exe, port): a per-port override wins over the
-/// app's whole-app default (`port: None`) when both exist — used by the
-/// daemon to verdict and by the TUI to show what would happen right now
-pub fn match_rule(rules: &[AppRule], exe: &str, port: Option<u16>) -> Option<Action> {
-    let applicable = |r: &&AppRule| r.enabled && r.exe == exe;
+/// the one matching rule for (exe, port, direction): the most specific rule
+/// wins — a per-port rule over the app's whole-app default (`port: None`),
+/// and within that a directional rule over one that covers both. Used by
+/// the daemon to verdict and by the TUI to show what would happen right now
+pub fn match_rule<'a>(
+    rules: &'a [AppRule],
+    exe: &str,
+    port: Option<u16>,
+    dir: Option<Direction>,
+) -> Option<&'a AppRule> {
     rules
         .iter()
-        .filter(applicable)
-        .find(|r| r.port == port)
-        .or_else(|| rules.iter().filter(applicable).find(|r| r.port.is_none()))
-        .map(|r| r.action)
+        .filter(|r| r.enabled && r.exe == exe)
+        .filter(|r| r.port.is_none() || r.port == port)
+        .filter(|r| r.direction.is_none() || r.direction == dir)
+        .max_by_key(|r| (r.port.is_some(), r.direction.is_some()))
 }
 
 fn default_pending_timeout() -> u32 {
@@ -184,9 +195,14 @@ mod tests {
             id: 0,
             exe: exe.into(),
             port,
+            direction: None,
             action,
             enabled: true,
         }
+    }
+
+    fn act(r: Option<&AppRule>) -> Option<Action> {
+        r.map(|r| r.action)
     }
 
     #[test]
@@ -196,24 +212,62 @@ mod tests {
             rule("/usr/bin/a", Some(443), Action::Deny),
         ];
         assert_eq!(
-            match_rule(&rules, "/usr/bin/a", Some(443)),
+            act(match_rule(&rules, "/usr/bin/a", Some(443), None)),
             Some(Action::Deny)
         );
         assert_eq!(
-            match_rule(&rules, "/usr/bin/a", Some(80)),
+            act(match_rule(&rules, "/usr/bin/a", Some(80), None)),
             Some(Action::Allow),
             "other ports keep the app default"
         );
-        assert_eq!(match_rule(&rules, "/usr/bin/b", Some(443)), None);
+        assert_eq!(act(match_rule(&rules, "/usr/bin/b", Some(443), None)), None);
     }
 
     #[test]
     fn port_rule_alone_leaves_other_ports_unruled() {
         let rules = vec![rule("/usr/bin/a", Some(443), Action::Deny)];
         assert_eq!(
-            match_rule(&rules, "/usr/bin/a", Some(53)),
+            act(match_rule(&rules, "/usr/bin/a", Some(53), None)),
             None,
             "denying one port must not deny the app"
+        );
+    }
+
+    #[test]
+    fn directional_rule_beats_both_ways_rule_only_for_its_direction() {
+        let mut out_only = rule("/usr/bin/a", Some(443), Action::Deny);
+        out_only.direction = Some(Direction::Out);
+        let rules = vec![rule("/usr/bin/a", Some(443), Action::Allow), out_only];
+        assert_eq!(
+            act(match_rule(
+                &rules,
+                "/usr/bin/a",
+                Some(443),
+                Some(Direction::Out)
+            )),
+            Some(Action::Deny)
+        );
+        assert_eq!(
+            act(match_rule(
+                &rules,
+                "/usr/bin/a",
+                Some(443),
+                Some(Direction::In)
+            )),
+            Some(Action::Allow)
+        );
+        // whole-app directional loses to a per-port both-ways rule
+        let mut app_in = rule("/usr/bin/a", None, Action::Deny);
+        app_in.direction = Some(Direction::In);
+        let rules = vec![rule("/usr/bin/a", Some(22), Action::Allow), app_in];
+        assert_eq!(
+            act(match_rule(
+                &rules,
+                "/usr/bin/a",
+                Some(22),
+                Some(Direction::In)
+            )),
+            Some(Action::Allow)
         );
     }
 }

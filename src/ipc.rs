@@ -90,11 +90,13 @@ pub enum ClientMsg {
     },
     /// set (creating if needed) a rule for `exe` — `port: None` is the
     /// whole-app default (Apps/Conflicts panes), `port: Some(p)` is a
-    /// per-port override (Flow pane) that wins over the default; always
-    /// covers both directions, see daemon::upsert_rule
+    /// per-port override (Flow pane) that wins over the default; `direction:
+    /// None` covers both ways, see daemon::upsert_rule and config::match_rule
     SetAppRule {
         exe: String,
         port: Option<u16>,
+        #[serde(default)]
+        direction: Option<Direction>,
         action: Action,
     },
     ToggleAppRule {
