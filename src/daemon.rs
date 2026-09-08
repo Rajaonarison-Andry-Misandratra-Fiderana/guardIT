@@ -753,7 +753,8 @@ fn to_verdict(action: Action) -> Verdict {
 
 pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
     eprintln!(
-        "guardit daemon: starting{}",
+        "guardit daemon {}: starting{}",
+        env!("CARGO_PKG_VERSION"),
         if debug {
             " (--debug, always-accept)"
         } else {

@@ -4,12 +4,16 @@ mod ipc;
 mod ruleset;
 mod tui;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use config::{Action as RuleAction, Config, Direction, Proto, Rule, now_ts};
 use ipc::{ClientMsg, FlowStatus, ServerMsg};
 
 #[derive(Parser)]
-#[command(name = "guardit", about = "ultra simple nftables-backed firewall")]
+#[command(
+    name = "guardit",
+    version,
+    about = "nftables-backed firewall with per-app control and a live TUI dashboard"
+)]
 struct Cli {
     /// no subcommand → opens the TUI (same as `guardit tui`)
     #[command(subcommand)]
@@ -94,6 +98,10 @@ enum Cmd {
     Import { file: String },
     /// connections the daemon is holding right now, waiting for a decision
     Pending,
+    /// print a shell completion script (fish: `guardit completions fish > ~/.config/fish/completions/guardit.fish`)
+    Completions { shell: clap_complete::Shell },
+    /// print the man page (roff): `guardit man | gzip > /usr/share/man/man1/guardit.1.gz`
+    Man,
     /// decide a pending connection by its id (see `pending`); remembered as a rule
     Answer { req_id: u32, verdict: VerdictArg },
     /// allow traffic matching a source/port
@@ -145,6 +153,8 @@ fn main() {
             | Cmd::LogApp { .. }
             | Cmd::Apply { dry_run: true }
             | Cmd::App(AppCmd::List)
+            | Cmd::Completions { .. }
+            | Cmd::Man
     );
     if !read_only && !ruleset::is_root() {
         eprintln!("guardit needs root — run with sudo");
@@ -208,6 +218,15 @@ fn main() {
             }
             println!("forgot {exe} ({} rule(s) removed)", before - rules.len());
         }
+        Cmd::Completions { shell } => clap_complete::generate(
+            shell,
+            &mut Cli::command(),
+            "guardit",
+            &mut std::io::stdout(),
+        ),
+        Cmd::Man => clap_mangen::Man::new(Cli::command())
+            .render(&mut std::io::stdout())
+            .unwrap_or_else(|e| fail(&format!("render man page: {e}"))),
         Cmd::Export => print!(
             "{}",
             toml::to_string_pretty(&cfg).expect("serialize config")
