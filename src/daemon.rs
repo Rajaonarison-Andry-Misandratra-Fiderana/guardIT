@@ -2,7 +2,7 @@ use crate::config::{
     Action, AppRule, Config, Direction, config_path, fingerprint, match_rule, now_ts,
 };
 use crate::ipc::{self, ClientMsg, FlowStatus, FlowWire, ServerMsg};
-use crate::ruleset::{QUEUE_IN, QUEUE_OUT};
+use crate::ruleset::{QUEUE_DNS, QUEUE_IN, QUEUE_OUT};
 use nfq::{Queue, Verdict};
 use std::collections::HashMap;
 use std::fs;
@@ -142,7 +142,7 @@ pub fn print_log_app(exe_filter: Option<&str>, n: usize) {
             "{:<8}{:<6}{:<20}{:<6}{:<6}{:<8}{}",
             ago(now.saturating_sub(e.ts)),
             e.direction.as_str(),
-            e.peer_ip,
+            e.peer(),
             e.proto,
             e.port.map(|p| p.to_string()).unwrap_or_default(),
             status,
@@ -177,6 +177,8 @@ struct PktInfo {
     dst_port: u16,
     src_ip: IpAddr,
     dst_ip: IpAddr,
+    /// byte offset of the L4 header in the packet
+    l4: usize,
 }
 
 /// dispatches on the version nibble in the first byte — same header shape
@@ -206,6 +208,7 @@ fn parse_ipv4(payload: &[u8]) -> Option<PktInfo> {
         proto,
         src_port: u16::from_be_bytes([l4[0], l4[1]]),
         dst_port: u16::from_be_bytes([l4[2], l4[3]]),
+        l4: ihl,
         src_ip: IpAddr::V4(Ipv4Addr::new(
             payload[12],
             payload[13],
@@ -244,9 +247,114 @@ fn parse_ipv6(payload: &[u8]) -> Option<PktInfo> {
         proto,
         src_port: u16::from_be_bytes([l4[0], l4[1]]),
         dst_port: u16::from_be_bytes([l4[2], l4[3]]),
+        l4: 40,
         src_ip: IpAddr::V6(Ipv6Addr::from(src)),
         dst_ip: IpAddr::V6(Ipv6Addr::from(dst)),
     })
+}
+
+/// ip -> the name whose lookup returned it, fed by dns_loop
+static DNS_NAMES: LazyLock<Mutex<HashMap<IpAddr, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// ponytail: no TTL, the whole map is dropped past this many entries
+const DNS_NAMES_CAP: usize = 8192;
+
+pub fn peer_name(ip: &IpAddr) -> Option<String> {
+    DNS_NAMES.lock().unwrap().get(ip).cloned()
+}
+
+/// passive DNS tap on QUEUE_DNS: every UDP reply from port 53 is parsed
+/// for A/AAAA answers and accepted untouched. Only ever a display aid —
+/// DoH/DoT and anything the app already had cached go unseen.
+fn dns_loop() -> std::io::Result<()> {
+    let mut queue = Queue::open()?;
+    queue.bind(QUEUE_DNS)?;
+    loop {
+        let mut msg = queue.recv()?;
+        if let Some(pkt) = parse_packet(msg.get_payload())
+            && pkt.proto == 17
+            && pkt.src_port == 53
+            && let Some(dns) = msg.get_payload().get(pkt.l4 + 8..)
+            && let Some((name, ips)) = parse_dns_answers(dns)
+        {
+            let mut map = DNS_NAMES.lock().unwrap();
+            if map.len() >= DNS_NAMES_CAP {
+                map.clear();
+            }
+            for ip in ips {
+                map.insert(ip, name.clone());
+            }
+        }
+        msg.set_verdict(Verdict::Accept);
+        queue.verdict(msg)?;
+    }
+}
+
+/// a DNS *response*: the first question's name and every A/AAAA rdata in
+/// the answer section, keyed to that name (so a CNAME chain still maps
+/// the final addresses to what the app actually asked for)
+fn parse_dns_answers(msg: &[u8]) -> Option<(String, Vec<IpAddr>)> {
+    if msg.len() < 12 || msg[2] & 0x80 == 0 {
+        return None;
+    }
+    let u16_at = |i: usize| Some(u16::from_be_bytes([*msg.get(i)?, *msg.get(i + 1)?]));
+    let (qd, an) = (u16_at(4)?, u16_at(6)?);
+    let mut pos = 12;
+    let mut qname = None;
+    for _ in 0..qd {
+        let (name, end) = dns_read_name(msg, pos)?;
+        qname.get_or_insert(name);
+        pos = end + 4; // qtype, qclass
+    }
+    let qname = qname?;
+    let mut ips = Vec::new();
+    for _ in 0..an {
+        let (_, end) = dns_read_name(msg, pos)?;
+        let rtype = u16_at(end)?;
+        let rdlen = u16_at(end + 8)? as usize; // type, class, ttl(4)
+        let rdata = msg.get(end + 10..end + 10 + rdlen)?;
+        match (rtype, rdlen) {
+            (1, 4) => ips.push(IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(rdata).ok()?))),
+            (28, 16) => ips.push(IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(rdata).ok()?,
+            ))),
+            _ => {}
+        }
+        pos = end + 10 + rdlen;
+    }
+    Some((qname, ips))
+}
+
+/// RFC 1035 name at `pos`, following compression pointers; returns the
+/// dotted name and the offset just past the name *in the original stream*
+fn dns_read_name(msg: &[u8], mut pos: usize) -> Option<(String, usize)> {
+    let mut name = String::new();
+    let mut end = None;
+    let mut hops = 0;
+    loop {
+        let len = *msg.get(pos)? as usize;
+        if len == 0 {
+            pos += 1;
+            break;
+        }
+        if len & 0xC0 == 0xC0 {
+            let ptr = ((len & 0x3F) << 8) | *msg.get(pos + 1)? as usize;
+            end.get_or_insert(pos + 2);
+            hops += 1;
+            if hops > 16 {
+                return None; // pointer loop
+            }
+            pos = ptr;
+            continue;
+        }
+        let label = msg.get(pos + 1..pos + 1 + len)?;
+        if !name.is_empty() {
+            name.push('.');
+        }
+        name.push_str(&String::from_utf8_lossy(label));
+        pos += 1 + len;
+    }
+    Some((name, end.unwrap_or(pos)))
 }
 
 fn proto_name(proto: u8) -> &'static str {
@@ -690,6 +798,14 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
         }));
     }
 
+    std::thread::spawn(|| {
+        if let Err(e) = dns_loop() {
+            eprintln!(
+                "guardit daemon: dns tap (queue {QUEUE_DNS}) stopped: {e} — peers show as ips"
+            );
+        }
+    });
+
     if !debug {
         let scan_listening = listening.clone();
         let scan_event_tx = event_tx.clone();
@@ -760,10 +876,12 @@ fn queue_loop(
             queue.verdict(msg)?;
             continue;
         };
-        let (local_port, peer_port, peer_ip) = match dir {
-            Direction::In => (pkt.dst_port, pkt.src_port, pkt.src_ip.to_string()),
-            Direction::Out => (pkt.src_port, pkt.dst_port, pkt.dst_ip.to_string()),
+        let (local_port, peer_port, peer_addr) = match dir {
+            Direction::In => (pkt.dst_port, pkt.src_port, pkt.src_ip),
+            Direction::Out => (pkt.src_port, pkt.dst_port, pkt.dst_ip),
         };
+        let peer_ip = peer_addr.to_string();
+        let peer_name = peer_name(&peer_addr);
         // the port a rule is about is always the *destination* port: the
         // service being reached — remote for outbound, our own local one for
         // inbound (the peer's source port is ephemeral, ruling on it would
@@ -809,6 +927,7 @@ fn queue_loop(
                     proto: proto_name(pkt.proto).to_string(),
                     port: Some(rule_port),
                     peer_ip: peer_ip.clone(),
+                    peer_name: peer_name.clone(),
                     status: action.into(),
                     ts: now_ts(),
                 };
@@ -831,6 +950,7 @@ fn queue_loop(
                     proto: proto_name(pkt.proto).to_string(),
                     port: Some(rule_port),
                     peer_ip: peer_ip.clone(),
+                    peer_name: peer_name.clone(),
                     status: FlowStatus::Pending,
                     ts: now_ts(),
                 };
@@ -891,7 +1011,7 @@ fn notify_desktop(w: &FlowWire) {
         w.exe,
         w.proto,
         w.port.unwrap_or(0),
-        w.peer_ip,
+        w.peer(),
         w.req_id.unwrap_or(0)
     );
     for u in users.flatten() {
@@ -1125,6 +1245,41 @@ mod tests {
         let cg = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/snap.code-insiders.code-insiders-9f8a1c2e-3b4d-4e5f-8a9b-0c1d2e3f4a5b.scope\n";
         assert_eq!(snap_id(cg), Some("code-insiders.code-insiders"));
         assert_eq!(snap_id("0::/user.slice/app-ghostty-26675.scope\n"), None);
+    }
+
+    #[test]
+    fn parses_dns_response_with_cname_and_pointers() {
+        // response, 1 question "example.com" A, 3 answers:
+        // CNAME (skipped), A 93.184.216.34, AAAA 2606:2800:220:1:248:1893:25c8:1946
+        let mut m = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 3, 0, 0, 0, 0];
+        m.extend(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        m.extend([
+            0xC0, 0x0C, 0, 5, 0, 1, 0, 0, 0, 60, 0, 6, 3, b'w', b'w', b'w', 0xC0, 0x0C,
+        ]);
+        m.extend([0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34]);
+        m.extend([0xC0, 0x0C, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16]);
+        m.extend(
+            "2606:2800:220:1:248:1893:25c8:1946"
+                .parse::<Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        let (name, ips) = parse_dns_answers(&m).unwrap();
+        assert_eq!(name, "example.com");
+        assert_eq!(
+            ips,
+            vec![
+                "93.184.216.34".parse::<IpAddr>().unwrap(),
+                "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()
+            ]
+        );
+        m[2] = 0x01; // QR clear = a query, not a response
+        assert!(parse_dns_answers(&m).is_none());
+        let looped = [0xC0, 0x00, 0, 0];
+        assert!(
+            dns_read_name(&looped, 0).is_none(),
+            "pointer loop must not hang"
+        );
     }
 
     #[test]

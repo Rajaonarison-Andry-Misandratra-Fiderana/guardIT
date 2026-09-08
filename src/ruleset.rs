@@ -17,6 +17,10 @@ pub const LOG_PREFIX_OUT: &str = "guardit-out: ";
 /// install.sh keeps it supervised (systemd or cron) for exactly that reason.
 pub const QUEUE_IN: u16 = 0;
 pub const QUEUE_OUT: u16 = 1;
+/// DNS replies, for IP -> name display only (daemon::dns_loop). This one
+/// DOES bypass: it decides nothing, so a stopped daemon must not stall
+/// name resolution on top of everything else it already blocks.
+pub const QUEUE_DNS: u16 = 2;
 
 fn rule_line(r: &Rule) -> String {
     let mut parts = vec![];
@@ -56,6 +60,8 @@ pub fn render(cfg: &Config) -> String {
     out.push_str(&format!("table inet {TABLE} {{\n"));
     out.push_str("  chain input {\n");
     out.push_str("    type filter hook input priority 0; policy drop;\n");
+    // before `iif lo`: a local resolver's replies to apps come over lo
+    out.push_str(&format!("    udp sport 53 queue num {QUEUE_DNS} bypass\n"));
     out.push_str("    iif lo accept\n");
     out.push_str("    ct state established,related accept\n");
     for r in cfg.rule.iter().filter(|r| r.enabled) {
@@ -193,7 +199,15 @@ mod tests {
         let out = render(&cfg);
         assert!(out.contains(&format!("queue num {QUEUE_IN}\n")));
         assert!(out.contains(&format!("queue num {QUEUE_OUT}\n")));
-        assert!(!out.contains("bypass"));
+        assert_eq!(
+            out.matches("bypass").count(),
+            1,
+            "only the DNS tap bypasses"
+        );
+        assert!(out.contains(&format!("udp sport 53 queue num {QUEUE_DNS} bypass\n")));
+        let dns = out.find("sport 53").unwrap();
+        let lo = out.find("iif lo accept").unwrap();
+        assert!(dns < lo, "DNS tap must see local-resolver replies on lo");
     }
 
     #[test]
@@ -205,7 +219,7 @@ mod tests {
         let out = render(&cfg);
         let input_chain = out.split("chain output").next().unwrap();
         let rule_pos = input_chain.find("1.2.3.4 tcp drop").unwrap();
-        let queue_pos = input_chain.find("queue num").unwrap();
+        let queue_pos = input_chain.find(&format!("queue num {QUEUE_IN}")).unwrap();
         assert!(
             rule_pos < queue_pos,
             "ip rule must be evaluated before the queue fallback"

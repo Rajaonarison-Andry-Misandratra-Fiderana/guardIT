@@ -8,6 +8,16 @@ pub fn socket_path() -> PathBuf {
     PathBuf::from("/run/guardit/ipc.sock")
 }
 
+impl FlowWire {
+    /// "github.com (140.82.121.4)" when the name is known, else the ip
+    pub fn peer(&self) -> String {
+        match &self.peer_name {
+            Some(n) => format!("{n} ({})", self.peer_ip),
+            None => self.peer_ip.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FlowStatus {
     Pending,
@@ -39,6 +49,10 @@ pub struct FlowWire {
     pub proto: String,
     pub port: Option<u16>,
     pub peer_ip: String,
+    /// the name an app resolved to get `peer_ip`, when the daemon's DNS tap
+    /// saw the answer (daemon::dns_loop) — display only, never matched on
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_name: Option<String>,
     pub status: FlowStatus,
     /// unix epoch seconds when this was logged — `#[serde(default)]` so
     /// history.jsonl lines written before this field existed still parse

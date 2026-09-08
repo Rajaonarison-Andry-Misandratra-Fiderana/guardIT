@@ -261,7 +261,7 @@ fn main() {
                     f.proto,
                     f.port.map(|p| p.to_string()).unwrap_or_default(),
                     f.exe,
-                    f.peer_ip
+                    f.peer()
                 );
             }
         }

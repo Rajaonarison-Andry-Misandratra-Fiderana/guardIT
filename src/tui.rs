@@ -1447,7 +1447,7 @@ fn draw_app_log(f: &mut Frame, app: &mut App, area: Rect) {
                 Cell::from(basename(&e.exe).to_string()),
                 Cell::from(e.proto.clone()),
                 Cell::from(e.port.map(|p| p.to_string()).unwrap_or_default()),
-                Cell::from(e.peer_ip.clone()),
+                Cell::from(e.peer()),
                 Cell::from(status),
             ])
             .style(Style::new().fg(color))
@@ -1703,7 +1703,7 @@ fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
                 e.proto,
                 e.direction.as_str(),
                 e.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-                e.peer_ip,
+                e.peer(),
             );
             let mut style = Style::new().fg(color);
             if matches!(status, FlowStatus::Pending) {
