@@ -119,7 +119,7 @@ a thick border:
 | Pane | What it shows | Keys |
 |---|---|---|
 | **System rules** | IP/port `Rule`s (nftables-level) | `j/k` move · `space` toggle · `d` delete · `a` add · `p` presets (changes apply immediately) |
-| **Application blocking** | one row per app, its whole-app default, and how many per-port overrides it has | `j/k` select · `Enter` jump to its Flow · `l` this app's log · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely |
+| **Application blocking** | one row per app, its whole-app default, and how many per-port overrides it has — apps with no rule yet sort to the top | `j/k` select · `Enter` jump to its Flow · `l` this app's log · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely |
 | **Listening ports** | every LISTEN/bound local socket, who owns it, and real bind conflicts (rare — the kernel already prevents most) | `j/k` select · `l` log · `y`/`n` allow/deny **this port only** |
 | **Top apps** | bar chart of the apps with the most connection attempts, over the whole audit log (reset by `f` flush) | informational |
 | **Network flow** | live connection history for whichever app is selected in Application blocking | `j/k` select · `y`/`n` allow/deny **this port and direction only** (remembered as a per-port rule) |

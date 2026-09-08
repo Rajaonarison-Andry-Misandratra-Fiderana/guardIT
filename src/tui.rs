@@ -907,7 +907,9 @@ fn rebuild_apps(app: &mut App) {
             });
         }
     }
-    rows.sort_by(|a, b| a.exe.cmp(&b.exe));
+    // apps with no rule at all first: they're the ones waiting on a decision,
+    // and they'd otherwise be buried alphabetically among the settled ones
+    rows.sort_by_key(|r| (r.rule.is_some() || r.port_overrides > 0, r.exe.clone()));
     app.apps = rows;
 
     let restored = selected_exe.and_then(|exe| app.apps.iter().position(|r| r.exe == exe));
@@ -1643,7 +1645,10 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
     let list = List::new(items)
         .style(theme.base())
         .highlight_style(Style::new().bg(theme.border_idle))
-        .block(theme.pane("application blocking".into(), app.focus == Focus::Apps));
+        .block(theme.pane(
+            "application blocking — undecided first".into(),
+            app.focus == Focus::Apps,
+        ));
     f.render_stateful_widget(list, area, &mut app.apps_state);
 }
 

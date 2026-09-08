@@ -23,6 +23,8 @@ Per-app rules got precise, and usable without the TUI.
 - **Hot reload**: the daemon picks up a hand-edited `rules.toml` within 5 s; a malformed
   file is logged and ignored, the loaded rules stay in force.
 - **Top apps** counts the whole audit log, not just the current session.
+- The Application blocking pane sorts apps with no rule yet to the top, instead of burying
+  them alphabetically among the settled ones.
 - **Security**: the daemon's IPC socket is now root-only (0600 in a 0700 dir) — any
   local user could previously connect and allow or deny apps. Rule sources are validated
   (`any`, ip, or ip/prefix) at every entry point before reaching nft.
