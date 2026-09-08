@@ -68,11 +68,10 @@ pub fn history_log_path() -> std::path::PathBuf {
 
 fn append_history_line(entry: &FlowWire) {
     use std::io::Write as _;
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(history_log_path()) {
-        if let Ok(line) = serde_json::to_string(entry) {
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(history_log_path())
+        && let Ok(line) = serde_json::to_string(entry) {
             let _ = writeln!(f, "{line}");
         }
-    }
 }
 
 /// the last `limit` entries of history.jsonl, oldest first, optionally only
@@ -140,11 +139,10 @@ const HISTORY_THROTTLE: Duration = Duration::from_secs(30);
 fn should_log_matched(throttle: &Throttle, key: (String, u8, u16, bool)) -> bool {
     let mut t = throttle.lock().unwrap();
     let now = Instant::now();
-    if let Some(&last) = t.get(&key) {
-        if now.duration_since(last) < HISTORY_THROTTLE {
+    if let Some(&last) = t.get(&key)
+        && now.duration_since(last) < HISTORY_THROTTLE {
             return false;
         }
-    }
     t.insert(key, now);
     true
 }

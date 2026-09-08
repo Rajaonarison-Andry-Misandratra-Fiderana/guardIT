@@ -5,13 +5,14 @@ use crate::ruleset;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, List, ListItem, ListState, Padding, Paragraph, Row, Sparkline, Table, TableState};
 use ratatui::{Frame, Terminal};
+use std::cmp::Reverse;
 use std::collections::{HashSet, VecDeque};
-use std::io::{stdout, BufReader, ErrorKind, Read as _};
+use std::io::{stdout, BufReader, Read as _};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Instant;
@@ -35,6 +36,23 @@ struct Theme {
     /// per-pane identity color, in Focus tab order: Rules, Apps, Conflicts
     /// (listening ports), TopApps, Flow
     accents: [Color; 5],
+}
+
+impl Theme {
+    fn base(self) -> Style {
+        Style::new().bg(self.bg).fg(self.fg)
+    }
+
+    /// the one bordered box every pane uses: thick + focus color when
+    /// focused (color alone is too easy to miss), plain + idle color otherwise
+    fn pane(self, title: String, focused: bool) -> Block<'static> {
+        let (border, kind) = if focused {
+            (Style::new().fg(self.border_focus).add_modifier(Modifier::BOLD), BorderType::Thick)
+        } else {
+            (Style::new().fg(self.border_idle), BorderType::Plain)
+        };
+        Block::default().style(self.base()).borders(Borders::ALL).padding(Padding::horizontal(1)).border_style(border).border_type(kind).title(title).title_alignment(Alignment::Center)
+    }
 }
 
 const THEMES: &[Theme] = &[
@@ -256,24 +274,21 @@ enum Focus {
     Flow,
     Rules,
     Conflicts,
-    TopApps,
     /// the full audit trail — its own tab, rendered full-screen (not part of
     /// the bento grid, it needs the room) and jumpable to from anywhere via
     /// the global `L` key, same idea as `t` for theme
     AppLog,
 }
 
-// Tab order: system rules -> apps -> top apps -> flow (live) -> listening
-// ports, then back to rules.
-// TopApps and AppLog are deliberately never Tab stops: TopApps is
-// informational only (no keys act on it), and AppLog is reached only via
-// the global `L`/`l` keys (from anywhere / from Apps·Flow·Conflicts) — it's
-// a drill-down, not a pane you'd casually cycle through.
+// Tab order: system rules -> apps -> flow (live) -> listening ports, then
+// back to rules. Top apps is informational only (nothing to focus), and
+// AppLog is reached only via the global `L`/`l` keys — a drill-down, not a
+// pane you'd casually cycle through.
 impl Focus {
     fn next(self) -> Focus {
         match self {
             Focus::Rules => Focus::Apps,
-            Focus::Apps | Focus::TopApps => Focus::Flow,
+            Focus::Apps => Focus::Flow,
             Focus::Flow => Focus::Conflicts,
             Focus::Conflicts | Focus::AppLog => Focus::Rules,
         }
@@ -283,7 +298,7 @@ impl Focus {
         match self {
             Focus::Rules | Focus::AppLog => Focus::Conflicts,
             Focus::Apps => Focus::Rules,
-            Focus::TopApps | Focus::Flow => Focus::Apps,
+            Focus::Flow => Focus::Apps,
             Focus::Conflicts => Focus::Flow,
         }
     }
@@ -340,19 +355,15 @@ impl IpcClient {
         let mut chunk = [0u8; 4096];
         loop {
             match self.reader.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => break,
+                Ok(n) if n > 0 => self.buf.extend_from_slice(&chunk[..n]),
+                _ => break,
             }
         }
         let mut out = Vec::new();
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            if let Ok(text) = std::str::from_utf8(&line[..line.len() - 1]) {
-                if let Ok(msg) = serde_json::from_str::<ServerMsg>(text) {
-                    out.push(msg);
-                }
+            if let Ok(msg) = serde_json::from_slice::<ServerMsg>(&line[..line.len() - 1]) {
+                out.push(msg);
             }
         }
         out
@@ -362,12 +373,6 @@ impl IpcClient {
         let _ = ipc::send_msg(&mut self.writer, msg);
     }
 }
-
-/// the flow pane's rows are exactly the daemon's wire type — kept around
-/// after they're decided so the pane reads as a history, not just a to-do
-/// queue. Global across all apps; the Apps pane's selection decides which
-/// slice of it the Flow pane shows.
-type FlowEntry = FlowWire;
 
 /// one row of the Apps pane: either a persisted decision (`rule` set) or an
 /// app that's only been *seen* asking (no rule yet — shows up as "new")
@@ -383,13 +388,17 @@ struct AppRow {
 
 const FLOW_CAP: usize = 200;
 
+/// `flow` is global across all apps (kept after decision so the pane reads as
+/// a history); the Apps pane's selection decides which slice Flow shows.
+/// `msg` is for errors only — everything else the UI can say is already
+/// visible live somewhere, so it never repeats transient "did X" notes.
 struct App {
     cfg: Config,
     state: ListState,
     apps: Vec<AppRow>,
     apps_state: ListState,
     app_rules: Vec<AppRule>,
-    flow: Vec<FlowEntry>,
+    flow: Vec<FlowWire>,
     flow_state: ListState,
     focus: Focus,
     ipc: Option<IpcClient>,
@@ -451,8 +460,6 @@ fn list_interfaces() -> Vec<String> {
         .collect()
 }
 
-/// entries seen in the log that already have a matching rule (any proto/port
-/// combo covering them) — no point offering to promote those again
 fn basename(exe: &str) -> &str {
     Path::new(exe).file_name().and_then(|s| s.to_str()).unwrap_or(exe)
 }
@@ -489,12 +496,6 @@ pub fn run(cfg: Config) {
     let backend = ratatui::backend::CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend).expect("terminal");
 
-    let ipc = IpcClient::connect();
-    let msg = if ipc.is_none() {
-        "daemon not reachable — per-app control disabled (run `sudo guardit daemon`)".to_string()
-    } else {
-        String::new()
-    };
     let mut app = App {
         app_rules: cfg.app_rule.clone(),
         cfg,
@@ -504,9 +505,9 @@ pub fn run(cfg: Config) {
         flow: Vec::new(),
         flow_state: ListState::default(),
         focus: Focus::Rules,
-        ipc,
+        ipc: IpcClient::connect(),
         mode: Mode::Browse,
-        msg,
+        msg: String::new(),
         net_prev: read_net_bytes(),
         net_prev_at: Instant::now(),
         net_rate_kbps: (0.0, 0.0),
@@ -550,13 +551,11 @@ pub fn run(cfg: Config) {
                 app.net_prev = (rx, tx);
                 app.net_prev_at = now;
                 const NET_HIST_CAP: usize = 120;
-                app.net_hist_down.push_back(app.net_rate_kbps.0 as u64);
-                app.net_hist_up.push_back(app.net_rate_kbps.1 as u64);
-                if app.net_hist_down.len() > NET_HIST_CAP {
-                    app.net_hist_down.pop_front();
-                }
-                if app.net_hist_up.len() > NET_HIST_CAP {
-                    app.net_hist_up.pop_front();
+                for (hist, rate) in [(&mut app.net_hist_down, app.net_rate_kbps.0), (&mut app.net_hist_up, app.net_rate_kbps.1)] {
+                    hist.push_back(rate as u64);
+                    while hist.len() > NET_HIST_CAP {
+                        hist.pop_front();
+                    }
                 }
             }
             continue;
@@ -565,6 +564,7 @@ pub fn run(cfg: Config) {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            app.msg.clear();
             if (key.code == KeyCode::Tab || key.code == KeyCode::BackTab) && !matches!(app.mode, Mode::Add(_) | Mode::Preset(_)) {
                 app.focus = if key.code == KeyCode::BackTab { app.focus.prev() } else { app.focus.next() };
                 if app.apps_state.selected().is_none() && !app.apps.is_empty() {
@@ -605,10 +605,9 @@ pub fn run(cfg: Config) {
                         KeyCode::Char('j') | KeyCode::Down => *sel = (*sel + 1) % PRESETS.len(),
                         KeyCode::Char('k') | KeyCode::Up => *sel = (*sel + PRESETS.len() - 1) % PRESETS.len(),
                         KeyCode::Enter => {
-                            let (label, spec) = PRESETS[*sel];
+                            let (_, spec) = PRESETS[*sel];
                             let mut r = parse_spec(spec).expect("built-in preset spec must parse");
                             r.id = app.cfg.next_id();
-                            app.msg = format!("added preset: {label}");
                             app.cfg.rule.push(r);
                             save_rules(&mut app);
                             app.mode = Mode::Browse;
@@ -621,7 +620,6 @@ pub fn run(cfg: Config) {
                             match parse_spec(buf) {
                                 Ok(mut r) => {
                                     r.id = app.cfg.next_id();
-                                    app.msg = format!("added rule #{}", r.id);
                                     app.cfg.rule.push(r);
                                     save_rules(&mut app);
                                 }
@@ -638,8 +636,8 @@ pub fn run(cfg: Config) {
                 },
                 Focus::Apps => match key.code {
                     KeyCode::Char('q') => break,
-                    KeyCode::Char('j') | KeyCode::Down => apps_select_next(&mut app),
-                    KeyCode::Char('k') | KeyCode::Up => apps_select_prev(&mut app),
+                    KeyCode::Char('j') | KeyCode::Down => apps_select(&mut app, false),
+                    KeyCode::Char('k') | KeyCode::Up => apps_select(&mut app, true),
                     KeyCode::Char('y') => apps_set_verdict(&mut app, Action::Allow),
                     KeyCode::Char('n') => apps_set_verdict(&mut app, Action::Deny),
                     KeyCode::Char(' ') => apps_toggle_selected(&mut app),
@@ -659,8 +657,8 @@ pub fn run(cfg: Config) {
                 },
                 Focus::Flow => match key.code {
                     KeyCode::Char('q') => break,
-                    KeyCode::Char('j') | KeyCode::Down => flow_select_next(&mut app),
-                    KeyCode::Char('k') | KeyCode::Up => flow_select_prev(&mut app),
+                    KeyCode::Char('j') | KeyCode::Down => flow_select(&mut app, false),
+                    KeyCode::Char('k') | KeyCode::Up => flow_select(&mut app, true),
                     KeyCode::Char('y') => flow_decide(&mut app, Action::Allow, false),
                     KeyCode::Char('n') => flow_decide(&mut app, Action::Deny, false),
                     KeyCode::Char('Y') => flow_decide(&mut app, Action::Allow, true),
@@ -674,8 +672,8 @@ pub fn run(cfg: Config) {
                 },
                 Focus::Conflicts => match key.code {
                     KeyCode::Char('q') => break,
-                    KeyCode::Char('j') | KeyCode::Down => conflicts_select_next(&mut app),
-                    KeyCode::Char('k') | KeyCode::Up => conflicts_select_prev(&mut app),
+                    KeyCode::Char('j') | KeyCode::Down => conflicts_select(&mut app, false),
+                    KeyCode::Char('k') | KeyCode::Up => conflicts_select(&mut app, true),
                     KeyCode::Char('y') => conflicts_decide(&mut app, Action::Allow),
                     KeyCode::Char('n') => conflicts_decide(&mut app, Action::Deny),
                     KeyCode::Char('l') => {
@@ -683,12 +681,6 @@ pub fn run(cfg: Config) {
                             open_app_log(&mut app, Some(exe));
                         }
                     }
-                    _ => {}
-                },
-                // informational chart, nothing to select/decide — it's still a
-                // Tab stop so the bento grid's border-highlight cycle is complete
-                Focus::TopApps => match key.code {
-                    KeyCode::Char('q') => break,
                     _ => {}
                 },
                 // q/L never quit the whole app from here — they take you back
@@ -708,19 +700,8 @@ pub fn run(cfg: Config) {
                 Focus::AppLog => match key.code {
                     KeyCode::Char('q') => close_app_log(&mut app),
                     KeyCode::Char('f') => app.app_log_confirm_flush = true,
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if !app.app_log.is_empty() {
-                            let i = app.app_log_state.selected().map(|i| (i + 1) % app.app_log.len()).unwrap_or(0);
-                            app.app_log_state.select(Some(i));
-                        }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        if !app.app_log.is_empty() {
-                            let len = app.app_log.len();
-                            let i = app.app_log_state.selected().map(|i| (i + len - 1) % len).unwrap_or(0);
-                            app.app_log_state.select(Some(i));
-                        }
-                    }
+                    KeyCode::Char('j') | KeyCode::Down => app.app_log_state.select(step(app.app_log_state.selected(), app.app_log.len(), false)),
+                    KeyCode::Char('k') | KeyCode::Up => app.app_log_state.select(step(app.app_log_state.selected(), app.app_log.len(), true)),
                     _ => {}
                 },
             }
@@ -774,19 +755,13 @@ fn rebuild_apps(app: &mut App) {
 
     let mut seen = HashSet::new();
     let mut rows: Vec<AppRow> = Vec::new();
-    // whole-app defaults first — each app's row always shows its default,
-    // never an arbitrary one of its rules
-    for r in app.app_rules.iter().filter(|r| r.port.is_none()) {
+    // whole-app defaults first so each app's row shows its default, never an
+    // arbitrary per-port override; then apps that only have overrides
+    let rules = &app.app_rules;
+    for r in rules.iter().filter(|r| r.port.is_none()).chain(rules.iter()) {
         if seen.insert(r.exe.clone()) {
-            let port_overrides = app.app_rules.iter().filter(|o| o.exe == r.exe && o.port.is_some()).count();
-            rows.push(AppRow { exe: r.exe.clone(), rule: Some(r.clone()), port_overrides });
-        }
-    }
-    // apps with only per-port overrides and no whole-app default yet
-    for r in &app.app_rules {
-        if seen.insert(r.exe.clone()) {
-            let port_overrides = app.app_rules.iter().filter(|o| o.exe == r.exe && o.port.is_some()).count();
-            rows.push(AppRow { exe: r.exe.clone(), rule: None, port_overrides });
+            let port_overrides = rules.iter().filter(|o| o.exe == r.exe && o.port.is_some()).count();
+            rows.push(AppRow { exe: r.exe.clone(), rule: r.port.is_none().then(|| r.clone()), port_overrides });
         }
     }
     for e in &app.flow {
@@ -821,11 +796,10 @@ fn reset_flow_selection(app: &mut App) {
     app.flow_state.select(if idxs.is_empty() { None } else { Some(0) });
 }
 
-/// writes just the IP/port rules under the shared config lock (see
-/// Config::update) — safe against a concurrent daemon write to app_rule
-/// writes the IP/port rules under the shared config lock, then applies
-/// immediately — there's no separate "apply" step anymore, every change
-/// takes effect the moment you make it
+/// writes the IP/port rules under the shared config lock (see Config::update,
+/// safe against a concurrent daemon write to app_rule), then applies
+/// immediately — there's no separate "apply" step, every change takes
+/// effect the moment you make it
 fn save_rules(app: &mut App) {
     let rule = app.cfg.rule.clone();
     app.cfg = Config::update(|fresh| fresh.rule = rule);
@@ -838,35 +812,33 @@ fn save_rules(app: &mut App) {
     }
 }
 
-fn select_next(app: &mut App) {
-    if app.cfg.rule.is_empty() {
-        return;
+/// wrap-around cursor move shared by every list/table in the UI
+fn step(sel: Option<usize>, len: usize, back: bool) -> Option<usize> {
+    if len == 0 {
+        return None;
     }
-    let i = app.state.selected().map(|i| (i + 1) % app.cfg.rule.len()).unwrap_or(0);
-    app.state.select(Some(i));
+    let delta = if back { len - 1 } else { 1 };
+    Some(sel.map(|i| (i + delta) % len).unwrap_or(0))
+}
+
+fn select_next(app: &mut App) {
+    app.state.select(step(app.state.selected(), app.cfg.rule.len(), false));
 }
 
 fn select_prev(app: &mut App) {
-    if app.cfg.rule.is_empty() {
-        return;
-    }
-    let len = app.cfg.rule.len();
-    let i = app.state.selected().map(|i| (i + len - 1) % len).unwrap_or(0);
-    app.state.select(Some(i));
+    app.state.select(step(app.state.selected(), app.cfg.rule.len(), true));
 }
 
 fn toggle_selected(app: &mut App) {
-    if let Some(i) = app.state.selected() {
-        if let Some(r) = app.cfg.rule.get_mut(i) {
-            r.enabled = !r.enabled;
-            save_rules(app);
-        }
+    if let Some(r) = app.state.selected().and_then(|i| app.cfg.rule.get_mut(i)) {
+        r.enabled = !r.enabled;
+        save_rules(app);
     }
 }
 
 fn delete_selected(app: &mut App) {
-    if let Some(i) = app.state.selected() {
-        if i < app.cfg.rule.len() {
+    if let Some(i) = app.state.selected()
+        && i < app.cfg.rule.len() {
             app.cfg.rule.remove(i);
             save_rules(app);
             if app.cfg.rule.is_empty() {
@@ -875,7 +847,6 @@ fn delete_selected(app: &mut App) {
                 app.state.select(Some(app.cfg.rule.len() - 1));
             }
         }
-    }
 }
 
 const APP_LOG_LIMIT: usize = 300;
@@ -897,55 +868,25 @@ fn close_app_log(app: &mut App) {
     app.app_log_confirm_flush = false;
 }
 
-fn apps_select_next(app: &mut App) {
-    if app.apps.is_empty() {
-        return;
-    }
-    let i = app.apps_state.selected().map(|i| (i + 1) % app.apps.len()).unwrap_or(0);
-    app.apps_state.select(Some(i));
+fn apps_select(app: &mut App, back: bool) {
+    app.apps_state.select(step(app.apps_state.selected(), app.apps.len(), back));
     reset_flow_selection(app);
 }
 
-fn apps_select_prev(app: &mut App) {
-    if app.apps.is_empty() {
-        return;
-    }
-    let len = app.apps.len();
-    let i = app.apps_state.selected().map(|i| (i + len - 1) % len).unwrap_or(0);
-    app.apps_state.select(Some(i));
-    reset_flow_selection(app);
-}
-
-/// an app-wide allow/deny decision (Apps y/n, Conflicts y/n — never Flow,
-/// see cascade_port_verdict_to_flow for that) applies everywhere that app
-/// shows up in Flow, not just going forward: any request from this app
-/// that's genuinely PENDING right now (the daemon is holding that packet
-/// open) gets resolved immediately instead of sitting until its own
-/// timeout, and every row already shown for this app flips to match —
-/// otherwise you'd allow an app and still see its earlier requests sitting
-/// there red.
-fn cascade_verdict_to_flow(app: &mut App, exe: &str, action: Action) {
-    cascade_flow_rows(app, action, |e| e.exe == exe);
-}
-
-/// same idea as cascade_verdict_to_flow but scoped to one (app, port) pair
-/// — this is what the Flow pane's decisions use. Deliberately narrower:
-/// deciding one port for an app must never touch that app's other ports,
-/// that's the whole point of having per-port control alongside the Apps
-/// pane's whole-app control.
-fn cascade_port_verdict_to_flow(app: &mut App, exe: &str, port: Option<u16>, action: Action) {
-    cascade_flow_rows(app, action, |e| e.exe == exe && e.port == port);
-}
-
-fn cascade_flow_rows(app: &mut App, action: Action, matches_row: impl Fn(&FlowEntry) -> bool) {
+/// a persisted allow/deny applies to every Flow row it covers, not just
+/// going forward: rows already shown flip to match, and any genuinely
+/// PENDING request (the daemon is holding that packet open) gets resolved
+/// now instead of sitting until its own timeout. The caller's `matches_row`
+/// decides the scope — whole app (Apps pane) or one (app, port) pair (Flow
+/// and Listening panes), never one silently widening into the other.
+fn cascade_flow_rows(app: &mut App, action: Action, matches_row: impl Fn(&FlowWire) -> bool) {
     let new_status = FlowStatus::from(action);
     let mut pending_req_ids = Vec::new();
     for e in app.flow.iter_mut().filter(|e| matches_row(e)) {
-        if matches!(e.status, FlowStatus::Pending) {
-            if let Some(req_id) = e.req_id {
+        if matches!(e.status, FlowStatus::Pending)
+            && let Some(req_id) = e.req_id {
                 pending_req_ids.push(req_id);
             }
-        }
         e.status = new_status;
     }
     if let Some(ipc) = &mut app.ipc {
@@ -964,7 +905,7 @@ fn cascade_flow_rows(app: &mut App, action: Action, matches_row: impl Fn(&FlowEn
 /// only falls back to the stored status if nothing matches at all — this
 /// is what makes the Flow pane self-correct after a reconnect instead of
 /// showing decisions you already made as reverted.
-fn effective_status(e: &FlowEntry, app_rules: &[AppRule]) -> FlowStatus {
+fn effective_status(e: &FlowWire, app_rules: &[AppRule]) -> FlowStatus {
     if matches!(e.status, FlowStatus::Pending) {
         return FlowStatus::Pending;
     }
@@ -976,14 +917,9 @@ fn effective_status(e: &FlowEntry, app_rules: &[AppRule]) -> FlowStatus {
 /// through the flow pane to make a call
 fn apps_set_verdict(app: &mut App, action: Action) {
     let Some(exe) = app.apps_state.selected().and_then(|i| app.apps.get(i)).map(|r| r.exe.clone()) else { return };
-    if app.ipc.is_none() {
-        app.msg = "daemon not reachable".into();
-        return;
-    }
-    if let Some(ipc) = &mut app.ipc {
-        ipc.send(&ClientMsg::SetAppRule { exe: exe.clone(), port: None, action });
-    }
-    cascade_verdict_to_flow(app, &exe, action);
+    let Some(ipc) = &mut app.ipc else { return };
+    ipc.send(&ClientMsg::SetAppRule { exe: exe.clone(), port: None, action });
+    cascade_flow_rows(app, action, |e| e.exe == exe);
 }
 
 fn apps_toggle_selected(app: &mut App) {
@@ -991,10 +927,7 @@ fn apps_toggle_selected(app: &mut App) {
         app.msg = "no rule yet — decide its request in the flow pane first".into();
         return;
     };
-    let Some(ipc) = &mut app.ipc else {
-        app.msg = "daemon not reachable".into();
-        return;
-    };
+    let Some(ipc) = &mut app.ipc else { return };
     ipc.send(&ClientMsg::ToggleAppRule { id });
 }
 
@@ -1005,38 +938,19 @@ fn apps_toggle_selected(app: &mut App) {
 fn apps_delete_selected(app: &mut App) {
     let Some(row) = app.apps_state.selected().and_then(|i| app.apps.get(i)) else { return };
     let exe = row.exe.clone();
-
-    if let Some(ipc) = &mut app.ipc {
-        // removes every rule for this app — whole-app default and all
-        // per-port overrides — not just the one shown on this row
-        ipc.send(&ClientMsg::RmAppRule { exe: exe.clone() });
-    } else {
-        app.msg = "daemon not reachable".into();
-        return;
-    }
+    let Some(ipc) = &mut app.ipc else { return };
+    // removes every rule for this app — whole-app default and all per-port
+    // overrides — not just the one shown on this row
+    ipc.send(&ClientMsg::RmAppRule { exe: exe.clone() });
 
     app.flow.retain(|e| e.exe != exe);
     rebuild_apps(app);
     reset_flow_selection(app);
 }
 
-fn flow_select_next(app: &mut App) {
-    let idxs = current_flow_indices(app);
-    if idxs.is_empty() {
-        return;
-    }
-    let i = app.flow_state.selected().map(|i| (i + 1) % idxs.len()).unwrap_or(0);
-    app.flow_state.select(Some(i));
-}
-
-fn flow_select_prev(app: &mut App) {
-    let idxs = current_flow_indices(app);
-    if idxs.is_empty() {
-        return;
-    }
-    let len = idxs.len();
-    let i = app.flow_state.selected().map(|i| (i + len - 1) % len).unwrap_or(0);
-    app.flow_state.select(Some(i));
+fn flow_select(app: &mut App, back: bool) {
+    let len = current_flow_indices(app).len();
+    app.flow_state.select(step(app.flow_state.selected(), len, back));
 }
 
 /// on a still-pending request this verdicts the actual held packet (and
@@ -1047,24 +961,18 @@ fn flow_decide(app: &mut App, verdict: Action, remember: bool) {
     let idxs = current_flow_indices(app);
     let Some(sel) = app.flow_state.selected() else { return };
     let Some(&real_idx) = idxs.get(sel) else { return };
-
-    if app.ipc.is_none() {
-        app.msg = "daemon not reachable".into();
-        return;
-    }
     let Some(entry) = app.flow.get(real_idx) else { return };
     let exe = entry.exe.clone();
     let port = entry.port;
     let was_pending = matches!(entry.status, FlowStatus::Pending);
     let req_id = entry.req_id;
+    let Some(ipc) = &mut app.ipc else { return };
 
-    if let Some(ipc) = &mut app.ipc {
-        if was_pending {
-            let Some(req_id) = req_id else { return };
-            ipc.send(&ClientMsg::Decide { req_id, verdict, remember });
-        } else {
-            ipc.send(&ClientMsg::SetAppRule { exe: exe.clone(), port, action: verdict });
-        }
+    if was_pending {
+        let Some(req_id) = req_id else { return };
+        ipc.send(&ClientMsg::Decide { req_id, verdict, remember });
+    } else {
+        ipc.send(&ClientMsg::SetAppRule { exe: exe.clone(), port, action: verdict });
     }
 
     // a persistent rule got created/updated (always true once resolved, or
@@ -1073,7 +981,7 @@ fn flow_decide(app: &mut App, verdict: Action, remember: bool) {
     // never the whole app — that's Apps/Conflicts' job). A plain one-off
     // y/n on a live request only touches that single row, no rule at all.
     if !was_pending || remember {
-        cascade_port_verdict_to_flow(app, &exe, port, verdict);
+        cascade_flow_rows(app, verdict, |e| e.exe == exe && e.port == port);
     } else if let Some(entry) = app.flow.get_mut(real_idx) {
         entry.status = verdict.into();
     }
@@ -1085,64 +993,20 @@ fn sort_listening(entries: &mut [ipc::ListenEntry]) {
     entries.sort_by(|a, b| (a.proto.as_str(), a.port, a.addr.as_str()).cmp(&(b.proto.as_str(), b.port, b.addr.as_str())));
 }
 
-fn conflicts_select_next(app: &mut App) {
-    let n = app.listening.len();
-    if n == 0 {
-        return;
-    }
-    let i = app.conflicts_state.selected().map(|i| (i + 1) % n).unwrap_or(0);
-    app.conflicts_state.select(Some(i));
+fn conflicts_select(app: &mut App, back: bool) {
+    app.conflicts_state.select(step(app.conflicts_state.selected(), app.listening.len(), back));
 }
 
-fn conflicts_select_prev(app: &mut App) {
-    let n = app.listening.len();
-    if n == 0 {
-        return;
-    }
-    let i = app.conflicts_state.selected().map(|i| (i + n - 1) % n).unwrap_or(0);
-    app.conflicts_state.select(Some(i));
-}
-
-/// deciding the selected listener's app allow/deny, same as apps_set_verdict
-/// — e.g. "this port shouldn't be reachable from outside" without switching panes
 /// per-port, same as the Flow pane — a listening-port entry is one specific
 /// port, so deciding it must not touch the app's whole-app default or its
 /// other ports (that's Apps pane's job)
 fn conflicts_decide(app: &mut App, action: Action) {
-    let Some(entry) = app.conflicts_state.selected().and_then(|i| app.listening.get(i)) else {
-        return;
-    };
+    let Some(entry) = app.conflicts_state.selected().and_then(|i| app.listening.get(i)) else { return };
     let exe = entry.exe.clone();
     let port = Some(entry.port);
-    if app.ipc.is_none() {
-        app.msg = "daemon not reachable".into();
-        return;
-    }
-    if let Some(ipc) = &mut app.ipc {
-        ipc.send(&ClientMsg::SetAppRule { exe: exe.clone(), port, action });
-    }
-    cascade_port_verdict_to_flow(app, &exe, port, action);
-}
-
-fn border_style(focused: bool, theme: Theme) -> Style {
-    if focused {
-        Style::new().fg(theme.border_focus).add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().fg(theme.border_idle)
-    }
-}
-
-/// thick border on the focused pane — color alone is too easy to miss at a
-/// glance, this makes it unambiguous which pane j/k/y/n currently act on
-// Plain (sharp, no rounded corners) when idle; Thick — the boldest single-
-// width line ratatui has — on the focused pane, so it visibly stands out
-// against every other box instead of blending in
-fn border_type(focused: bool) -> BorderType {
-    if focused {
-        BorderType::Thick
-    } else {
-        BorderType::Plain
-    }
+    let Some(ipc) = &mut app.ipc else { return };
+    ipc.send(&ClientMsg::SetAppRule { exe: exe.clone(), port, action });
+    cascade_flow_rows(app, action, |e| e.exe == exe && e.port == port);
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
@@ -1150,7 +1014,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let theme = THEMES[app.theme_idx];
     // paint the whole frame first so the gaps between panes pick up the
     // theme's background too, not just the widgets themselves
-    f.render_widget(Paragraph::new("").style(Style::new().bg(theme.bg).fg(theme.fg)), area);
+    f.render_widget(Paragraph::new("").style(theme.base()), area);
 
     let outer = Layout::vertical([Constraint::Length(5), Constraint::Min(3), Constraint::Length(1)]).split(area);
 
@@ -1167,7 +1031,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         let main = Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(42), Constraint::Percentage(30)]).split(outer[1]);
         let left = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).split(main[0]);
         let mid = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).split(main[1]);
-        draw_rules_or_log(f, app, left[0]);
+        draw_rules(f, app, left[0]);
         draw_apps(f, app, left[1]);
         draw_top_apps(f, app, mid[0]);
         draw_flow(f, app, mid[1]);
@@ -1177,25 +1041,23 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_footer(f, app, outer[2]);
 }
 
-/// static, starship-style status line: a colored "where you are" segment
-/// plus the keys that apply right now. Deliberately never shows transient
-/// state ("added rule #3", "allowed") — everything the UI can tell you is
-/// already visible live elsewhere, this bar doesn't repeat it.
 /// per-pane identity color, in the same order as Theme.accents
 fn focus_accent(focus: Focus, theme: Theme) -> Color {
     match focus {
         Focus::Rules => theme.accents[0],
         Focus::Apps => theme.accents[1],
         Focus::Conflicts => theme.accents[2],
-        Focus::TopApps => theme.accents[3],
         Focus::Flow => theme.accents[4],
         Focus::AppLog => theme.chart,
     }
 }
 
+/// static, starship-style status line: a colored "where you are" segment
+/// plus the keys that apply right now. Never repeats transient "did X"
+/// state — only an error (`app.msg`) gets appended, until the next key.
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let theme = THEMES[app.theme_idx];
-    let base = Style::new().bg(theme.bg).fg(theme.fg);
+    let base = theme.base();
 
     if let Mode::Add(buf) = &app.mode {
         let spans = vec![
@@ -1211,7 +1073,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Focus::Rules => "RULES",
         Focus::Apps => "APPS",
         Focus::Conflicts => "LISTEN",
-        Focus::TopApps => "TOP",
         Focus::Flow => "FLOW",
         Focus::AppLog => "LOG",
     };
@@ -1220,7 +1081,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         (Focus::Apps, _) => vec![("Tab", "pane"), ("j/k", "select"), ("Enter", "flow"), ("l", "log"), ("y/n", "allow/deny app"), ("space", "toggle"), ("d", "remove")],
         (Focus::Flow, _) => vec![("Tab", "pane"), ("j/k", "select"), ("l", "log"), ("y/n", "allow/deny port"), ("Y/N", "+remember")],
         (Focus::Conflicts, _) => vec![("Tab", "pane"), ("j/k", "select"), ("l", "log"), ("y/n", "allow/deny port")],
-        (Focus::TopApps, _) => vec![("Tab", "pane")],
         (Focus::AppLog, _) if app.app_log_confirm_flush => vec![("y", "confirm flush"), ("n", "cancel")],
         (Focus::AppLog, _) => vec![("j/k", "move"), ("f", "flush")],
         (Focus::Rules, Mode::Preset(_)) => vec![("j/k", "move"), ("Enter", "add"), ("Esc", "cancel")],
@@ -1242,24 +1102,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(" ", base));
         spans.push(Span::styled(desc, base));
     }
+    if !app.msg.is_empty() {
+        spans.push(Span::styled(format!("   {}", app.msg), base.fg(theme.deny).add_modifier(Modifier::BOLD)));
+    }
     f.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let daemon = if app.ipc.is_some() { "connected" } else { "not reachable" };
-    let focus = match app.focus {
-        Focus::Apps => "apps",
-        Focus::Flow => "flow",
-        Focus::Rules => "system rules",
-        Focus::Conflicts => "listening ports",
-        Focus::TopApps => "top apps",
-        Focus::AppLog => "app log",
-    };
+    let daemon = if app.ipc.is_some() { "connected" } else { "not reachable — per-app control off (sudo guardit daemon)" };
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(4)]).split(area);
     let ifaces = if app.interfaces.is_empty() { "none detected".to_string() } else { app.interfaces.join(", ") };
     let theme = THEMES[app.theme_idx];
-    let status = format!("guardit  |  if: {ifaces}  |  daemon: {daemon}  |  theme: {} (t)  |  focus: {focus}", theme.name);
-    f.render_widget(Paragraph::new(status).style(Style::new().bg(theme.bg).fg(theme.fg).add_modifier(Modifier::BOLD)), rows[0]);
+    let status = format!("guardit  |  if: {ifaces}  |  daemon: {daemon}  |  theme: {} (t)", theme.name);
+    f.render_widget(Paragraph::new(status).style(theme.base().add_modifier(Modifier::BOLD)), rows[0]);
 
     let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
     let (down, up) = app.net_rate_kbps;
@@ -1269,16 +1124,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_throughput_spark(f: &mut Frame, area: Rect, label: &str, current: f64, history: &VecDeque<u64>, theme: Theme) {
     let data: Vec<u64> = history.iter().copied().collect();
-    let sparkline = Sparkline::default().style(Style::new().fg(theme.chart).bg(theme.bg)).data(&data).block(
-        Block::default()
-            .style(Style::new().bg(theme.bg).fg(theme.fg))
-            .borders(Borders::ALL)
-            .padding(Padding::horizontal(1))
-            .border_style(Style::new().fg(theme.border_idle))
-            .border_type(BorderType::Rounded)
-            .title(format!("{label}  {current:.1} KB/s"))
-            .title_alignment(ratatui::layout::Alignment::Center),
-    );
+    let sparkline = Sparkline::default()
+        .style(Style::new().fg(theme.chart).bg(theme.bg))
+        .data(&data)
+        .block(theme.pane(format!("{label}  {current:.1} KB/s"), false).border_type(BorderType::Rounded));
     f.render_widget(sparkline, area);
 }
 
@@ -1322,21 +1171,15 @@ fn draw_app_log(f: &mut Frame, app: &mut App, area: Rect) {
         ],
     )
     .header(Row::new(vec!["AGO", "DIR", "EXE", "PROTO", "PORT", "PEER", "STATUS"]).style(Style::new().fg(theme.fg).add_modifier(Modifier::BOLD)))
-    .style(Style::new().bg(theme.bg).fg(theme.fg))
+    .style(theme.base())
     .row_highlight_style(Style::new().bg(theme.border_idle))
-    .block(
-        Block::default()
-            .style(Style::new().bg(theme.bg).fg(theme.fg))
-            .borders(Borders::ALL)
-            .padding(Padding::horizontal(1))
-            .border_style(border_style(true, theme))
-            .border_type(border_type(true))
-            .title(match &app.app_log_filter {
-                Some(exe) => format!("app log — {} ({} entries)", basename(exe), app.app_log.len()),
-                None => format!("app log — full audit trail ({} entries)", app.app_log.len()),
-            })
-            .title_alignment(ratatui::layout::Alignment::Center),
-    );
+    .block(theme.pane(
+        match &app.app_log_filter {
+            Some(exe) => format!("app log — {} ({} entries)", basename(exe), app.app_log.len()),
+            None => format!("app log — full audit trail ({} entries)", app.app_log.len()),
+        },
+        true,
+    ));
     f.render_stateful_widget(table, area, &mut app.app_log_state);
 
     if app.app_log_confirm_flush {
@@ -1347,24 +1190,19 @@ fn draw_app_log(f: &mut Frame, app: &mut App, area: Rect) {
 /// small centered dialog over the app log — y/n, nothing else responds while it's up
 fn draw_confirm_flush(f: &mut Frame, app: &App, area: Rect) {
     let theme = THEMES[app.theme_idx];
-    let w = 44.min(area.width.saturating_sub(4));
-    let h = 3;
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
+    let [popup] = Layout::horizontal([Constraint::Length(44)]).flex(Flex::Center).areas(area);
+    let [popup] = Layout::vertical([Constraint::Length(3)]).flex(Flex::Center).areas(popup);
     let text = Paragraph::new("flush the whole log? this can't be undone  y/n")
-        .alignment(ratatui::layout::Alignment::Center)
+        .alignment(Alignment::Center)
         .style(Style::new().bg(theme.deny).fg(Color::Black).add_modifier(Modifier::BOLD))
         .block(Block::default().borders(Borders::ALL).style(Style::new().bg(theme.deny).fg(Color::Black)).border_type(BorderType::Thick));
     f.render_widget(ratatui::widgets::Clear, popup);
     f.render_widget(text, popup);
 }
 
-fn draw_rules_or_log(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_rules(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = THEMES[app.theme_idx];
+    let focused = app.focus == Focus::Rules;
     match &mut app.mode {
         Mode::Preset(sel) => {
             let items: Vec<ListItem> = PRESETS
@@ -1376,14 +1214,7 @@ fn draw_rules_or_log(f: &mut Frame, app: &mut App, area: Rect) {
                     ListItem::new(text).style(style)
                 })
                 .collect();
-            let list = List::new(items).style(Style::new().bg(theme.bg).fg(theme.fg)).block(
-                Block::default()
-                    .style(Style::new().bg(theme.bg).fg(theme.fg))
-                    .borders(Borders::ALL).padding(Padding::horizontal(1))
-                    .border_style(border_style(app.focus == Focus::Rules, THEMES[app.theme_idx])).border_type(border_type(app.focus == Focus::Rules))
-                    .title("pick a preset")
-                    .title_alignment(ratatui::layout::Alignment::Center),
-            );
+            let list = List::new(items).style(theme.base()).block(theme.pane("pick a preset".into(), focused));
             f.render_widget(list, area);
         }
         _ => {
@@ -1411,17 +1242,7 @@ fn draw_rules_or_log(f: &mut Frame, app: &mut App, area: Rect) {
                     ListItem::new(text).style(Style::new().fg(color))
                 })
                 .collect();
-            let list = List::new(items)
-                .style(Style::new().bg(theme.bg).fg(theme.fg))
-                .highlight_style(Style::new().bg(theme.border_idle))
-                .block(
-                    Block::default()
-                        .style(Style::new().bg(theme.bg).fg(theme.fg))
-                        .borders(Borders::ALL).padding(Padding::horizontal(1))
-                        .border_style(border_style(app.focus == Focus::Rules, THEMES[app.theme_idx])).border_type(border_type(app.focus == Focus::Rules))
-                        .title("system rules")
-                        .title_alignment(ratatui::layout::Alignment::Center),
-                );
+            let list = List::new(items).style(theme.base()).highlight_style(Style::new().bg(theme.border_idle)).block(theme.pane("system rules".into(), focused));
             f.render_stateful_widget(list, area, &mut app.state);
         }
     }
@@ -1476,14 +1297,7 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new(format!("{dot} {name_col} {status}")).style(style)
         })
         .collect();
-    let list = List::new(items).style(Style::new().bg(theme.bg).fg(theme.fg)).highlight_style(Style::new().bg(theme.border_idle)).block(
-        Block::default()
-            .style(Style::new().bg(theme.bg).fg(theme.fg))
-            .borders(Borders::ALL).padding(Padding::horizontal(1))
-            .border_style(border_style(app.focus == Focus::Apps, THEMES[app.theme_idx])).border_type(border_type(app.focus == Focus::Apps))
-            .title("application blocking")
-            .title_alignment(ratatui::layout::Alignment::Center),
-    );
+    let list = List::new(items).style(theme.base()).highlight_style(Style::new().bg(theme.border_idle)).block(theme.pane("application blocking".into(), app.focus == Focus::Apps));
     f.render_stateful_widget(list, area, &mut app.apps_state);
 }
 
@@ -1495,11 +1309,8 @@ fn draw_top_apps(f: &mut Frame, app: &App, area: Rect) {
     for e in &app.flow {
         *counts.entry(e.exe.as_str()).or_default() += 1;
     }
-    let top: Vec<(&str, u64)> = {
-        let mut v: Vec<(&str, u64)> = counts.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
-        v
-    };
+    let mut top: Vec<(&str, u64)> = counts.into_iter().collect();
+    top.sort_by_key(|&(_, c)| Reverse(c));
     // every app, always — bar width adapts to how many there are instead of
     // truncating the list, so it never silently hides an app
     let n = top.len().max(1) as u16;
@@ -1526,15 +1337,7 @@ fn draw_top_apps(f: &mut Frame, app: &App, area: Rect) {
         .bar_gap(bar_gap)
         .label_style(Style::new().fg(theme.fg))
         .style(Style::new().bg(theme.bg))
-        .block(
-            Block::default()
-                .style(Style::new().bg(theme.bg).fg(theme.fg))
-                .borders(Borders::ALL).padding(Padding::horizontal(1))
-                .border_style(border_style(app.focus == Focus::TopApps, THEMES[app.theme_idx]))
-                .border_type(border_type(app.focus == Focus::TopApps))
-                .title("top apps — connection attempts")
-                .title_alignment(ratatui::layout::Alignment::Center),
-        );
+        .block(theme.pane("top apps — connection attempts".into(), false));
     f.render_widget(chart, area);
 }
 
@@ -1569,14 +1372,7 @@ fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new(text).style(style)
         })
         .collect();
-    let list = List::new(items).style(Style::new().bg(theme.bg).fg(theme.fg)).highlight_style(Style::new().bg(theme.border_idle)).block(
-        Block::default()
-            .style(Style::new().bg(theme.bg).fg(theme.fg))
-            .borders(Borders::ALL).padding(Padding::horizontal(1))
-            .border_style(border_style(app.focus == Focus::Flow, THEMES[app.theme_idx])).border_type(border_type(app.focus == Focus::Flow))
-            .title(title)
-            .title_alignment(ratatui::layout::Alignment::Center),
-    );
+    let list = List::new(items).style(theme.base()).highlight_style(Style::new().bg(theme.border_idle)).block(theme.pane(title, app.focus == Focus::Flow));
     f.render_stateful_widget(list, area, &mut app.flow_state);
 }
 
@@ -1614,15 +1410,6 @@ fn draw_conflicts(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!("listening ports — {} REAL CONFLICT(S)", conflicts.len())
     };
-    let list = List::new(items).style(Style::new().bg(theme.bg).fg(theme.fg)).highlight_style(Style::new().bg(theme.border_idle)).block(
-        Block::default()
-            .style(Style::new().bg(theme.bg).fg(theme.fg))
-            .borders(Borders::ALL)
-            .padding(Padding::horizontal(1))
-            .border_style(border_style(app.focus == Focus::Conflicts, THEMES[app.theme_idx]))
-            .border_type(border_type(app.focus == Focus::Conflicts))
-            .title(title)
-            .title_alignment(ratatui::layout::Alignment::Center),
-    );
+    let list = List::new(items).style(theme.base()).highlight_style(Style::new().bg(theme.border_idle)).block(theme.pane(title, app.focus == Focus::Conflicts));
     f.render_stateful_widget(list, area, &mut app.conflicts_state);
 }
