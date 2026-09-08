@@ -4,7 +4,9 @@
 
 ## What is GuardIT?
 
-<img width="1920" height="1080" alt="guardit TUI dashboard" src="https://github.com/user-attachments/assets/bd5914ff-b687-46a7-bf1d-d8d45340b53f" />
+https://github.com/user-attachments/assets/8776d1cc-61e7-4fc2-a7b5-0da06f5d8df8
+
+
 
 GuardIT is a TUI firewall for Linux that drives `nftables` directly.
 
