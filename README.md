@@ -164,6 +164,7 @@ sudo guardit blocklist update                # download now (the daemon also doe
 guardit blocklist categories                 # the twelve, * = blocked
 guardit blocklist status                     # what's on, domains loaded, how stale
 guardit blocklist check ads.example.com      # blocked? by which list, via which entry
+guardit blocklist log [--n 100] [--filter x] # what has actually been blocked, and for whom
 sudo guardit blocklist allow cdn.example.com # never block this name, nor anything under it
 sudo guardit blocklist off
 ```

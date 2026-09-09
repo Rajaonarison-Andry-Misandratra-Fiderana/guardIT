@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Blocked lookups are written to `/etc/guardit/blocked.jsonl`** and read back by
+  `guardit blocklist log`, so a page that broke this morning is still answerable this
+  afternoon. Capped at 8 MB (the older half is dropped) because this is written per DNS
+  answer rather than per connection; the dashboard's recent list is seeded from it on
+  daemon start.
 - **Blocked lookups are attributed to the app that asked.** The reply is held on its way
   to the socket that wanted it, so its destination port names the process — no second
   queue, no bookkeeping. The dashboard's recent list now says who, and the busiest blocked

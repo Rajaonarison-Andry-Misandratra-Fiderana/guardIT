@@ -663,20 +663,104 @@ pub fn blocklist_stats(cfg: &crate::config::BlocklistConfig) -> ipc::BlocklistSt
     }
 }
 
+/// Beside history.jsonl, and for the same reason: a page that broke this
+/// morning is a question you ask this afternoon, by which time the in-memory
+/// list has long since rolled over and a daemon restart has cleared it
+/// anyway.
+pub fn blocked_log_path() -> std::path::PathBuf {
+    config_path().with_file_name("blocked.jsonl")
+}
+
+/// Unlike history.jsonl this one is capped, because it is written per DNS
+/// answer rather than per connection — orders of magnitude more traffic, and
+/// on a machine whose resolver does not honour our negative TTL it would run
+/// away. Over the cap, the older half is dropped.
+const BLOCKED_LOG_CAP: u64 = 8 * 1024 * 1024;
+/// how many appends between size checks — a stat() per blocked lookup would
+/// be a syscall on the hot path for a file that takes hours to fill
+const BLOCKED_LOG_CHECK_EVERY: u64 = 500;
+
+fn append_blocked_line(entry: &ipc::Blocked) {
+    use std::io::Write as _;
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(blocked_log_path())
+        && let Ok(line) = serde_json::to_string(entry)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+    if BLOCKED_TOTAL
+        .load(Ordering::Relaxed)
+        .is_multiple_of(BLOCKED_LOG_CHECK_EVERY)
+    {
+        trim_blocked_log();
+    }
+}
+
+/// keeps the newer half when the log outgrows its cap. Read-and-rewrite
+/// rather than rotate: one file is one thing to reason about, and half of
+/// 8 MB is still tens of thousands of lines of history.
+fn trim_blocked_log() {
+    let path = blocked_log_path();
+    if fs::metadata(&path).is_ok_and(|m| m.len() <= BLOCKED_LOG_CAP) {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(&path) else {
+        return;
+    };
+    let _ = fs::write(&path, newer_half(&text));
+}
+
+/// the newer half of a jsonl file, still one whole line per entry and still
+/// newline-terminated — a half-written last line would be dropped silently
+/// by every reader here, but writing one would be our own doing
+fn newer_half(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let keep = &lines[lines.len() / 2..];
+    if keep.is_empty() {
+        return String::new();
+    }
+    let mut out = keep.join("\n");
+    out.push('\n');
+    out
+}
+
+/// the last `limit` blocked names, oldest first, optionally narrowed to
+/// those whose name or app contains `filter`
+pub fn read_blocked(limit: usize, filter: Option<&str>) -> Vec<ipc::Blocked> {
+    let Ok(text) = fs::read_to_string(blocked_log_path()) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<ipc::Blocked> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter(|e: &ipc::Blocked| {
+            filter.is_none_or(|f| {
+                e.name.contains(f) || e.exe.as_deref().is_some_and(|x| x.contains(f))
+            })
+        })
+        .collect();
+    let start = entries.len().saturating_sub(limit);
+    entries.split_off(start)
+}
+
 fn note_blocked(name: &str, exe: Option<String>) {
     BLOCKED_TOTAL.fetch_add(1, Ordering::Relaxed);
     if let Some(exe) = &exe {
         *BLOCKED_BY_APP.lock().unwrap().entry(exe.clone()).or_default() += 1;
     }
+    let entry = ipc::Blocked {
+        ts: now_ts(),
+        name: name.to_string(),
+        exe,
+    };
+    append_blocked_line(&entry);
     let mut recent = BLOCKED_RECENT.lock().unwrap();
     if recent.len() >= BLOCKED_RECENT_CAP {
         recent.pop_front();
     }
-    recent.push_back(ipc::Blocked {
-        ts: now_ts(),
-        name: name.to_string(),
-        exe,
-    });
+    recent.push_back(entry);
 }
 
 fn proto_name(proto: u8) -> &'static str {
@@ -1190,6 +1274,9 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
     }
 
     reload_blocklist(&cfg);
+    // the dashboard is useful the moment the daemon comes back, not once it
+    // has blocked enough to refill the list
+    *BLOCKED_RECENT.lock().unwrap() = read_blocked(BLOCKED_RECENT_CAP, None).into();
 
     std::thread::spawn(|| {
         if let Err(e) = dns_loop() {
@@ -1706,6 +1793,17 @@ mod tests {
         p.extend_from_slice(&[0, 0]);
         p.extend_from_slice(&dns);
         p
+    }
+
+    #[test]
+    fn trimming_the_blocked_log_keeps_whole_newer_lines() {
+        let text = "a\nb\nc\nd\n";
+        assert_eq!(newer_half(text), "c\nd\n", "the newer half, terminated");
+        assert_eq!(newer_half("a\nb\nc\n"), "b\nc\n", "odd counts round down");
+        assert_eq!(newer_half("only\n"), "only\n", "one line survives itself");
+        assert_eq!(newer_half(""), "");
+        // a file that lost its final newline must not merge two entries
+        assert_eq!(newer_half("a\nb"), "b\n");
     }
 
     #[test]

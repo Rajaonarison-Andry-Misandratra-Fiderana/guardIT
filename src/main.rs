@@ -121,6 +121,14 @@ enum BlocklistCmd {
     Unallow { domain: String },
     /// would this name be blocked right now, and why
     Check { domain: String },
+    /// what has actually been blocked, from blocked.jsonl
+    Log {
+        #[arg(long, default_value_t = 100)]
+        n: usize,
+        /// only entries whose name or app contains this
+        #[arg(long)]
+        filter: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -200,6 +208,7 @@ fn main() {
                     | BlocklistCmd::Sources
                     | BlocklistCmd::Status
                     | BlocklistCmd::Check { .. }
+                    | BlocklistCmd::Log { .. }
             )
     );
     if !read_only && !ruleset::is_root() {
@@ -679,6 +688,23 @@ fn blocklist_cmd(cfg: Config, sub: BlocklistCmd) {
             }
             save_blocklist(cfg, |b| b.allow.retain(|d| *d != domain));
             println!("{domain} removed from the allowlist");
+        }
+        BlocklistCmd::Log { n, filter } => {
+            let entries = daemon::read_blocked(n, filter.as_deref());
+            if entries.is_empty() {
+                println!("nothing blocked yet");
+                return;
+            }
+            let now = now_ts();
+            println!("{:<8}{:<26}NAME", "AGO", "APP");
+            for e in entries {
+                println!(
+                    "{:<8}{:<26}{}",
+                    daemon::ago(now.saturating_sub(e.ts)),
+                    e.exe.as_deref().unwrap_or("-"),
+                    e.name
+                );
+            }
         }
         BlocklistCmd::Check { domain } => {
             if !cfg.blocklist.enabled {
