@@ -1715,6 +1715,7 @@ fn queue_loop(
                 peer_ip: peer_ip.clone(),
                 peer_name: peer_name.clone(),
                 status: FlowStatus::Denied,
+                denied_by: Some(ipc::DeniedBy::Blocklist),
                 ts: now_ts(),
             };
             append_history_line(&wire);
@@ -1754,6 +1755,7 @@ fn queue_loop(
                 peer_ip: peer_ip.clone(),
                 peer_name: None,
                 status: FlowStatus::Denied,
+                denied_by: Some(ipc::DeniedBy::Unresolved),
                 ts: now_ts(),
             };
             append_history_line(&wire);
@@ -1785,6 +1787,7 @@ fn queue_loop(
                     peer_ip: peer_ip.clone(),
                     peer_name: peer_name.clone(),
                     status: action.into(),
+                    denied_by: None,
                     ts: now_ts(),
                 };
                 append_history_line(&wire);
@@ -1808,6 +1811,7 @@ fn queue_loop(
                     peer_ip: peer_ip.clone(),
                     peer_name: peer_name.clone(),
                     status: FlowStatus::Pending,
+                    denied_by: None,
                     ts: now_ts(),
                 };
                 push_history(&history, wire.clone());

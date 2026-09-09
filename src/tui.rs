@@ -1440,6 +1440,13 @@ fn effective_status(e: &FlowWire, app_rules: &[AppRule]) -> FlowStatus {
     if matches!(e.status, FlowStatus::Pending) {
         return FlowStatus::Pending;
     }
+    // A policy refusal is not something the rules can be re-read to reach:
+    // the blocklist and require_resolved decide on evidence of their own, and
+    // a whole-app allow does not override either. Recomputing from the rules
+    // alone painted those rows green while the daemon went on dropping them.
+    if e.denied_by.is_some() {
+        return FlowStatus::Denied;
+    }
     match_rule(
         app_rules,
         &e.exe,
@@ -2803,6 +2810,7 @@ fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
         None => "select an app".to_string(),
     };
     let idxs = current_flow_indices(app);
+    let width = area.width.saturating_sub(2) as usize;
     let items: Vec<ListItem> = idxs
         .iter()
         .filter_map(|&i| app.flow.get(i))
@@ -2813,18 +2821,42 @@ fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
                 FlowStatus::Allowed => ("[ UP ]", theme.allow),
                 FlowStatus::Denied => ("[DROP]", theme.deny),
             };
-            let text = format!(
-                "{tag}  {:<4}/{:<4}  port {:<6}  {}",
+            // the reason gets its columns reserved before the peer is laid
+            // out: a truncated "· unres" reads as a bug, and the peer is the
+            // field with room to give
+            let reason = e
+                .denied_by
+                .map(|why| format!("  · {}", why.as_str()))
+                .unwrap_or_default();
+            let head = format!(
+                "{tag}  {:<4}/{:<4}  port {:<6}  ",
                 e.proto,
                 e.direction.as_str(),
                 e.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-                e.peer(),
             );
+            let room = width
+                .saturating_sub(head.chars().count() + reason.chars().count());
+            let peer = e.peer();
+            let peer = if peer.chars().count() > room && room > 1 {
+                format!("{}…", peer.chars().take(room - 1).collect::<String>())
+            } else {
+                peer
+            };
+            let text = format!("{head}{peer}");
             let mut style = Style::new().fg(color);
             if matches!(status, FlowStatus::Pending) {
                 style = style.add_modifier(Modifier::BOLD);
             }
-            ListItem::new(text).style(style)
+            // a red row is a question — your rule, or a list? — and only the
+            // row itself can answer it
+            if reason.is_empty() {
+                ListItem::new(text).style(style)
+            } else {
+                ListItem::new(Line::from(vec![
+                    Span::styled(text, style),
+                    Span::styled(reason, Style::new().fg(theme.border_idle)),
+                ]))
+            }
         })
         .collect();
     let [head, body] =
@@ -2916,6 +2948,7 @@ mod tests {
             peer_ip: ip.into(),
             peer_name: name.map(|n| n.into()),
             status: FlowStatus::Allowed,
+            denied_by: None,
             ts: 0,
         }
     }
@@ -2982,6 +3015,42 @@ mod tests {
         rebuild_apps(&mut app);
         app.focus = Focus::Apps;
         app
+    }
+
+    #[test]
+    fn a_policy_refusal_is_never_recomputed_back_to_allowed() {
+        let allow_whole_app = AppRule {
+            id: 1,
+            exe: "/usr/bin/firefox".into(),
+            port: None,
+            direction: None,
+            action: Action::Allow,
+            enabled: true,
+            expires: None,
+            fingerprint: None,
+            host: None,
+        };
+        let rules = vec![allow_whole_app];
+
+        let mut row = demo_flow(443, "1.2.3.4", Some("ads.example.com"), "/usr/bin/firefox");
+        row.status = FlowStatus::Denied;
+
+        // this is what the pane used to do: read the rules, find the allow,
+        // and paint the row green while the daemon went on dropping it
+        assert_eq!(
+            effective_status(&row, &rules),
+            FlowStatus::Allowed,
+            "no reason recorded, so the rules decide — as they should"
+        );
+
+        row.denied_by = Some(ipc::DeniedBy::Blocklist);
+        assert_eq!(effective_status(&row, &rules), FlowStatus::Denied);
+        row.denied_by = Some(ipc::DeniedBy::Unresolved);
+        assert_eq!(effective_status(&row, &rules), FlowStatus::Denied);
+
+        // a still-pending row is still pending, whatever else is true
+        row.status = FlowStatus::Pending;
+        assert_eq!(effective_status(&row, &rules), FlowStatus::Pending);
     }
 
     #[test]
@@ -3117,6 +3186,7 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
     }
 }
+
 
 
 

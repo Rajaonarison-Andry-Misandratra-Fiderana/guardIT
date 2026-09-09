@@ -93,6 +93,12 @@
   rejected, and the DoH bootstrap names plus Mozilla's `use-application-dns.net` canary
   return NXDOMAIN. `reject`, not `drop`, so clients fall back to plain DNS at once rather
   than hanging.
+- **A connection refused by a blocklist now reads as refused in the flow pane**, and says
+  which policy did it. The pane recomputed each row's colour from the app rules alone, so a
+  connection to a blocked name under a whole-app `allow` was painted green while the daemon
+  went on dropping it — the two policies decide on evidence of their own, which no reading
+  of the rules can reach. The reason travels on the row, and the peer is truncated to make
+  room for it rather than the other way round.
 - **The grid is about access control again.** Ads & tracking had grown to a full-height
   third of the screen — something you read, taking more room than the pane you operate — so
   it moves to its own tab on `B`, with its headline in the status line. What is left is

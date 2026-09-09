@@ -41,6 +41,31 @@ impl From<Action> for FlowStatus {
 /// `ServerMsg::FlowResolved`). The daemon keeps a capped history of these
 /// (see daemon::HISTORY_CAP) so a TUI that reconnects still sees what an
 /// app has been doing, not just requests still awaiting a decision.
+/// Why a connection was refused by something other than a rule of the
+/// user's own — the two policies that decide on their own evidence.
+///
+/// Carried on the row because a bare red line is a question: nothing else on
+/// screen distinguishes "you denied this" from "a list did", and the second
+/// one cannot be worked out from the rules, which is exactly why the UI used
+/// to recompute such a row back to green.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeniedBy {
+    /// the peer's name is on an enabled blocklist
+    Blocklist,
+    /// `require_resolved`: no lookup ever named that address
+    Unresolved,
+}
+
+impl DeniedBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeniedBy::Blocklist => "blocklist",
+            DeniedBy::Unresolved => "unresolved",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowWire {
     pub req_id: Option<u32>,
@@ -56,6 +81,9 @@ pub struct FlowWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_name: Option<String>,
     pub status: FlowStatus,
+    /// set when a policy refused this, not a rule — see `DeniedBy`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied_by: Option<DeniedBy>,
     /// unix epoch seconds when this was logged — `#[serde(default)]` so
     /// history.jsonl lines written before this field existed still parse
     #[serde(default)]
