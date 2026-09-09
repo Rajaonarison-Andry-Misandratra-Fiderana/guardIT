@@ -198,17 +198,17 @@ deny the app and allow the ports you mean.
 
 ## The TUI
 
-A top band of three columns — the kernel-level rules, what the machine has been doing, and
-everything the blocklists do — over a full-width band holding the pane you actually work
-in. `Tab` / `Shift+Tab` moves between the focusable panes, the focused one gets a thick
-border:
+The blocklists hold the right-hand column top to bottom. The rest is a top band — the
+rules the kernel holds, and what the machine has been doing — over the pane you actually
+work in, whose two halves line up with the two panes above them. `Tab` / `Shift+Tab` moves
+between the focusable panes, the focused one gets a thick border:
 
 | Where | Pane | What it shows | Keys |
 |---|---|---|---|
-| top left | **System rules** | IP/port `Rule`s (nftables-level) | `j/k` move · `space` toggle · `d` delete · `a` add · `p` presets (changes apply immediately) |
-| top middle | **Top apps** | bar chart of the apps with the most connection attempts, over the whole audit log (reset by `f` flush), each app's total above its bar | informational |
-| top right | **Ads & tracking** | a bar of DNS lookups blocked vs allowed with the rate above it, a sparkline of blocks per 5 s, then each figure under its own label — lookups, blocked, allowed — plus lists, domains loaded, last update and whether encrypted DNS is refused, then the names most recently blocked. A short pane drops the tail, never the top | informational |
-| bottom, full width | **Application blocking** — one pane, two halves either side of a vertical rule, because you pick an app on the left and rule on what it is doing on the right | | |
+| left, top | **System rules** | IP/port `Rule`s (nftables-level) | `j/k` move · `space` toggle · `d` delete · `a` add · `p` presets (changes apply immediately) |
+| middle, top | **Top apps** | bar chart of the apps with the most connection attempts, over the whole audit log (reset by `f` flush), each app's total above its bar | informational |
+| right, full height | **Ads & tracking** | a bar of DNS lookups blocked vs allowed with the rate above it, a sparkline of blocks per 5 s, then each figure under its own label — lookups, blocked, allowed — plus lists, domains loaded, last update and whether encrypted DNS is refused, then the names most recently blocked. A short pane drops the tail, never the top | informational |
+| bottom | **Application blocking** — one pane, two halves either side of a vertical rule, because you pick an app on the left and rule on what it is doing on the right. The rule sits on the column where Top apps begins, so each half runs under the pane it belongs with | | |
 | ↳ left half | **apps** | one row per app, its whole-app default, and how many per-port overrides it has | `j/k` select · `Enter` jump to the flow half · `l` this app's audit trail · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely · `/` filter by name (live; `Enter` keeps it, `Esc` clears) |
 | ↳ right half | **flow** | live connection history for whichever app is selected on the left | `j/k` select · `y`/`n` allow/deny **this port and direction only** (remembered as a per-port rule) · `Y`/`N` allow/deny **this peer's hostname**, any port (needs a resolved name; uses the exact name — `--host '*.foo.com'` on the CLI for a whole domain) |
 

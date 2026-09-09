@@ -16,10 +16,11 @@
   rejected, and the DoH bootstrap names plus Mozilla's `use-application-dns.net` canary
   return NXDOMAIN. `reject`, not `drop`, so clients fall back to plain DNS at once rather
   than hanging.
-- **New TUI layout**: a top band of three columns — System rules, Top apps, and the ads &
-  tracking dashboard — over a full-width **Application blocking** pane holding the app list
-  and that app's live flow either side of a vertical rule, since neither is much use
-  without the other. The dashboard shows a bar of lookups blocked vs allowed, a sparkline
+- **New TUI layout**: the ads & tracking dashboard holds the right-hand column top to
+  bottom; System rules and Top apps share a band above an **Application blocking** pane
+  holding the app list and that app's live flow either side of a vertical rule, since
+  neither is much use without the other. The rule lands on the column where Top apps
+  begins, so the app list runs under the rules and its flow under the chart. The dashboard shows a bar of lookups blocked vs allowed, a sparkline
   of blocks per 5 s, the three counters each with their number under their label, then the
   names most recently blocked; a short pane drops the tail rather than clipping anything.
   The audit tab moves from `L` to **`A`** and picks up the listening ports alongside the

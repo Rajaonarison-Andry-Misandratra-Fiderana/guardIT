@@ -1469,24 +1469,28 @@ fn draw(f: &mut Frame, app: &mut App) {
         // (not Percentage) so the halves are exactly equal — no rounding
         // drift between panes, which is what breaks top/bottom alignment
         // across columns.
-        // Top band, one column per subject: the kernel-level rules on the
-        // left, what the machine has been doing in the middle, everything
-        // the blocklists do on the right. Bottom band: the pane you actually
-        // work in, across the whole width — an app list beside its own live
-        // flow, where every column of a flow row is a field worth reading.
+        // The blocklists get the right-hand column outright, top to bottom:
+        // it is the one subject that is purely read, and it has the most to
+        // say per row. What is left is split into a top band — the rules the
+        // kernel holds, and what the machine has been doing — over the pane
+        // you actually work in, which spans that whole width because a flow
+        // row is a whole record and every column of it is worth reading.
+        let [work, blocking] =
+            Layout::horizontal([Constraint::Percentage(74), Constraint::Percentage(26)])
+                .areas(outer[1]);
         let [top, bottom] =
             Layout::vertical([Constraint::Percentage(52), Constraint::Percentage(48)])
-                .areas(outer[1]);
-        let cols = Layout::horizontal([
-            Constraint::Percentage(28),
-            Constraint::Percentage(44),
-            Constraint::Percentage(28),
-        ])
-        .split(top);
-        draw_rules(f, app, cols[0]);
-        draw_top_apps(f, app, cols[1]);
-        draw_blocking(f, app, cols[2]);
-        draw_app_control(f, app, bottom);
+                .areas(work);
+        let [rules, top_apps] =
+            Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)])
+                .areas(top);
+        draw_rules(f, app, rules);
+        draw_top_apps(f, app, top_apps);
+        // the divider lands on the column where Top apps begins, so the two
+        // halves sit under the panes they belong with: the app list under
+        // the rules, its flow under what the machine has been doing
+        draw_app_control(f, app, bottom, top_apps.x);
+        draw_blocking(f, app, blocking);
     }
 
     draw_footer(f, app, outer[2]);
@@ -1560,7 +1564,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("Tab", "pane"),
             ("j/k", "select"),
             ("Enter", "flow"),
-            ("l", "log"),
+            ("l", "audit"),
             ("y/n", "allow/deny app"),
             ("space", "toggle"),
             ("d", "remove"),
@@ -1569,7 +1573,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         (Focus::Flow, _) => vec![
             ("Tab", "pane"),
             ("j/k", "select"),
-            ("l", "log"),
+            ("l", "audit"),
             ("y/n", "allow/deny port"),
             ("Y/N", "allow/deny host"),
         ],
@@ -1949,7 +1953,12 @@ fn half_heading(theme: Theme, focused: bool) -> Style {
 /// which app it is showing, so a shared border says that better than two
 /// separate ones did. Both halves stay in the Tab ring; the border lights up
 /// for either.
-fn draw_app_control(f: &mut Frame, app: &mut App, area: Rect) {
+///
+/// `divider_x` is an absolute column, so the rule can be lined up with a
+/// pane boundary elsewhere on the screen rather than falling wherever a
+/// percentage of this pane happens to land. It is clamped to leave at least
+/// one usable column on each side.
+fn draw_app_control(f: &mut Frame, app: &mut App, area: Rect, divider_x: u16) {
     let theme = THEMES[app.theme_idx];
     let focused = matches!(app.focus, Focus::Apps | Focus::Flow);
     let block = theme.pane("application blocking".into(), focused);
@@ -1959,10 +1968,9 @@ fn draw_app_control(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     // the divider is a column of its own so neither list ever draws over it
-    // the app list is a name and a verdict; the flow is a whole record per
-    // row, so it takes the width the full-width band buys
+    let divider_x = divider_x.clamp(inner.x + 1, inner.right().saturating_sub(2));
     let [left, rule, right] = Layout::horizontal([
-        Constraint::Percentage(26),
+        Constraint::Length(divider_x - inner.x),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
@@ -2260,7 +2268,9 @@ fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("updated ", dim),
         Span::styled(
             match b.updated_at {
-                Some(t) => format!("{} ago", ago(now_ts().saturating_sub(t))),
+                // no " ago" — this line pairs two facts in a narrow column,
+                // and the word is the first thing that pushes it off the edge
+                Some(t) => ago(now_ts().saturating_sub(t)),
                 None => "never".into(),
             },
             Style::new().fg(if b.updated_at.is_some() {
@@ -2578,5 +2588,7 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
     }
 }
+
+
 
 
