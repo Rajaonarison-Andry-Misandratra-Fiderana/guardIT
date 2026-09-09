@@ -16,11 +16,15 @@
   rejected, and the DoH bootstrap names plus Mozilla's `use-application-dns.net` canary
   return NXDOMAIN. `reject`, not `drop`, so clients fall back to plain DNS at once rather
   than hanging.
-- **New TUI layout**: the audit log tab (`L`) now holds the listening ports alongside the
-  log, `Tab` switching between them; Network flow takes the full-height right column that
-  frees up; and the middle column's lower half is a new **ads & tracking** dashboard — a
-  ring of lookups allowed vs blocked with the block rate in the hole, and every figure
-  repeated under its own label.
+- **New TUI layout**, one subject per column. System rules take the left column; Top apps
+  and a combined **Application blocking** pane — the app list and that app's live flow,
+  either side of a vertical rule, since neither is much use without the other — take the
+  middle; and the whole right column is the ads & tracking dashboard: a ring of lookups
+  allowed vs blocked with the block rate in the hole, every figure repeated under its own
+  label, then the names most recently blocked. The audit log tab (`L`) picks up the
+  listening ports alongside the log, `Tab` switching between them. Rule rows wrap onto two
+  lines rather than truncating the source, and the app-name column shrinks with its pane so
+  the allow/deny status never falls off the edge.
 - **Filter the audit log** with `/`: a number matches the port exactly, anything else is a
   substring of the peer address, the resolved name or the app path.
 - **Rules by domain**: `guardit app deny <exe> --host '*.doubleclick.net'` restricts a

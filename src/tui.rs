@@ -1446,22 +1446,21 @@ fn draw(f: &mut Frame, app: &mut App) {
         // (not Percentage) so the halves are exactly equal — no rounding
         // drift between panes, which is what breaks top/bottom alignment
         // across columns.
-        // the middle column carries the two panes you read rather than
-        // operate — a bar chart needs width per app and a donut needs to be
-        // round — so it gets the space, taken from the list panes either side
+        // one column per subject: the kernel-level rules on the left, the
+        // per-app picture in the middle, everything the blocklists do on the
+        // right. The middle gets the width because both of its panes need it
+        // — a bar per app, and an app list beside its own live flow
         let main = Layout::horizontal([
             Constraint::Percentage(24),
             Constraint::Percentage(50),
             Constraint::Percentage(26),
         ])
         .split(outer[1]);
-        let left = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).split(main[0]);
         let mid = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).split(main[1]);
-        draw_rules(f, app, left[0]);
-        draw_apps(f, app, left[1]);
+        draw_rules(f, app, main[0]);
         draw_top_apps(f, app, mid[0]);
-        draw_blocking(f, app, mid[1]);
-        draw_flow(f, app, main[2]);
+        draw_app_control(f, app, mid[1]);
+        draw_blocking(f, app, main[2]);
     }
 
     draw_footer(f, app, outer[2]);
@@ -1788,16 +1787,25 @@ fn draw_rules(f: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         theme.deny
                     };
-                    let text = format!(
-                        "#{:<3} {:<6} [{}]  {}{}  {}",
-                        r.id,
-                        format!("{:?}", r.action).to_uppercase(),
-                        format!("{:?}", r.proto).to_lowercase(),
-                        r.src,
-                        r.port.map(|p| format!(":{p}")).unwrap_or_default(),
-                        if r.enabled { "" } else { "(off)" },
-                    );
-                    ListItem::new(text).style(Style::new().fg(color))
+                    // two lines, not one: the source is the identifying half
+                    // of a rule and this pane is the narrow column, so a
+                    // single line would truncate exactly the part you read.
+                    // Height is what the column has to spare
+                    ListItem::new(vec![
+                        Line::from(format!(
+                            "#{:<3} {:<6} {}{}",
+                            r.id,
+                            format!("{:?}", r.action).to_uppercase(),
+                            format!("{:?}", r.proto).to_lowercase(),
+                            if r.enabled { "" } else { "  (off)" },
+                        )),
+                        Line::from(format!(
+                            "  {}{}",
+                            r.src,
+                            r.port.map(|p| format!(":{p}")).unwrap_or_default(),
+                        )),
+                    ])
+                    .style(Style::new().fg(color))
                 })
                 .collect();
             let list = List::new(items)
@@ -1811,6 +1819,7 @@ fn draw_rules(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = THEMES[app.theme_idx];
+    let width = area.width;
     let items: Vec<ListItem> = app
         .apps
         .iter()
@@ -1863,33 +1872,82 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
             };
             // a name longer than the column gets truncated (not just padded) —
             // otherwise one long app name pushes its own status out of line
-            // with every other row's, defeating the whole point of padding
+            // with every other row's, defeating the whole point of padding.
+            // The column shrinks with the pane so the status, which is the
+            // part you are actually reading, never falls off the edge
             let name = basename(&row.exe);
-            const NAME_COL: usize = 18;
-            let name_col = if name.chars().count() > NAME_COL {
-                format!("{}…", name.chars().take(NAME_COL - 1).collect::<String>())
+            let col = (width as usize).saturating_sub(10).clamp(6, 18);
+            let name_col = if name.chars().count() > col {
+                format!("{}…", name.chars().take(col - 1).collect::<String>())
             } else {
-                format!("{name:<NAME_COL$}")
+                format!("{name:<col$}")
             };
             ListItem::new(format!("{dot} {name_col} {status}")).style(style)
         })
         .collect();
+    let heading = if app.apps_filter.is_empty() {
+        "apps — undecided first".to_string()
+    } else {
+        format!("apps — /{} ({} shown)", app.apps_filter, app.apps.len())
+    };
+    let [head, body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    f.render_widget(
+        Paragraph::new(heading).style(half_heading(theme, app.focus == Focus::Apps)),
+        head,
+    );
     let list = List::new(items)
         .style(theme.base())
-        .highlight_style(Style::new().bg(theme.border_idle))
-        .block(theme.pane(
-            if app.apps_filter.is_empty() {
-                "application blocking — undecided first".into()
-            } else {
-                format!(
-                    "application blocking — /{} ({} shown)",
-                    app.apps_filter,
-                    app.apps.len()
-                )
-            },
-            app.focus == Focus::Apps,
-        ));
-    f.render_stateful_widget(list, area, &mut app.apps_state);
+        .highlight_style(Style::new().bg(theme.border_idle));
+    f.render_stateful_widget(list, body, &mut app.apps_state);
+}
+
+/// the two halves of the app-control pane label themselves, since they share
+/// one border: the focused one is bold in its own accent, the other is quiet
+fn half_heading(theme: Theme, focused: bool) -> Style {
+    if focused {
+        theme
+            .base()
+            .fg(theme.border_focus)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme.base().fg(theme.border_idle)
+    }
+}
+
+/// Application blocking: the app list and that app's live flow, one pane
+/// split by a vertical rule.
+///
+/// They are one subject — you pick an app on the left and rule on what it is
+/// doing on the right — and the flow pane is meaningless without knowing
+/// which app it is showing, so a shared border says that better than two
+/// separate ones did. Both halves stay in the Tab ring; the border lights up
+/// for either.
+fn draw_app_control(f: &mut Frame, app: &mut App, area: Rect) {
+    let theme = THEMES[app.theme_idx];
+    let focused = matches!(app.focus, Focus::Apps | Focus::Flow);
+    let block = theme.pane("application blocking".into(), focused);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 4 || inner.height == 0 {
+        return;
+    }
+    // the divider is a column of its own so neither list ever draws over it
+    let [left, rule, right] = Layout::horizontal([
+        Constraint::Percentage(38),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    draw_apps(f, app, left);
+    f.render_widget(
+        Block::new()
+            .borders(Borders::LEFT)
+            .border_style(Style::new().fg(theme.border_idle))
+            .style(theme.base()),
+        rule,
+    );
+    draw_flow(f, app, right);
 }
 
 /// top apps by how many flow entries they've generated this session —
@@ -2054,21 +2112,29 @@ fn ring_arc(ctx: &mut Context, from: f64, sweep: f64, color: Color) {
     });
 }
 
-/// The ads / tracking dashboard: what the blocklists are doing right now.
+/// The ads / tracking column: everything the blocklists are doing.
 ///
-/// The ring is DNS lookups since the daemon started, split allowed vs
-/// blocked, with the block rate in the hole; the column beside it repeats
-/// each figure under its own label, because a ring answers "roughly how
-/// much" and the number under it answers "how much".
+/// A ring of DNS lookups allowed vs blocked with the block rate in the hole,
+/// then every figure repeated under its own label — a ring answers "roughly
+/// how much" and the number under it answers "how much" — then the names
+/// most recently blocked, which is where a false positive announces itself
+/// the moment a page breaks.
+///
+/// Laid out down the column rather than across it: this is the full height
+/// of the right-hand column, so there is room to stack, and stacking keeps
+/// the same shape at every terminal width instead of reflowing at some
+/// threshold.
 fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
     let theme = THEMES[app.theme_idx];
     let b = &app.blocklist;
-    let title = if b.enabled {
-        "ads & tracking — blocked lookups".to_string()
-    } else {
-        "ads & tracking — off".to_string()
-    };
-    let block = theme.pane(title, false);
+    let block = theme.pane(
+        if b.enabled {
+            "ads & tracking".to_string()
+        } else {
+            "ads & tracking — off".to_string()
+        },
+        false,
+    );
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
@@ -2076,24 +2142,21 @@ fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
     }
 
     if !b.enabled {
+        let dim = Style::new().fg(theme.border_idle);
         let hint = vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  blocking is off",
+                "blocking is off",
                 Style::new().fg(theme.warn).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from("  sudo guardit blocklist on"),
-            Line::from("  sudo guardit blocklist update"),
+            Line::from("sudo guardit blocklist on"),
+            Line::from("sudo guardit blocklist update"),
             Line::from(""),
-            Line::from(Span::styled(
-                "  ads, trackers and telemetry are refused at",
-                Style::new().fg(theme.border_idle),
-            )),
-            Line::from(Span::styled(
-                "  the DNS answer, before anything connects",
-                Style::new().fg(theme.border_idle),
-            )),
+            Line::from(Span::styled("ads, trackers and telemetry", dim)),
+            Line::from(Span::styled("are refused at the DNS", dim)),
+            Line::from(Span::styled("answer, before anything", dim)),
+            Line::from(Span::styled("connects", dim)),
         ];
         f.render_widget(Paragraph::new(hint).style(theme.base()), inner);
         return;
@@ -2106,104 +2169,146 @@ fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
         b.blocked as f64 / b.queries as f64 * 100.0
     };
 
-    // the ring takes a 2:1 rect as wide as it can be without crowding the
-    // figures out; below ~6 rows there is no room for one at all
-    let ring_h = inner.height.min(inner.width / 4).min(9);
-    let ring_w = ring_h * 2;
-    let [ring_area, text_area] =
-        Layout::horizontal([Constraint::Length(ring_w), Constraint::Min(0)]).areas(inner);
-    if ring_h >= 3 {
-        let ring_area = Rect {
-            y: ring_area.y + inner.height.saturating_sub(ring_h) / 2,
-            height: ring_h,
-            ..ring_area
+    // the figures are the part that must always be readable, so they get
+    // their rows first and the ring takes what is left, up to a size where
+    // more braille stops adding anything
+    const FIGURES: u16 = 10;
+    let ring_h = (inner.width / 4)
+        .min(9)
+        .min(inner.height.saturating_sub(FIGURES + 2));
+    let (ring_area, rest) = if ring_h >= 3 {
+        let [r, rest] =
+            Layout::vertical([Constraint::Length(ring_h), Constraint::Min(0)]).areas(inner);
+        (Some(r), rest)
+    } else {
+        (None, inner)
+    };
+
+    if let Some(r) = ring_area {
+        // twice as wide as tall, centred: see draw_ring
+        let w = (ring_h * 2).min(r.width);
+        let r = Rect {
+            x: r.x + (r.width - w) / 2,
+            width: w,
+            ..r
         };
         draw_ring(
             f,
-            ring_area,
+            r,
             vec![(b.blocked, theme.deny), (allowed, theme.allow)],
             theme.border_idle,
         );
-        // the rate goes in the hole, where a donut chart puts its headline
-        let mid = Rect {
-            x: ring_area.x,
-            y: ring_area.y + ring_area.height / 2,
-            width: ring_area.width,
-            height: 1,
+        // the rate goes in the hole, where a donut puts its headline — but
+        // only if the hole can hold it, otherwise the label would be drawn
+        // over the band it is supposed to sit inside
+        let hole = (r.width as f64 * 0.52) as usize;
+        let label = match hole {
+            6.. => Some(format!("{rate:.1}%")),
+            4..=5 => Some(format!("{rate:.0}%")),
+            _ => None,
         };
-        f.render_widget(
-            Paragraph::new(format!("{rate:.1}%"))
-                .alignment(Alignment::Center)
-                .style(theme.base().fg(theme.deny).add_modifier(Modifier::BOLD)),
-            mid,
-        );
+        if let Some(label) = label {
+            f.render_widget(
+                Paragraph::new(label)
+                    .alignment(Alignment::Center)
+                    .style(theme.base().fg(theme.deny).add_modifier(Modifier::BOLD)),
+                Rect {
+                    y: r.y + r.height / 2,
+                    height: 1,
+                    ..r
+                },
+            );
+        }
     }
 
-    let updated = match b.updated_at {
-        Some(t) => format!("{} ago", ago(now_ts().saturating_sub(t))),
-        None => "never — run `blocklist update`".into(),
-    };
     let dim = Style::new().fg(theme.border_idle);
-    let mut lines = vec![
-        Line::from(Span::styled("● lookups", dim)),
-        Line::from(Span::styled(
-            format!("  {}", group(b.queries)),
-            Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled("● blocked", dim)),
-        Line::from(Span::styled(
-            format!("  {}", group(b.blocked)),
-            Style::new().fg(theme.deny).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled("● allowed", dim)),
-        Line::from(Span::styled(
-            format!("  {}", group(allowed)),
-            Style::new().fg(theme.allow).add_modifier(Modifier::BOLD),
-        )),
+    let figure = |dot_color: Color, label: &str, value: String| {
+        [
+            Line::from(vec![
+                Span::styled("● ", Style::new().fg(dot_color)),
+                Span::styled(label.to_string(), dim),
+            ]),
+            Line::from(Span::styled(
+                format!("  {value}"),
+                Style::new().fg(dot_color).add_modifier(Modifier::BOLD),
+            )),
+        ]
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    lines.extend(figure(theme.fg, "lookups", group(b.queries)));
+    lines.extend(figure(theme.deny, "blocked", group(b.blocked)));
+    lines.extend(figure(theme.allow, "allowed", group(allowed)));
+    let pair = |label: &str, value: String, color: Color| {
         Line::from(vec![
-            Span::styled("domains  ", dim),
-            Span::styled(group(b.domains as u64), Style::new().fg(theme.fg)),
-        ]),
-        Line::from(vec![
-            Span::styled("lists    ", dim),
-            Span::styled(b.sources.len().to_string(), Style::new().fg(theme.fg)),
-        ]),
-        Line::from(vec![
-            Span::styled("updated  ", dim),
-            Span::styled(updated, Style::new().fg(theme.fg)),
-        ]),
-        Line::from(vec![
-            Span::styled("enc dns  ", dim),
-            Span::styled(
-                if b.encrypted_dns_blocked {
-                    "refused"
-                } else {
-                    "allowed — apps can bypass"
-                },
-                Style::new().fg(if b.encrypted_dns_blocked {
-                    theme.allow
-                } else {
-                    theme.warn
-                }),
-            ),
-        ]),
-    ];
-    // the newest block, so a false positive shows up here the moment a page
-    // breaks instead of having to be guessed at
-    if let Some((_, name)) = b.recent.last() {
-        lines.push(Line::from(vec![
-            Span::styled("last     ", dim),
-            Span::styled(name.clone(), Style::new().fg(theme.deny)),
-        ]));
+            Span::styled(format!("{label:<9}"), dim),
+            Span::styled(value, Style::new().fg(color)),
+        ])
+    };
+    lines.push(pair("domains", group(b.domains as u64), theme.fg));
+    lines.push(pair("lists", b.sources.len().to_string(), theme.fg));
+    lines.push(pair(
+        "updated",
+        match b.updated_at {
+            Some(t) => format!("{} ago", ago(now_ts().saturating_sub(t))),
+            None => "never".into(),
+        },
+        if b.updated_at.is_some() {
+            theme.fg
+        } else {
+            theme.warn
+        },
+    ));
+    lines.push(pair(
+        "enc dns",
+        if b.encrypted_dns_blocked {
+            "refused".into()
+        } else {
+            "bypassable".into()
+        },
+        if b.encrypted_dns_blocked {
+            theme.allow
+        } else {
+            theme.warn
+        },
+    ));
+
+    let figures_h = (lines.len() as u16).min(rest.height);
+    let [figures_area, recent_area] =
+        Layout::vertical([Constraint::Length(figures_h), Constraint::Min(0)]).areas(rest);
+    f.render_widget(Paragraph::new(lines).style(theme.base()), figures_area);
+
+    if recent_area.height < 2 {
+        return;
     }
-    f.render_widget(Paragraph::new(lines).style(theme.base()), text_area);
+    let mut recent = vec![Line::from(Span::styled("recently blocked", dim))];
+    if b.recent.is_empty() {
+        recent.push(Line::from(Span::styled("nothing yet", dim)));
+    } else {
+        // newest first, and only as many as there are rows for
+        let rows = recent_area.height.saturating_sub(1) as usize;
+        for (ts, name) in b.recent.iter().rev().take(rows) {
+            let age = ago(now_ts().saturating_sub(*ts));
+            let width = recent_area.width as usize;
+            let room = width.saturating_sub(age.chars().count() + 2);
+            let name = if name.chars().count() > room && room > 1 {
+                format!("{}…", name.chars().take(room - 1).collect::<String>())
+            } else {
+                name.clone()
+            };
+            recent.push(Line::from(vec![
+                Span::styled(name, Style::new().fg(theme.deny)),
+                Span::styled(format!(" {age}"), dim),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(recent).style(theme.base()), recent_area);
 }
 
 fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = THEMES[app.theme_idx];
-    let title = match app.apps_state.selected().and_then(|i| app.apps.get(i)) {
-        Some(row) => format!("network flow — {}", basename(&row.exe)),
-        None => "network flow — select an app on the left".to_string(),
+    let heading = match app.apps_state.selected().and_then(|i| app.apps.get(i)) {
+        Some(row) => format!("flow — {}", basename(&row.exe)),
+        None => "flow — select an app".to_string(),
     };
     let idxs = current_flow_indices(app);
     let items: Vec<ListItem> = idxs
@@ -2230,11 +2335,16 @@ fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new(text).style(style)
         })
         .collect();
+    let [head, body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    f.render_widget(
+        Paragraph::new(heading).style(half_heading(theme, app.focus == Focus::Flow)),
+        head,
+    );
     let list = List::new(items)
         .style(theme.base())
-        .highlight_style(Style::new().bg(theme.border_idle))
-        .block(theme.pane(title, app.focus == Focus::Flow));
-    f.render_stateful_widget(list, area, &mut app.flow_state);
+        .highlight_style(Style::new().bg(theme.border_idle));
+    f.render_stateful_widget(list, body, &mut app.flow_state);
 }
 
 fn draw_conflicts(f: &mut Frame, app: &mut App, area: Rect) {
@@ -2292,7 +2402,7 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
-    fn flow(port: u16, ip: &str, name: Option<&str>, exe: &str) -> FlowWire {
+    fn demo_flow(port: u16, ip: &str, name: Option<&str>, exe: &str) -> FlowWire {
         FlowWire {
             req_id: None,
             exe: exe.into(),
@@ -2308,7 +2418,7 @@ mod tests {
 
     #[test]
     fn a_numeric_log_filter_is_a_port_not_a_substring() {
-        let e = flow(443, "140.82.121.4", Some("github.com"), "/usr/bin/curl");
+        let e = demo_flow(443, "140.82.121.4", Some("github.com"), "/usr/bin/curl");
         assert!(log_row_matches(&e, "443"));
         assert!(!log_row_matches(&e, "44"), "not a prefix of the port");
         assert!(!log_row_matches(&e, "4"), "nor a digit inside the address");
@@ -2317,14 +2427,14 @@ mod tests {
 
     #[test]
     fn a_text_log_filter_matches_address_name_or_app() {
-        let e = flow(443, "140.82.121.4", Some("github.com"), "/usr/bin/curl");
+        let e = demo_flow(443, "140.82.121.4", Some("github.com"), "/usr/bin/curl");
         assert!(log_row_matches(&e, "140.82"));
         assert!(log_row_matches(&e, "github"));
         assert!(log_row_matches(&e, "GitHub.COM"), "case-insensitive");
         assert!(log_row_matches(&e, "curl"));
         assert!(!log_row_matches(&e, "gitlab"));
         // a row the tap never resolved still matches on its address
-        let bare = flow(443, "140.82.121.4", None, "/usr/bin/curl");
+        let bare = demo_flow(443, "140.82.121.4", None, "/usr/bin/curl");
         assert!(log_row_matches(&bare, "140.82"));
         assert!(!log_row_matches(&bare, "github"));
     }
@@ -2367,7 +2477,7 @@ mod tests {
                 recent: vec![(0, "ads.example.com".into())],
                 updated_at: Some(1),
             };
-            app.flow = vec![flow(443, "140.82.121.4", Some("github.com"), "/usr/bin/curl")];
+            app.flow = vec![demo_flow(443, "140.82.121.4", Some("github.com"), "/usr/bin/curl")];
             app.listening = vec![ipc::ListenEntry {
                 proto: "tcp".into(),
                 addr: "0.0.0.0".into(),
@@ -2416,3 +2526,4 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
     }
 }
+
