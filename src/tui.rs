@@ -322,7 +322,9 @@ enum Focus {
     Apps,
     Flow,
     Rules,
-    /// what the blocklists block: the categories are toggled here
+    /// what the blocklists block — its own tab on `B`, not a pane in the
+    /// grid: it is set up now and then, and the grid is for the thing you
+    /// operate every day
     Blocking,
     /// listening ports — inside the log tab, not the grid: it answers the
     /// same "what has been going on" question the audit trail does, and
@@ -340,6 +342,11 @@ fn in_log_tab(focus: Focus) -> bool {
     matches!(focus, Focus::AppLog | Focus::Conflicts)
 }
 
+/// Anything drawn over the whole grid rather than inside it.
+fn in_tab(focus: Focus) -> bool {
+    in_log_tab(focus) || focus == Focus::Blocking
+}
+
 // Two rings over the same panes.
 //
 // Tab walks the panes as a user thinks of them: system rules, application
@@ -355,21 +362,23 @@ impl Focus {
     fn next(self) -> Focus {
         match self {
             Focus::Rules => Focus::Apps,
-            Focus::Apps | Focus::Flow => Focus::Blocking,
-            Focus::Blocking => Focus::Rules,
-            // inside the tab, Tab is a toggle between its two halves
+            Focus::Apps | Focus::Flow => Focus::Rules,
+            // inside the log tab, Tab toggles its two halves; the blocking
+            // tab holds one thing, so there is nowhere for Tab to go
             Focus::AppLog => Focus::Conflicts,
             Focus::Conflicts => Focus::AppLog,
+            Focus::Blocking => Focus::Blocking,
         }
     }
 
     fn prev(self) -> Focus {
         match self {
-            Focus::Rules => Focus::Blocking,
-            Focus::Apps | Focus::Flow => Focus::Rules,
-            Focus::Blocking => Focus::Apps,
+            Focus::Rules => Focus::Apps,
+            Focus::Apps => Focus::Rules,
+            Focus::Flow => Focus::Apps,
             Focus::AppLog => Focus::Conflicts,
             Focus::Conflicts => Focus::AppLog,
+            Focus::Blocking => Focus::Blocking,
         }
     }
 
@@ -379,22 +388,22 @@ impl Focus {
         match self {
             Focus::Rules => Focus::Apps,
             Focus::Apps => Focus::Flow,
-            Focus::Flow => Focus::Blocking,
-            Focus::Blocking => Focus::Rules,
+            Focus::Flow => Focus::Rules,
             Focus::AppLog => Focus::Conflicts,
             Focus::Conflicts => Focus::AppLog,
+            Focus::Blocking => Focus::Blocking,
         }
     }
 
     /// `h`: the same, the other way
     fn left(self) -> Focus {
         match self {
-            Focus::Rules => Focus::Blocking,
+            Focus::Rules => Focus::Flow,
             Focus::Apps => Focus::Rules,
             Focus::Flow => Focus::Apps,
-            Focus::Blocking => Focus::Flow,
             Focus::AppLog => Focus::Conflicts,
             Focus::Conflicts => Focus::AppLog,
+            Focus::Blocking => Focus::Blocking,
         }
     }
 }
@@ -787,6 +796,19 @@ pub fn run(cfg: Config) {
                 save_theme_idx(app.theme_idx);
                 continue;
             }
+            if key.code == KeyCode::Char('B')
+                && !matches!(app.mode, Mode::Add(_) | Mode::Filter)
+            {
+                if app.focus == Focus::Blocking {
+                    app.focus = app.prev_focus;
+                } else {
+                    if !in_tab(app.focus) {
+                        app.prev_focus = app.focus;
+                    }
+                    app.focus = Focus::Blocking;
+                }
+                continue;
+            }
             // jumpable to from anywhere, same idea as `t` — the audit tab is
             // its own tab, not nested under any pane's local keys
             if key.code == KeyCode::Char('A')
@@ -908,7 +930,7 @@ pub fn run(cfg: Config) {
                     _ => {}
                 },
                 Focus::Blocking => match key.code {
-                    KeyCode::Char('q') => break,
+                    KeyCode::Char('q') => app.focus = app.prev_focus,
                     KeyCode::Char('j') | KeyCode::Down => app.blocking_state.select(step(
                         app.blocking_state.selected(),
                         blocklist::CATEGORIES.len(),
@@ -1652,7 +1674,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     .split(area);
 
     draw_header(f, app, outer[0]);
-    if in_log_tab(app.focus) {
+    if app.focus == Focus::Blocking {
+        draw_blocking(f, app, outer[1]);
+    } else if in_log_tab(app.focus) {
         // its own tab over the whole grid area: the audit trail and the
         // listening ports, which answer the same "what has been going on"
         // question and are both wider than a grid cell
@@ -1667,20 +1691,16 @@ fn draw(f: &mut Frame, app: &mut App) {
         // (not Percentage) so the halves are exactly equal — no rounding
         // drift between panes, which is what breaks top/bottom alignment
         // across columns.
-        // The blocklists get the right-hand column outright, top to bottom:
-        // it is the one subject that is purely read, and it has the most to
-        // say per row. What is left is split into a top band — the rules the
-        // kernel holds, and what the machine has been doing — over the pane
-        // you actually work in, which spans that whole width because a flow
-        // row is a whole record and every column of it is worth reading.
-        let [work, blocking] =
-            Layout::horizontal([Constraint::Percentage(74), Constraint::Percentage(26)])
-                .areas(outer[1]);
+        // Three panes, all about the same thing: the rules the kernel
+        // holds, what the machine has been doing, and the pane you decide
+        // in. The blocklists are a tab (`B`), not a column — they are set up
+        // now and then, and a third of the screen given to something you
+        // read makes the tool look like what it isn't.
         let [top, bottom] =
-            Layout::vertical([Constraint::Percentage(52), Constraint::Percentage(48)])
-                .areas(work);
+            Layout::vertical([Constraint::Percentage(46), Constraint::Percentage(54)])
+                .areas(outer[1]);
         let [rules, top_apps] =
-            Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)])
+            Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)])
                 .areas(top);
         draw_rules(f, app, rules);
         draw_top_apps(f, app, top_apps);
@@ -1689,7 +1709,6 @@ fn draw(f: &mut Frame, app: &mut App) {
         // halves sit under the panes they belong with: the app list under
         // the rules, its flow under what the machine has been doing
         draw_app_control(f, app, bottom, rules.right().saturating_sub(1));
-        draw_blocking(f, app, blocking);
     }
 
     draw_footer(f, app, outer[2]);
@@ -1807,7 +1826,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("Y/N", "allow/deny host"),
         ],
         (Focus::Blocking, _) => vec![
-            ("h/l", "pane"),
             ("j/k", "category"),
             ("space", "block/unblock"),
             ("u", "update lists"),
@@ -1840,13 +1858,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("p", "presets"),
         ],
     };
-    let in_tab = in_log_tab(app.focus);
-    if !in_tab {
+    let tab = in_tab(app.focus);
+    if !tab {
         keys.push(("A", "audit"));
+        keys.push(("B", "blocking"));
     }
     keys.push(("t", "theme"));
-    if !(in_tab && app.app_log_confirm_flush) {
-        keys.push(("q", if in_tab { "back" } else { "quit" }));
+    if !(tab && app.app_log_confirm_flush) {
+        keys.push(("q", if tab { "back" } else { "quit" }));
     }
 
     let mut spans = vec![Span::styled(
@@ -1887,8 +1906,20 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         app.interfaces.join(", ")
     };
     let theme = THEMES[app.theme_idx];
+    // the blocklists' one headline, so leaving them in a tab does not mean
+    // losing sight of whether they are on
+    let blocking = if !app.blocklist.enabled {
+        "off (B)".to_string()
+    } else if app.blocklist.queries == 0 {
+        "on (B)".to_string()
+    } else {
+        format!(
+            "{:.1}% of lookups (B)",
+            app.blocklist.blocked as f64 / app.blocklist.queries as f64 * 100.0
+        )
+    };
     let status = format!(
-        "guardit  |  if: {ifaces}  |  daemon: {daemon}  |  theme: {} (t)",
+        "guardit  |  if: {ifaces}  |  daemon: {daemon}  |  blocking: {blocking}  |  theme: {} (t)",
         theme.name
     );
     f.render_widget(
@@ -2560,17 +2591,18 @@ fn draw_categories(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     f.render_stateful_widget(list, body, &mut app.blocking_state);
 }
 
-/// The blocking column: what is blocked, how well it is going, and the
+/// The blocking tab: what is blocked, how well it is going, and the
 /// switches for changing it.
 ///
-/// A bar for the split of DNS lookups blocked vs allowed — proportion, read
-/// across. Every figure under its own label. The categories, which is the
-/// part you operate: tick what you want blocked, several at once. Then the
-/// names most recently blocked, where a false positive announces itself the
-/// moment a page breaks.
+/// Its own tab rather than a column in the grid. Blocking is set up now and
+/// then and read occasionally; the grid is for the thing you operate, and
+/// giving a third of it to something you only read made the tool look like
+/// an ad blocker that happened to have a firewall in it.
+///
+/// Three columns at tab width, stacked in the order they matter when there
+/// is not room for three: the figures, the switches, then what was blocked.
 fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = THEMES[app.theme_idx];
-    let focused = app.focus == Focus::Blocking;
     let b = app.blocklist.clone();
     let block = theme.pane(
         if b.enabled {
@@ -2578,7 +2610,7 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             "ads & tracking — off".to_string()
         },
-        focused,
+        true,
     );
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2587,23 +2619,42 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let dim = Style::new().fg(theme.border_idle);
+    // wide enough for three columns, or stacked; either way the switches are
+    // never the thing that gets dropped, since they are why you came here
+    let columns = if inner.width >= 90 { 3 } else { 1 };
+    let (stats_area, cats_area, recent_area) = if columns == 3 {
+        let [a, b, c] = Layout::horizontal([
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+        ])
+        // columns that touch read as one run-on line
+        .spacing(3)
+        .areas(inner);
+        (a, b, Some(c))
+    } else {
+        let [a, b] =
+            Layout::vertical([Constraint::Length(11), Constraint::Min(0)]).areas(inner);
+        (a, b, None)
+    };
+
     if !b.enabled {
-        let [head, list] =
-            Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(inner);
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     "blocking is off",
                     Style::new().fg(theme.warn).add_modifier(Modifier::BOLD),
                 )),
-                Line::from(Span::styled("names are refused at the DNS", dim)),
-                Line::from(Span::styled("answer, before anything connects", dim)),
                 Line::from(""),
+                Line::from(Span::styled("tick a category with space —", dim)),
+                Line::from(Span::styled("names on its lists are then", dim)),
+                Line::from(Span::styled("refused at the DNS answer,", dim)),
+                Line::from(Span::styled("before anything connects", dim)),
             ])
             .style(theme.base()),
-            head,
+            stats_area,
         );
-        draw_categories(f, app, list, focused);
+        draw_categories(f, app, cats_area, true);
         return;
     }
 
@@ -2614,18 +2665,12 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
         b.blocked as f64 / b.queries as f64 * 100.0
     };
 
-    // Rows are handed out in order of what you would miss most if it were
-    // gone, and each element is skipped whole rather than drawn clipped:
-    // the split first, then the figures, then the trend, then the names.
-    // A short pane loses the tail; it never loses the top.
-    let mut rest = inner;
-
+    let mut rest = stats_area;
     if let Some(area) = take_rows(&mut rest, 2) {
         let [head, bar] =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
         // each end of the bar gets its own share, labelled at its own end —
-        // so the line reads as the bar underneath it does, red on the left
-        // and green on the right, instead of asking anyone to subtract
+        // so the line reads as the bar underneath it does
         let blocked = format!("{rate:.1}%");
         let allowed_pct = format!("{:.1}%", 100.0 - rate);
         let gap = (head.width as usize).saturating_sub(
@@ -2638,8 +2683,6 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
                 Style::new().fg(theme.deny).add_modifier(Modifier::BOLD),
             ),
         ];
-        // dropped rather than wrapped when the pane is too narrow for both:
-        // the blocked share is the one anyone opened this pane for
         if gap > 0 {
             spans.push(Span::styled(" ".repeat(gap), theme.base()));
             spans.push(Span::styled("allowed ", dim));
@@ -2648,13 +2691,9 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
                 Style::new().fg(theme.allow).add_modifier(Modifier::BOLD),
             ));
         }
+        f.render_widget(Paragraph::new(Line::from(spans)).style(theme.base()), head);
         f.render_widget(
-            Paragraph::new(Line::from(spans)).style(theme.base()),
-            head,
-        );
-        f.render_widget(
-            Paragraph::new(stacked_bar(bar.width, b.blocked, allowed, theme))
-                .style(theme.base()),
+            Paragraph::new(stacked_bar(bar.width, b.blocked, allowed, theme)).style(theme.base()),
             bar,
         );
     }
@@ -2675,15 +2714,6 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
     lines.extend(figure(theme.fg, "lookups", group(b.queries)));
     lines.extend(figure(theme.deny, "blocked", group(b.blocked)));
     lines.extend(figure(theme.allow, "allowed", group(allowed)));
-    // the three counters get a line each for their number, as the headline
-    // figures; what the lists themselves are doing is state, not a quantity
-    // you read off, so it pairs up onto two lines
-    lines.push(Line::from(vec![
-        Span::styled("lists ", dim),
-        Span::styled(b.sources.len().to_string(), Style::new().fg(theme.fg)),
-        Span::styled(" · domains ", dim),
-        Span::styled(group(b.domains as u64), Style::new().fg(theme.fg)),
-    ]));
     if let Some((exe, n)) = b.by_app.first() {
         lines.push(Line::from(vec![
             Span::styled("worst   ", dim),
@@ -2692,11 +2722,15 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
         ]));
     }
     lines.push(Line::from(vec![
+        Span::styled("lists ", dim),
+        Span::styled(b.sources.len().to_string(), Style::new().fg(theme.fg)),
+        Span::styled(" · domains ", dim),
+        Span::styled(group(b.domains as u64), Style::new().fg(theme.fg)),
+    ]));
+    lines.push(Line::from(vec![
         Span::styled("updated ", dim),
         Span::styled(
             match b.updated_at {
-                // no " ago" — this line pairs two facts in a narrow column,
-                // and the word is the first thing that pushes it off the edge
                 Some(t) => ago(now_ts().saturating_sub(t)),
                 None => "never".into(),
             },
@@ -2725,18 +2759,13 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(Paragraph::new(lines).style(theme.base()), area);
     }
 
-    // the switches: enough rows for the whole list where there is room, and
-    // a scrolling window where there isn't, but never at the cost of the
-    // recent names having nothing left
-    let cats_h = ((blocklist::CATEGORIES.len() + 1) as u16)
-        .min(rest.height.saturating_sub(3))
-        .max(4)
-        .min(rest.height);
-    if let Some(area) = take_rows(&mut rest, cats_h) {
-        draw_categories(f, app, area, focused);
-    }
+    draw_categories(f, app, cats_area, true);
 
-    let recent_area = rest;
+    // stacked and short: the switches took what was left, and the names are
+    // the part you can also get from `guardit blocklist log`
+    let Some(recent_area) = recent_area else {
+        return;
+    };
     if recent_area.height < 2 {
         return;
     }
@@ -2744,11 +2773,9 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
     if b.recent.is_empty() {
         recent.push(Line::from(Span::styled("nothing yet", dim)));
     } else {
-        // newest first, and only as many as there are rows for
         let rows = recent_area.height.saturating_sub(1) as usize;
         for entry in b.recent.iter().rev().take(rows) {
-            // who asked, when we know it — more use than how long ago, in a
-            // column with room for one of the two
+            // who asked, when we know it — more use than how long ago
             let tail = match &entry.exe {
                 Some(exe) => basename(exe).to_string(),
                 None => ago(now_ts().saturating_sub(entry.ts)),
@@ -3090,6 +3117,7 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
     }
 }
+
 
 
 

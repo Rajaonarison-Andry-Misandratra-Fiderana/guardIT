@@ -93,6 +93,11 @@
   rejected, and the DoH bootstrap names plus Mozilla's `use-application-dns.net` canary
   return NXDOMAIN. `reject`, not `drop`, so clients fall back to plain DNS at once rather
   than hanging.
+- **The grid is about access control again.** Ads & tracking had grown to a full-height
+  third of the screen — something you read, taking more room than the pane you operate — so
+  it moves to its own tab on `B`, with its headline in the status line. What is left is
+  three panes on one subject: the rules the kernel holds, what the machine has been doing,
+  and the app list beside its flow.
 - **New TUI layout**: the ads & tracking dashboard holds the right-hand column top to
   bottom; System rules and Top apps share a band above an **Application blocking** pane
   holding the app list and that app's live flow either side of a vertical rule, since

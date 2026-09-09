@@ -251,9 +251,10 @@ deny the app and allow the ports you mean.
 
 ## The TUI
 
-The blocklists hold the right-hand column top to bottom. The rest is a top band — the
-rules the kernel holds, and what the machine has been doing — over the pane you actually
-work in, whose two halves line up with the two panes above them.
+Three panes, all about the same thing: the rules the kernel holds, what the machine has
+been doing, and the pane you decide in — whose two halves line up with the two above them.
+The blocklists live in their own tab on `B`, with a headline in the status line so you can
+see at a glance whether they are on.
 
 `Tab` / `Shift+Tab` moves between the three panes; `h` / `l` moves the same way but counts
 the two halves of Application blocking separately, so `l` out of the app list lands on its
@@ -264,10 +265,14 @@ pane gets a thick border:
 |---|---|---|---|
 | left, top | **System rules** | IP/port `Rule`s (nftables-level) | `j/k` move · `space` toggle · `d` delete · `a` add · `p` presets (changes apply immediately) |
 | middle, top | **Top apps** | bar chart of the apps with the most connection attempts, over the whole audit log (reset by `f` flush), each app's total above its bar | informational |
-| right, full height | **Ads & tracking** | a bar of DNS lookups blocked vs allowed, labelled at each end with its own share, each figure under its own label — lookups, blocked, allowed — plus lists, domains loaded, last update and whether encrypted DNS is refused; then the category switches, and the names most recently blocked. A short pane drops the tail, never the top | `j/k` category · `space` block or unblock it — ticking one that has no lists on disk downloads them there and then, in the background · `u` re-download the lot |
 | bottom | **Application blocking** — one pane, two halves either side of a vertical rule, because you pick an app on the left and rule on what it is doing on the right. The rule is two columns, reproducing the seam where System rules meets Top apps, so each half runs under the pane it belongs with | | |
 | ↳ left half | **apps** | one row per app and its whole-app verdict — `(custom)` when it has rules of its own for particular ports or hosts, with the dot keeping the default's colour | `j/k` select · `a` this app's audit trail · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely · `/` filter by name (live; `Enter` keeps it, `Esc` clears) |
 | ↳ right half | **flow** | live connection history for whichever app is selected on the left | `j/k` select · `a` this app's audit trail · `y`/`n` allow/deny **exactly this row** — this app, this port and direction, and the peer it named (a row whose peer has no resolved name falls back to the port, which is all such a row says) · `Y`/`N` allow/deny **this peer's hostname**, any port (needs a resolved name; uses the exact name — `--host '*.foo.com'` on the CLI for a whole domain) |
+
+`B` opens the blocking tab: the figures, the twelve category switches, and the names most
+recently blocked. `j/k` moves, `space` blocks or unblocks a category — ticking one whose
+lists aren't on disk downloads them there and then, in the background — and `u`
+re-downloads the lot. `q`/`B` goes back.
 
 `A` opens the audit tab, holding the two "what has already happened" views side by side —
 `Tab` switches between them, `q`/`A` goes back. A pane's own `a` opens it scoped to the
