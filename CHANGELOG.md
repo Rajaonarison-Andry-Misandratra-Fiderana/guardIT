@@ -2,8 +2,14 @@
 
 ## Unreleased
 
-- **Ads and tracking blocking** (`guardit blocklist`): curated domain lists from HaGeZi,
-  StevenBlack, OISD, AdGuard and Peter Lowe, each in several levels, merged into one set
+- **Ads and tracking blocking** (`guardit blocklist`): pick **what** to block — `ads`,
+  `tracking`, `phishing`, `fake`, `crypto`, `dns-bypass`, `telemetry`, `social`,
+  `gambling`, `porn`, `piracy`, `drugs` — any number at once, from the CLI or with `space`
+  in the TUI's ads & tracking column, where ticking one downloads its lists there and then. Behind the twelve categories are 61 curated lists
+  (HaGeZi, StevenBlack, OISD, AdGuard, The Blocklist Project, Peter Lowe, AdAway, Frogeye,
+  Phishing Army, abuse.ch URLhaus, Sinfonietta, Dan Pollock); a category turns on one or
+  two well-chosen ones rather than every list touching the subject, and
+  `blocklist enable <list>` adds any of the rest on top. All of it is merged into one set
   and matched against every DNS lookup the daemon sees. A blocked name's reply is rewritten
   to NXDOMAIN in the queue, so the app never learns an address and never connects — no
   sinkhole process, no new hook, one lookup per DNS answer. A listed name covers everything
@@ -21,11 +27,16 @@
   holding the app list and that app's live flow either side of a vertical rule, since
   neither is much use without the other. The rule is two columns wide, reproducing the seam
   where System rules meets Top apps, so the app list runs under the rules and its flow
-  under the chart. The dashboard shows a bar of lookups blocked vs allowed, a sparkline
-  of blocks per 5 s, the three counters each with their number under their label, then the
-  names most recently blocked; a short pane drops the tail rather than clipping anything.
+  under the chart. The dashboard shows a bar of lookups blocked vs allowed, the three
+  counters each with their number under their label, the category switches, then the names
+  most recently blocked; a short pane drops the tail rather than clipping anything.
   The audit tab moves from `L` to **`A`** and picks up the listening ports alongside the
-  trail, `Tab` switching between them. Rule rows wrap onto two lines rather than truncating
+  trail; a pane's own `a` opens it filtered to the selected app (it was `l`). `h`/`l` now
+  move between panes the way `j`/`k` move within one, and Application blocking is a single
+  `Tab` stop that `h`/`l` navigates the two halves of. The listening-ports pane gets `/`
+  too, on the same terms as the audit trail's. Downloading lists and loading the ruleset
+  now run off the draw loop, with a spinner segment at the far right of the status line
+  saying which is running — both used to freeze the screen, one of them for a minute. Rule rows wrap onto two lines rather than truncating
   the source, the app-name column shrinks with its pane so the allow/deny status never
   falls off the edge, and the apps list is plain alphabetical (it used to float undecided
   apps to the top, which moved rows under you as decisions landed).

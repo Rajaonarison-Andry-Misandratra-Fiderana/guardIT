@@ -138,24 +138,49 @@ Curated domain blocklists, matched against every DNS lookup the daemon sees. A b
 name's answer is rewritten to NXDOMAIN, so the app never learns an address and never opens
 the connection.
 
+You choose **what** to block, not which list to install. Twelve categories, any number of
+them at once:
+
+| Category | Covers |
+|---|---|
+| `ads` | advertising |
+| `tracking` | trackers and analytics, including CNAME-cloaked first-party ones |
+| `phishing` | malware, phishing, scam, ransomware |
+| `fake` | fake shops, fake streaming, fake support |
+| `crypto` | cryptojacking and mining |
+| `dns-bypass` | DoH, VPN and proxy endpoints that route around filtering |
+| `telemetry` | device and OS telemetry (Windows/Office, Apple, Samsung, Xiaomi, Amazon, TikTok…) |
+| `social` | social networks |
+| `gambling` | gambling and betting |
+| `porn` | pornography |
+| `piracy` | piracy and torrents |
+| `drugs` | drug and vaping shops |
+
 ```
-sudo guardit blocklist on                   # enables hagezi:pro
+sudo guardit blocklist on                    # on, covering ads + phishing
+sudo guardit blocklist enable porn           # block another category
+sudo guardit blocklist enable gambling
+sudo guardit blocklist disable porn
 sudo guardit blocklist update                # download now (the daemon also does it daily)
-guardit blocklist sources                    # the catalogue, * = enabled
-sudo guardit blocklist enable hagezi:tif     # add malware/phishing coverage
-sudo guardit blocklist disable hagezi:tif
+guardit blocklist categories                 # the twelve, * = blocked
 guardit blocklist status                     # what's on, domains loaded, how stale
 guardit blocklist check ads.example.com      # would this be blocked, right now
 sudo guardit blocklist allow cdn.example.com # never block this name, nor anything under it
 sudo guardit blocklist off
 ```
 
-Lists come from HaGeZi, StevenBlack, OISD, AdGuard and Peter Lowe, each in several levels
-(`hagezi:light` … `hagezi:ultimate`, plus focused ones: `tif` for malware/phishing, `fake`,
-`gambling`, `nsfw`, `native.tiktok`, `native.winoffice`; `stevenblack:porn`,
-`stevenblack:social`, and so on). `guardit blocklist sources` lists them all with what each
-covers. Enabled lists are merged into one set, so several can be on at once. Downloads live
-in `/var/lib/guardit/blocklists/`.
+In the TUI, the ads & tracking column carries the same switches: `Tab` to it, `j/k` to a
+category, `space` to block or unblock it. Ticking a category whose lists aren't on disk
+downloads them in the background and the numbers move as soon as they land; `u`
+re-downloads everything.
+
+Behind the categories are 61 lists from HaGeZi, StevenBlack, OISD, AdGuard, The Blocklist
+Project, Peter Lowe, AdAway, Frogeye, Phishing Army, abuse.ch URLhaus, Sinfonietta and Dan
+Pollock. A category turns on one or two well-chosen ones rather than every list that
+touches the subject — the catalogue overlaps heavily, and merging five lists covering the
+same domains costs the memory five times for the coverage once. `guardit blocklist sources`
+lists all 61 grouped by category, and `guardit blocklist enable <list>` adds any of them on
+top of your categories. Downloads live in `/var/lib/guardit/blocklists/`.
 
 A listed name covers everything under it, and an allowlist entry beats the lists and
 rescues its own subtree — so `allow good.example.com` still works with `example.com`
@@ -179,7 +204,8 @@ run your own encrypted resolver on purpose.
 ```toml
 [blocklist]
 enabled = true
-sources = ["hagezi:pro", "hagezi:tif"]
+categories = ["ads", "phishing", "telemetry"]
+sources = ["oisd:small"]     # extra lists on top of the categories
 allow = ["cdn.example.com"]
 block_encrypted_dns = true
 update_hours = 24            # 0 to never auto-update
@@ -200,17 +226,21 @@ deny the app and allow the ports you mean.
 
 The blocklists hold the right-hand column top to bottom. The rest is a top band — the
 rules the kernel holds, and what the machine has been doing — over the pane you actually
-work in, whose two halves line up with the two panes above them. `Tab` / `Shift+Tab` moves
-between the focusable panes, the focused one gets a thick border:
+work in, whose two halves line up with the two panes above them.
+
+`Tab` / `Shift+Tab` moves between the three panes; `h` / `l` moves the same way but counts
+the two halves of Application blocking separately, so `l` out of the app list lands on its
+flow and `l` again leaves the pane. `j` / `k` moves within whatever is focused. The focused
+pane gets a thick border:
 
 | Where | Pane | What it shows | Keys |
 |---|---|---|---|
 | left, top | **System rules** | IP/port `Rule`s (nftables-level) | `j/k` move · `space` toggle · `d` delete · `a` add · `p` presets (changes apply immediately) |
 | middle, top | **Top apps** | bar chart of the apps with the most connection attempts, over the whole audit log (reset by `f` flush), each app's total above its bar | informational |
-| right, full height | **Ads & tracking** | a bar of DNS lookups blocked vs allowed with the rate above it, a sparkline of blocks per 5 s, then each figure under its own label — lookups, blocked, allowed — plus lists, domains loaded, last update and whether encrypted DNS is refused, then the names most recently blocked. A short pane drops the tail, never the top | informational |
+| right, full height | **Ads & tracking** | a bar of DNS lookups blocked vs allowed, labelled at each end with its own share, each figure under its own label — lookups, blocked, allowed — plus lists, domains loaded, last update and whether encrypted DNS is refused; then the category switches, and the names most recently blocked. A short pane drops the tail, never the top | `j/k` category · `space` block or unblock it — ticking one that has no lists on disk downloads them there and then, in the background · `u` re-download the lot |
 | bottom | **Application blocking** — one pane, two halves either side of a vertical rule, because you pick an app on the left and rule on what it is doing on the right. The rule is two columns, reproducing the seam where System rules meets Top apps, so each half runs under the pane it belongs with | | |
-| ↳ left half | **apps** | one row per app, its whole-app default, and how many per-port overrides it has | `j/k` select · `Enter` jump to the flow half · `l` this app's audit trail · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely · `/` filter by name (live; `Enter` keeps it, `Esc` clears) |
-| ↳ right half | **flow** | live connection history for whichever app is selected on the left | `j/k` select · `y`/`n` allow/deny **this port and direction only** (remembered as a per-port rule) · `Y`/`N` allow/deny **this peer's hostname**, any port (needs a resolved name; uses the exact name — `--host '*.foo.com'` on the CLI for a whole domain) |
+| ↳ left half | **apps** | one row per app, its whole-app default, and how many per-port overrides it has | `j/k` select · `a` this app's audit trail · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely · `/` filter by name (live; `Enter` keeps it, `Esc` clears) |
+| ↳ right half | **flow** | live connection history for whichever app is selected on the left | `j/k` select · `a` this app's audit trail · `y`/`n` allow/deny **this port and direction only** (remembered as a per-port rule) · `Y`/`N` allow/deny **this peer's hostname**, any port (needs a resolved name; uses the exact name — `--host '*.foo.com'` on the CLI for a whole domain) |
 
 `A` opens the audit tab, holding the two "what has already happened" views side by side —
 `Tab` switches between them, `q`/`A` goes back:
@@ -218,9 +248,14 @@ between the focusable panes, the focused one gets a thick border:
 | Pane | What it shows | Keys |
 |---|---|---|
 | **Audit** | the full unthrottled trail from `history.jsonl` | `j/k` move · `/` filter by port, ip or name (live; a number is matched against the port, anything else as a substring of the address, resolved name or app path) · `f` flush with confirm |
-| **Listening ports** | every LISTEN/bound local socket, who owns it, and real bind conflicts (rare — the kernel already prevents most) | `j/k` select · `l` this app's log · `y`/`n` allow/deny **this port only** |
+| **Listening ports** | every LISTEN/bound local socket, who owns it, and real bind conflicts (rare — the kernel already prevents most) | `j/k` select · `/` filter by port, address or owner · `a` this app's audit trail · `y`/`n` allow/deny **this port only** |
 
 Other keys: `t` cycles color theme (remembered across restarts), `q` quits.
+
+Downloading lists and loading the ruleset into the kernel both run off the draw loop, with
+a spinner segment at the far right of the status line saying which is happening — a
+category can pull half a dozen lists and one of them is 39 MB, and a frozen screen for a
+minute is indistinguishable from a crash.
 
 ## License
 

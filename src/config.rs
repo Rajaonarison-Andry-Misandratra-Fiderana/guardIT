@@ -230,7 +230,13 @@ fn default_update_hours() -> u32 {
 pub struct BlocklistConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// `id:level` keys from blocklist::SOURCES, merged into one set
+    /// what to block, in blocklist::CATEGORIES terms — "ads", "phishing",
+    /// "porn"… Each enables the lists it names; several at once is the
+    /// normal case
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// extra `id:level` keys from blocklist::SOURCES, on top of whatever the
+    /// categories bring in — the escape hatch for a list no category picks
     #[serde(default)]
     pub sources: Vec<String>,
     /// names that are never blocked, whatever the lists say — an entry also
@@ -251,6 +257,7 @@ impl Default for BlocklistConfig {
     fn default() -> Self {
         BlocklistConfig {
             enabled: false,
+            categories: Vec::new(),
             sources: Vec::new(),
             allow: Vec::new(),
             block_encrypted_dns: true,

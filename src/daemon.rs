@@ -556,22 +556,24 @@ pub fn blocked_recent() -> Vec<(u64, String)> {
 
 /// the dashboard payload, assembled from the live counters and the config
 pub fn blocklist_stats(cfg: &crate::config::BlocklistConfig) -> ipc::BlocklistStats {
+    // what is actually loaded, which is the categories' lists plus anything
+    // added by hand — not the hand-added ones alone
+    let sources = blocklist::effective_sources(cfg);
     ipc::BlocklistStats {
         enabled: cfg.enabled,
         encrypted_dns_blocked: cfg.enabled && cfg.block_encrypted_dns,
-        sources: cfg.sources.clone(),
         domains: BLOCKLIST.read().unwrap().len(),
         queries: DNS_TOTAL.load(Ordering::Relaxed),
         blocked: BLOCKED_TOTAL.load(Ordering::Relaxed),
         recent: blocked_recent(),
         // the oldest list is the one that decides how stale the set is, and
         // a never-downloaded list makes the whole thing unknown
-        updated_at: cfg
-            .sources
+        updated_at: sources
             .iter()
             .map(|k| blocklist::cached_at(k))
             .try_fold(u64::MAX, |acc, t| t.map(|t| acc.min(t)))
-            .filter(|_| !cfg.sources.is_empty()),
+            .filter(|_| !sources.is_empty()),
+        sources,
     }
 }
 
@@ -1473,11 +1475,18 @@ fn handle_client(
     loop {
         match ipc::read_msg::<ClientMsg>(&mut reader) {
             Ok(Some(msg)) => {
+                let reloaded = matches!(msg, ClientMsg::Reload);
                 if let Some(rules) = handle_client_msg(msg, app_rules, pending_registry) {
                     // broadcast, not a direct reply — every connected client
                     // (this one included, via its own rx below) should see
                     // a rule change made by any of them
                     broadcast(subscribers, ServerMsg::AppRules(rules));
+                }
+                if reloaded {
+                    // so a category ticked in the TUI shows its new domain
+                    // count at once, rather than on the next 5s scan
+                    let stats = blocklist_stats(&BLOCKLIST_CFG.lock().unwrap().clone());
+                    broadcast(subscribers, ServerMsg::Blocklist(stats));
                 }
             }
             Ok(None) => return, // client disconnected
@@ -1520,6 +1529,11 @@ fn handle_client_msg(
         }
         ClientMsg::Reload => {
             let fresh = Config::load();
+            // unconditional, unlike the mtime poll's check: Reload is sent
+            // after a download too, where the *files* changed under an
+            // unchanged config section and a "did the section move?" test
+            // would keep serving the lists we already had
+            reload_blocklist(&fresh);
             *app_rules.lock().unwrap() = fresh.app_rule.clone();
             Some(fresh.app_rule)
         }

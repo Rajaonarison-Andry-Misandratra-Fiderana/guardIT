@@ -1,3 +1,4 @@
+use crate::blocklist;
 use crate::config;
 use crate::config::now_ts;
 use crate::config::{Action, AppRule, Config, Direction, Proto, Rule, config_path, match_rule};
@@ -21,6 +22,7 @@ use ratatui::{Frame, Terminal};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Read as _, stdout};
+use std::sync::mpsc;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Instant;
@@ -320,6 +322,8 @@ enum Focus {
     Apps,
     Flow,
     Rules,
+    /// what the blocklists block: the categories are toggled here
+    Blocking,
     /// listening ports — inside the log tab, not the grid: it answers the
     /// same "what has been going on" question the audit trail does, and
     /// pairing them frees the grid's third column for the live flow
@@ -336,16 +340,23 @@ fn in_log_tab(focus: Focus) -> bool {
     matches!(focus, Focus::AppLog | Focus::Conflicts)
 }
 
-// Grid tab order: system rules -> apps -> network flow, then back. Top apps
-// and the blocking dashboard are informational (nothing to focus), and the
-// audit tab is reached only via the global `A` key or a pane's `l` — a
-// drill-down, not a pane you'd casually cycle through.
+// Two rings over the same panes.
+//
+// Tab walks the panes as a user thinks of them: system rules, application
+// blocking, ads & tracking. Application blocking is one stop even though it
+// holds two lists, because it is one pane with one border.
+//
+// h/l walks every stop, the halves of application blocking included, in the
+// order they sit on screen — so `l` out of the app list lands on its flow,
+// and `l` again leaves the pane. Top apps is informational (nothing to
+// focus), and the audit tab is reached only via the global `A` key or a
+// pane's `a` — a drill-down, not a pane you'd casually cycle through.
 impl Focus {
     fn next(self) -> Focus {
         match self {
             Focus::Rules => Focus::Apps,
-            Focus::Apps => Focus::Flow,
-            Focus::Flow => Focus::Rules,
+            Focus::Apps | Focus::Flow => Focus::Blocking,
+            Focus::Blocking => Focus::Rules,
             // inside the tab, Tab is a toggle between its two halves
             Focus::AppLog => Focus::Conflicts,
             Focus::Conflicts => Focus::AppLog,
@@ -354,9 +365,34 @@ impl Focus {
 
     fn prev(self) -> Focus {
         match self {
-            Focus::Rules => Focus::Flow,
+            Focus::Rules => Focus::Blocking,
+            Focus::Apps | Focus::Flow => Focus::Rules,
+            Focus::Blocking => Focus::Apps,
+            Focus::AppLog => Focus::Conflicts,
+            Focus::Conflicts => Focus::AppLog,
+        }
+    }
+
+    /// `l`: the next stop to the right, counting the two halves of
+    /// application blocking separately
+    fn right(self) -> Focus {
+        match self {
+            Focus::Rules => Focus::Apps,
+            Focus::Apps => Focus::Flow,
+            Focus::Flow => Focus::Blocking,
+            Focus::Blocking => Focus::Rules,
+            Focus::AppLog => Focus::Conflicts,
+            Focus::Conflicts => Focus::AppLog,
+        }
+    }
+
+    /// `h`: the same, the other way
+    fn left(self) -> Focus {
+        match self {
+            Focus::Rules => Focus::Blocking,
             Focus::Apps => Focus::Rules,
             Focus::Flow => Focus::Apps,
+            Focus::Blocking => Focus::Flow,
             Focus::AppLog => Focus::Conflicts,
             Focus::Conflicts => Focus::AppLog,
         }
@@ -367,11 +403,10 @@ enum Mode {
     Browse,
     Add(String),
     Preset(usize),
-    /// keystrokes go to `App::apps_filter` instead of the Apps pane's own
-    /// keys — the filter itself stays applied after leaving this mode
+    /// keystrokes go to the focused pane's filter instead of its own keys.
+    /// Which filter that is follows the focus (`filter_buf`); the filter
+    /// itself stays applied after leaving this mode
     Filter,
-    /// the same, for the log tab's own filter (`App::log_filter`)
-    LogFilter,
 }
 
 /// newest first — same reader as `guardit log-app`, just rendered live
@@ -455,11 +490,6 @@ struct AppRow {
 }
 
 const FLOW_CAP: usize = 200;
-/// one sparkline bar per this much wall time. Matched to the daemon's own
-/// stats cadence (daemon::LISTEN_SCAN_INTERVAL) — sampling faster would just
-/// draw the same number spread across several bars
-const BLOCKED_SAMPLE: std::time::Duration = std::time::Duration::from_secs(5);
-const BLOCKED_HIST_CAP: usize = 120;
 
 /// `flow` is global across all apps (kept after decision so the pane reads as
 /// a history); the Apps pane's selection decides which slice Flow shows.
@@ -508,13 +538,27 @@ struct App {
     app_log_all: Vec<FlowWire>,
     /// port / ip / name the log tab is narrowed to; empty = all
     log_filter: String,
+    /// every listening socket the daemon reported; `listening` is this
+    /// narrowed by `listening_filter`, and is what the pane renders and what
+    /// its selection indexes into
+    listening_all: Vec<ipc::ListenEntry>,
+    /// port / address / owner the listening pane is narrowed to; empty = all
+    listening_filter: String,
     blocklist: ipc::BlocklistStats,
-    /// blocked lookups per sampling window, oldest first — sampled on our own
-    /// clock rather than on the daemon's updates, so a window in which
-    /// nothing was blocked is a zero rather than a gap
-    blocked_hist: VecDeque<u64>,
-    blocked_prev: u64,
-    blocked_sampled_at: Instant,
+    /// which row of the category list is selected
+    blocking_state: ListState,
+    /// the one slow thing that may be running: a list download, or a
+    /// ruleset reload. Both are seconds-to-minutes and both used to happen
+    /// inside the draw loop, where they read as a freeze
+    busy: Option<Busy>,
+}
+
+/// A job running off the draw loop. It reports one line back and hangs up;
+/// until then the footer carries a segment saying what is going on.
+struct Busy {
+    label: &'static str,
+    started: Instant,
+    rx: mpsc::Receiver<String>,
 }
 
 /// total rx/tx bytes across every interface except loopback, from
@@ -636,10 +680,11 @@ fn new_app(cfg: Config) -> App {
         apps_filter: String::new(),
         app_log_all: Vec::new(),
         log_filter: String::new(),
+        listening_all: Vec::new(),
+        listening_filter: String::new(),
         blocklist: ipc::BlocklistStats::default(),
-        blocked_hist: VecDeque::new(),
-        blocked_prev: 0,
-        blocked_sampled_at: Instant::now(),
+        blocking_state: ListState::default().with_selected(Some(0)),
+        busy: None,
     };
     if !app.cfg.rule.is_empty() {
         app.state.select(Some(0));
@@ -673,6 +718,7 @@ pub fn run(cfg: Config) {
                 }
             }
             drain_ipc(&mut app);
+            drain_busy(&mut app);
             let now = Instant::now();
             let elapsed = now.duration_since(app.net_prev_at).as_secs_f64();
             if elapsed > 0.05 {
@@ -694,19 +740,6 @@ pub fn run(cfg: Config) {
                     }
                 }
             }
-            // the daemon only pushes blocklist counters when they move, so
-            // sampling on its messages would draw a quiet minute as no data
-            // at all instead of as zeroes. One bar per window, on our clock.
-            if now.duration_since(app.blocked_sampled_at) >= BLOCKED_SAMPLE {
-                app.blocked_sampled_at = now;
-                let total = app.blocklist.blocked;
-                app.blocked_hist
-                    .push_back(total.saturating_sub(app.blocked_prev));
-                app.blocked_prev = total;
-                while app.blocked_hist.len() > BLOCKED_HIST_CAP {
-                    app.blocked_hist.pop_front();
-                }
-            }
             continue;
         }
         if let Event::Key(key) = event::read().expect("read event") {
@@ -714,17 +747,24 @@ pub fn run(cfg: Config) {
                 continue;
             }
             app.msg.clear();
-            if (key.code == KeyCode::Tab || key.code == KeyCode::BackTab)
+            // h/l move like j/k do, one axis over: between panes, and
+            // between the two halves of application blocking
+            let move_focus = match key.code {
+                KeyCode::Tab => Some(Focus::next as fn(Focus) -> Focus),
+                KeyCode::BackTab => Some(Focus::prev as fn(Focus) -> Focus),
+                KeyCode::Char('l') | KeyCode::Right => Some(Focus::right as fn(Focus) -> Focus),
+                KeyCode::Char('h') | KeyCode::Left => Some(Focus::left as fn(Focus) -> Focus),
+                _ => None,
+            };
+            if let Some(step) = move_focus
                 && !matches!(
                     app.mode,
-                    Mode::Add(_) | Mode::Preset(_) | Mode::Filter | Mode::LogFilter
+                    Mode::Add(_) | Mode::Preset(_) | Mode::Filter
                 )
+                // a confirmation is answered before anything else moves
+                && !app.app_log_confirm_flush
             {
-                app.focus = if key.code == KeyCode::BackTab {
-                    app.focus.prev()
-                } else {
-                    app.focus.next()
-                };
+                app.focus = step(app.focus);
                 if app.apps_state.selected().is_none() && !app.apps.is_empty() {
                     app.apps_state.select(Some(0));
                     reset_flow_selection(&mut app);
@@ -732,7 +772,7 @@ pub fn run(cfg: Config) {
                 continue;
             }
             if key.code == KeyCode::Char('t')
-                && !matches!(app.mode, Mode::Add(_) | Mode::Filter | Mode::LogFilter)
+                && !matches!(app.mode, Mode::Add(_) | Mode::Filter)
             {
                 app.theme_idx = (app.theme_idx + 1) % THEMES.len();
                 save_theme_idx(app.theme_idx);
@@ -741,7 +781,7 @@ pub fn run(cfg: Config) {
             // jumpable to from anywhere, same idea as `t` — the audit tab is
             // its own tab, not nested under any pane's local keys
             if key.code == KeyCode::Char('A')
-                && !matches!(app.mode, Mode::Add(_) | Mode::Filter | Mode::LogFilter)
+                && !matches!(app.mode, Mode::Add(_) | Mode::Filter)
             {
                 if in_log_tab(app.focus) {
                     close_app_log(&mut app);
@@ -781,7 +821,7 @@ pub fn run(cfg: Config) {
                     // only ever set from the Apps pane / the log tab, and Tab
                     // can't leave either — but if one got here, Browse is the
                     // safe read
-                    Mode::Filter | Mode::LogFilter => app.mode = Mode::Browse,
+                    Mode::Filter => app.mode = Mode::Browse,
                     Mode::Add(buf) => match key.code {
                         KeyCode::Esc => app.mode = Mode::Browse,
                         KeyCode::Enter => {
@@ -803,22 +843,27 @@ pub fn run(cfg: Config) {
                     },
                 },
                 // every keystroke narrows the list live, so you see what
-                // you're typing towards instead of committing blind
-                Focus::Apps if matches!(app.mode, Mode::Filter) => {
+                // you're typing towards instead of committing blind. One
+                // branch for every pane that has a filter — which one is
+                // being typed into follows the focus
+                _ if matches!(app.mode, Mode::Filter) => {
+                    let Some(buf) = filter_buf(&mut app) else {
+                        app.mode = Mode::Browse;
+                        continue;
+                    };
                     match key.code {
                         KeyCode::Enter => app.mode = Mode::Browse,
                         KeyCode::Esc => {
-                            app.apps_filter.clear();
+                            buf.clear();
                             app.mode = Mode::Browse;
                         }
                         KeyCode::Backspace => {
-                            app.apps_filter.pop();
+                            buf.pop();
                         }
-                        KeyCode::Char(c) => app.apps_filter.push(c),
+                        KeyCode::Char(c) => buf.push(c),
                         _ => continue,
                     }
-                    rebuild_apps(&mut app);
-                    reset_flow_selection(&mut app);
+                    apply_filter(&mut app);
                 }
                 Focus::Apps => match key.code {
                     KeyCode::Char('q') => break,
@@ -827,8 +872,7 @@ pub fn run(cfg: Config) {
                     // from anywhere in the pane, not only while typing
                     KeyCode::Esc if !app.apps_filter.is_empty() => {
                         app.apps_filter.clear();
-                        rebuild_apps(&mut app);
-                        reset_flow_selection(&mut app);
+                        apply_filter(&mut app);
                     }
                     KeyCode::Char('j') | KeyCode::Down => apps_select(&mut app, false),
                     KeyCode::Char('k') | KeyCode::Up => apps_select(&mut app, true),
@@ -842,7 +886,7 @@ pub fn run(cfg: Config) {
                         app.focus = Focus::Flow;
                         reset_flow_selection(&mut app);
                     }
-                    KeyCode::Char('l') => {
+                    KeyCode::Char('a') => {
                         if let Some(exe) = app
                             .apps_state
                             .selected()
@@ -854,6 +898,22 @@ pub fn run(cfg: Config) {
                     }
                     _ => {}
                 },
+                Focus::Blocking => match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('j') | KeyCode::Down => app.blocking_state.select(step(
+                        app.blocking_state.selected(),
+                        blocklist::CATEGORIES.len(),
+                        false,
+                    )),
+                    KeyCode::Char('k') | KeyCode::Up => app.blocking_state.select(step(
+                        app.blocking_state.selected(),
+                        blocklist::CATEGORIES.len(),
+                        true,
+                    )),
+                    KeyCode::Char(' ') => toggle_category(&mut app),
+                    KeyCode::Char('u') => update_blocklists(&mut app),
+                    _ => {}
+                },
                 Focus::Flow => match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('j') | KeyCode::Down => flow_select(&mut app, false),
@@ -863,7 +923,7 @@ pub fn run(cfg: Config) {
                     // uppercase = wider scope: the peer's name instead of the port
                     KeyCode::Char('Y') => flow_decide_host(&mut app, Action::Allow),
                     KeyCode::Char('N') => flow_decide_host(&mut app, Action::Deny),
-                    KeyCode::Char('l') => {
+                    KeyCode::Char('a') => {
                         if let Some(exe) = app
                             .apps_state
                             .selected()
@@ -877,11 +937,16 @@ pub fn run(cfg: Config) {
                 },
                 Focus::Conflicts => match key.code {
                     KeyCode::Char('q') => close_app_log(&mut app),
+                    KeyCode::Char('/') => app.mode = Mode::Filter,
+                    KeyCode::Esc if !app.listening_filter.is_empty() => {
+                        app.listening_filter.clear();
+                        apply_filter(&mut app);
+                    }
                     KeyCode::Char('j') | KeyCode::Down => conflicts_select(&mut app, false),
                     KeyCode::Char('k') | KeyCode::Up => conflicts_select(&mut app, true),
                     KeyCode::Char('y') => conflicts_decide(&mut app, Action::Allow),
                     KeyCode::Char('n') => conflicts_decide(&mut app, Action::Deny),
-                    KeyCode::Char('l') => {
+                    KeyCode::Char('a') => {
                         if let Some(exe) = app
                             .conflicts_state
                             .selected()
@@ -910,27 +975,12 @@ pub fn run(cfg: Config) {
                     KeyCode::Char('n') | KeyCode::Esc => app.app_log_confirm_flush = false,
                     _ => {}
                 },
-                Focus::AppLog if matches!(app.mode, Mode::LogFilter) => {
-                    match key.code {
-                        KeyCode::Enter => app.mode = Mode::Browse,
-                        KeyCode::Esc => {
-                            app.log_filter.clear();
-                            app.mode = Mode::Browse;
-                        }
-                        KeyCode::Backspace => {
-                            app.log_filter.pop();
-                        }
-                        KeyCode::Char(c) => app.log_filter.push(c),
-                        _ => continue,
-                    }
-                    apply_log_filter(&mut app);
-                }
                 Focus::AppLog => match key.code {
                     KeyCode::Char('q') => close_app_log(&mut app),
-                    KeyCode::Char('/') => app.mode = Mode::LogFilter,
+                    KeyCode::Char('/') => app.mode = Mode::Filter,
                     KeyCode::Esc if !app.log_filter.is_empty() => {
                         app.log_filter.clear();
-                        apply_log_filter(&mut app);
+                        apply_filter(&mut app);
                     }
                     KeyCode::Char('f') => app.app_log_confirm_flush = true,
                     KeyCode::Char('j') | KeyCode::Down => app.app_log_state.select(step(
@@ -971,9 +1021,9 @@ fn drain_ipc(app: &mut App) {
             } => {
                 app.app_rules = app_rules;
                 app.flow = flow;
-                app.listening = listening;
+                app.listening_all = listening;
                 app.blocklist = blocklist;
-                sort_listening(&mut app.listening);
+                apply_listening_filter(app);
             }
             ServerMsg::Blocklist(stats) => app.blocklist = stats,
             ServerMsg::FlowNew(w) => {
@@ -987,8 +1037,8 @@ fn drain_ipc(app: &mut App) {
             }
             ServerMsg::AppRules(rules) => app.app_rules = rules,
             ServerMsg::Listening(entries) => {
-                app.listening = entries;
-                sort_listening(&mut app.listening);
+                app.listening_all = entries;
+                apply_listening_filter(app);
             }
         }
     }
@@ -1091,9 +1141,8 @@ fn reset_flow_selection(app: &mut App) {
 fn save_rules(app: &mut App) {
     let rule = app.cfg.rule.clone();
     app.cfg = Config::update(|fresh| fresh.rule = rule);
-    if let Err(e) = ruleset::apply(&app.cfg) {
-        app.msg = format!("apply failed: {e}");
-    }
+    let cfg = Config::load();
+    apply_ruleset(app, cfg);
 }
 
 /// wrap-around cursor move shared by every list/table in the UI
@@ -1167,6 +1216,59 @@ fn log_row_matches(e: &FlowWire, needle: &str) -> bool {
         || e.exe.to_lowercase().contains(&needle)
 }
 
+/// Which text field the keystrokes of `Mode::Filter` land in — the pane
+/// with the focus owns the filter, so there is one mode rather than one per
+/// pane. `None` for panes that have no filter, which cannot enter the mode.
+fn filter_buf(app: &mut App) -> Option<&mut String> {
+    match app.focus {
+        Focus::Apps => Some(&mut app.apps_filter),
+        Focus::AppLog => Some(&mut app.log_filter),
+        Focus::Conflicts => Some(&mut app.listening_filter),
+        _ => None,
+    }
+}
+
+/// re-narrows whatever the focused pane shows, after its filter changed
+fn apply_filter(app: &mut App) {
+    match app.focus {
+        Focus::Apps => {
+            rebuild_apps(app);
+            reset_flow_selection(app);
+        }
+        Focus::AppLog => apply_log_filter(app),
+        Focus::Conflicts => apply_listening_filter(app),
+        _ => {}
+    }
+}
+
+/// Narrows the listening pane to one port, address or owner, on the same
+/// terms as the audit trail's filter: a digits-only needle is the port as a
+/// whole number, anything else a substring of the bound address or the exe.
+fn apply_listening_filter(app: &mut App) {
+    app.listening = app
+        .listening_all
+        .iter()
+        .filter(|e| {
+            let needle = &app.listening_filter;
+            if needle.is_empty() {
+                return true;
+            }
+            if needle.chars().all(|c| c.is_ascii_digit()) {
+                return e.port.to_string() == *needle;
+            }
+            let needle = needle.to_lowercase();
+            e.addr.to_lowercase().contains(&needle) || e.exe.to_lowercase().contains(&needle)
+        })
+        .cloned()
+        .collect();
+    sort_listening(&mut app.listening);
+    app.conflicts_state.select(if app.listening.is_empty() {
+        None
+    } else {
+        Some(0)
+    });
+}
+
 fn apply_log_filter(app: &mut App) {
     app.app_log = if app.log_filter.is_empty() {
         app.app_log_all.clone()
@@ -1188,6 +1290,8 @@ fn close_app_log(app: &mut App) {
     app.focus = app.prev_focus;
     app.app_log_filter = None;
     app.log_filter.clear();
+    app.listening_filter.clear();
+    apply_listening_filter(app);
     app.app_log_confirm_flush = false;
 }
 
@@ -1504,6 +1608,7 @@ fn focus_accent(focus: Focus, theme: Theme) -> Color {
         Focus::Apps => theme.accents[1],
         Focus::Conflicts => theme.accents[2],
         Focus::Flow => theme.accents[4],
+        Focus::Blocking => theme.accents[3],
         Focus::AppLog => theme.chart,
     }
 }
@@ -1515,11 +1620,40 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let theme = THEMES[app.theme_idx];
     let base = theme.base();
 
-    if matches!(app.mode, Mode::Filter | Mode::LogFilter) {
-        let (label, buf) = if matches!(app.mode, Mode::Filter) {
-            (" FILTER APPS ", &app.apps_filter)
-        } else {
-            (" FILTER LOG — port, ip or name ", &app.log_filter)
+    // a job running off the draw loop gets the far right of the status line,
+    // as its own segment: same shape as the focus segment on the left, in
+    // the warn colour because it is a state that will pass. Reserved before
+    // anything else is laid out, so a long key list is what gets cut, not
+    // the only thing on screen saying the app is busy
+    let area = match &app.busy {
+        Some(busy) => {
+            // 10 frames at ~100ms, from the job's own clock — without it a
+            // minute-long download is indistinguishable from a freeze
+            const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let frame = SPINNER[(busy.started.elapsed().as_millis() / 100) as usize % SPINNER.len()];
+            let text = format!(" {frame} {}… ", busy.label);
+            let w = (text.chars().count() as u16).min(area.width);
+            let [keys, seg] =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(w)]).areas(area);
+            f.render_widget(
+                Paragraph::new(text).style(
+                    Style::new()
+                        .bg(theme.warn)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                seg,
+            );
+            keys
+        }
+        None => area,
+    };
+
+    if matches!(app.mode, Mode::Filter) {
+        let (label, buf) = match app.focus {
+            Focus::AppLog => (" FILTER AUDIT — port, ip or name ", &app.log_filter),
+            Focus::Conflicts => (" FILTER PORTS — port, address or app ", &app.listening_filter),
+            _ => (" FILTER APPS ", &app.apps_filter),
         };
         let spans = vec![
             Span::styled(
@@ -1557,38 +1691,45 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Focus::Apps => "APPS",
         Focus::Conflicts => "LISTEN",
         Focus::Flow => "FLOW",
-        Focus::AppLog => "LOG",
+        Focus::Blocking => "BLOCK",
+        Focus::AppLog => "AUDIT",
     };
     let focus_color = focus_accent(app.focus, theme);
     let mut keys: Vec<(&str, &str)> = match (app.focus, &app.mode) {
         (Focus::Apps, _) => vec![
-            ("Tab", "pane"),
+            ("h/l", "pane"),
             ("j/k", "select"),
-            ("Enter", "flow"),
-            ("l", "audit"),
+            ("a", "audit app"),
             ("y/n", "allow/deny app"),
             ("space", "toggle"),
             ("d", "remove"),
             ("/", "filter"),
         ],
         (Focus::Flow, _) => vec![
-            ("Tab", "pane"),
+            ("h/l", "pane"),
             ("j/k", "select"),
-            ("l", "audit"),
+            ("a", "audit app"),
             ("y/n", "allow/deny port"),
             ("Y/N", "allow/deny host"),
         ],
+        (Focus::Blocking, _) => vec![
+            ("h/l", "pane"),
+            ("j/k", "category"),
+            ("space", "block/unblock"),
+            ("u", "update lists"),
+        ],
         (Focus::Conflicts, _) => vec![
-            ("Tab", "log"),
+            ("h/l", "audit"),
             ("j/k", "select"),
-            ("l", "this app"),
+            ("a", "audit app"),
             ("y/n", "allow/deny port"),
+            ("/", "filter"),
         ],
         (Focus::AppLog, _) if app.app_log_confirm_flush => {
             vec![("y", "confirm flush"), ("n", "cancel")]
         }
         (Focus::AppLog, _) => vec![
-            ("Tab", "ports"),
+            ("h/l", "ports"),
             ("j/k", "move"),
             ("/", "filter"),
             ("f", "flush"),
@@ -1597,7 +1738,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             vec![("j/k", "move"), ("Enter", "add"), ("Esc", "cancel")]
         }
         (Focus::Rules, _) => vec![
-            ("Tab", "pane"),
+            ("h/l", "pane"),
             ("j/k", "move"),
             ("space", "toggle"),
             ("d", "delete"),
@@ -2127,6 +2268,144 @@ fn stacked_bar(width: u16, blocked: u64, allowed: u64, theme: Theme) -> Line<'st
 
 /// The ads / tracking column: everything the blocklists are doing.
 ///
+/// Blocks or unblocks the selected category.
+///
+/// Written straight to rules.toml rather than sent over IPC: nothing in the
+/// kernel ruleset changes, and the daemon re-reads the file within seconds
+/// and reloads the lists itself. The TUI's own copy is refreshed from what
+/// `Config::update` returns, so a concurrent write by the daemon can't be
+/// clobbered.
+fn toggle_category(app: &mut App) {
+    let Some(cat) = app
+        .blocking_state
+        .selected()
+        .and_then(|i| blocklist::CATEGORIES.get(i))
+    else {
+        return;
+    };
+    let key = cat.key.to_string();
+    let was_enabled = app.cfg.blocklist.enabled;
+    app.cfg = Config::update(|cfg| {
+        if let Some(i) = cfg.blocklist.categories.iter().position(|k| *k == key) {
+            cfg.blocklist.categories.remove(i);
+        } else {
+            cfg.blocklist.categories.push(key.clone());
+            // turning a category on with blocking off would look like
+            // nothing happened at all
+            cfg.blocklist.enabled = true;
+        }
+    });
+    // the encrypted-dns half of blocking lives in the kernel ruleset, so
+    // switching blocking on here has to reload it — the daemon's own
+    // re-read only covers the lists
+    if !was_enabled && app.cfg.blocklist.enabled {
+        let cfg = Config::load();
+        apply_ruleset(app, cfg);
+    }
+    if let Some(ipc) = &mut app.ipc {
+        ipc.send(&ClientMsg::Reload);
+    }
+    if !app.cfg.blocklist.categories.iter().any(|k| *k == cat.key) {
+        app.msg = format!("no longer blocking {}", cat.key);
+        return;
+    }
+    // a category whose lists are not on disk yet blocks nothing, so ticking
+    // it has to fetch them — otherwise the box is ticked, the numbers do not
+    // move, and nothing is actually blocked until someone presses u
+    let missing = blocklist::effective_sources(&app.cfg.blocklist)
+        .iter()
+        .any(|k| blocklist::cached_at(k).is_none());
+    if missing {
+        update_blocklists(app);
+        app.msg = format!("blocking {} — downloading its lists", cat.key);
+    } else {
+        app.msg = format!("blocking {}", cat.key);
+    }
+}
+
+/// Runs `job` on a thread, with `label` in the footer until it finishes.
+///
+/// One at a time: both jobs here rewrite the same state, and a UI that can
+/// only show one of them running should only be able to start one.
+fn start_busy(app: &mut App, label: &'static str, job: impl FnOnce() -> String + Send + 'static) {
+    if app.busy.is_some() {
+        app.msg = "still working — one thing at a time".into();
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    app.busy = Some(Busy {
+        label,
+        started: Instant::now(),
+        rx,
+    });
+    std::thread::spawn(move || {
+        let _ = tx.send(job());
+    });
+}
+
+/// Downloads the enabled lists, off the draw loop.
+///
+/// A category can bring in half a dozen lists and one of them is 39 MB, so
+/// doing this inline would freeze the UI for a minute with nothing on
+/// screen to say why.
+fn update_blocklists(app: &mut App) {
+    let cfg = app.cfg.blocklist.clone();
+    if blocklist::effective_sources(&cfg).is_empty() {
+        app.msg = "nothing to download — space to block a category".into();
+        return;
+    }
+    start_busy(app, "updating domains", move || {
+        let results = blocklist::update_all(&cfg);
+        let failed: Vec<&str> = results
+            .iter()
+            .filter(|(_, r)| r.is_err())
+            .map(|(k, _)| k.as_str())
+            .collect();
+        if failed.is_empty() {
+            format!("downloaded {} list(s)", results.len())
+        } else {
+            format!(
+                "{} of {} lists failed: {}",
+                failed.len(),
+                results.len(),
+                failed.join(", ")
+            )
+        }
+    });
+}
+
+/// Loads the ruleset into the kernel, off the draw loop.
+///
+/// Usually fast, but it is an `nft -f` of the whole table and the
+/// encrypted-dns sets alone carry ~1500 addresses, so it is not always
+/// instant — and the config on disk is already the source of truth by the
+/// time this runs, so nothing depends on it having finished.
+fn apply_ruleset(app: &mut App, cfg: Config) {
+    start_busy(app, "applying ruleset", move || match ruleset::apply(&cfg) {
+        Ok(()) => String::new(),
+        Err(e) => format!("apply failed: {e}"),
+    });
+}
+
+/// picks up a finished job and tells the daemon to re-read what changed —
+/// which is what makes the domain count on screen move
+fn drain_busy(app: &mut App) {
+    let Some(busy) = &app.busy else { return };
+    match busy.rx.try_recv() {
+        Ok(msg) => {
+            if !msg.is_empty() {
+                app.msg = msg;
+            }
+            app.busy = None;
+            if let Some(ipc) = &mut app.ipc {
+                ipc.send(&ClientMsg::Reload);
+            }
+        }
+        Err(mpsc::TryRecvError::Disconnected) => app.busy = None,
+        Err(mpsc::TryRecvError::Empty) => {}
+    }
+}
+
 /// Splits `n` rows off the top of `rest`, leaving the remainder behind —
 /// None when there aren't that many, which is how a pane drops an element
 /// whole instead of drawing it clipped.
@@ -2139,22 +2418,61 @@ fn take_rows(rest: &mut Rect, n: u16) -> Option<Rect> {
     Some(got)
 }
 
-/// Three views of the same thing, stacked down the column. A bar for the
-/// split of DNS lookups blocked vs allowed — proportion, read across. A
-/// sparkline of blocks per five-second window — trend, which the split
-/// cannot show. Then every figure under its own label, and the names most
-/// recently blocked, which is where a false positive announces itself the
-/// moment a page breaks.
-fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
+/// The category switches: one row per thing you can block, ticked when it
+/// is on. Several at once is the normal case, so these are checkboxes and
+/// not a menu — `space` toggles the selected one.
+fn draw_categories(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let theme = THEMES[app.theme_idx];
-    let b = &app.blocklist;
+    let dim = Style::new().fg(theme.border_idle);
+    let on = app.cfg.blocklist.categories.clone();
+    let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("block ", half_heading(theme, focused)),
+            // app.msg is wiped by the next keypress, so the one long-running
+            // thing this pane does says so here instead
+            Span::styled(format!("({} on)", on.len()), dim),
+        ]))
+        .style(theme.base()),
+        head,
+    );
+    let items: Vec<ListItem> = blocklist::CATEGORIES
+        .iter()
+        .map(|c| {
+            let ticked = on.iter().any(|k| k == c.key);
+            let (mark, color) = if ticked {
+                ("[x]", theme.deny)
+            } else {
+                ("[ ]", theme.border_idle)
+            };
+            ListItem::new(format!("{mark} {}", c.key)).style(Style::new().fg(color))
+        })
+        .collect();
+    let list = List::new(items)
+        .style(theme.base())
+        .highlight_style(Style::new().bg(theme.border_idle));
+    f.render_stateful_widget(list, body, &mut app.blocking_state);
+}
+
+/// The blocking column: what is blocked, how well it is going, and the
+/// switches for changing it.
+///
+/// A bar for the split of DNS lookups blocked vs allowed — proportion, read
+/// across. Every figure under its own label. The categories, which is the
+/// part you operate: tick what you want blocked, several at once. Then the
+/// names most recently blocked, where a false positive announces itself the
+/// moment a page breaks.
+fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
+    let theme = THEMES[app.theme_idx];
+    let focused = app.focus == Focus::Blocking;
+    let b = app.blocklist.clone();
     let block = theme.pane(
         if b.enabled {
             "ads & tracking".to_string()
         } else {
             "ads & tracking — off".to_string()
         },
-        false,
+        focused,
     );
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2162,24 +2480,24 @@ fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let dim = Style::new().fg(theme.border_idle);
     if !b.enabled {
-        let dim = Style::new().fg(theme.border_idle);
-        let hint = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "blocking is off",
-                Style::new().fg(theme.warn).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from("sudo guardit blocklist on"),
-            Line::from("sudo guardit blocklist update"),
-            Line::from(""),
-            Line::from(Span::styled("ads, trackers and telemetry", dim)),
-            Line::from(Span::styled("are refused at the DNS", dim)),
-            Line::from(Span::styled("answer, before anything", dim)),
-            Line::from(Span::styled("connects", dim)),
-        ];
-        f.render_widget(Paragraph::new(hint).style(theme.base()), inner);
+        let [head, list] =
+            Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(inner);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "blocking is off",
+                    Style::new().fg(theme.warn).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled("names are refused at the DNS", dim)),
+                Line::from(Span::styled("answer, before anything connects", dim)),
+                Line::from(""),
+            ])
+            .style(theme.base()),
+            head,
+        );
+        draw_categories(f, app, list, focused);
         return;
     }
 
@@ -2190,8 +2508,6 @@ fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
         b.blocked as f64 / b.queries as f64 * 100.0
     };
 
-    let dim = Style::new().fg(theme.border_idle);
-
     // Rows are handed out in order of what you would miss most if it were
     // gone, and each element is skipped whole rather than drawn clipped:
     // the split first, then the figures, then the trend, then the names.
@@ -2201,45 +2517,39 @@ fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
     if let Some(area) = take_rows(&mut rest, 2) {
         let [head, bar] =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+        // each end of the bar gets its own share, labelled at its own end —
+        // so the line reads as the bar underneath it does, red on the left
+        // and green on the right, instead of asking anyone to subtract
+        let blocked = format!("{rate:.1}%");
+        let allowed_pct = format!("{:.1}%", 100.0 - rate);
+        let gap = (head.width as usize).saturating_sub(
+            "blocked ".len() + blocked.len() + "allowed ".len() + allowed_pct.len(),
+        );
+        let mut spans = vec![
+            Span::styled("blocked ", dim),
+            Span::styled(
+                blocked,
+                Style::new().fg(theme.deny).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        // dropped rather than wrapped when the pane is too narrow for both:
+        // the blocked share is the one anyone opened this pane for
+        if gap > 0 {
+            spans.push(Span::styled(" ".repeat(gap), theme.base()));
+            spans.push(Span::styled("allowed ", dim));
+            spans.push(Span::styled(
+                allowed_pct,
+                Style::new().fg(theme.allow).add_modifier(Modifier::BOLD),
+            ));
+        }
         f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("blocked ", dim),
-                Span::styled(
-                    format!("{rate:.1}%"),
-                    Style::new().fg(theme.deny).add_modifier(Modifier::BOLD),
-                ),
-            ]))
-            .style(theme.base()),
+            Paragraph::new(Line::from(spans)).style(theme.base()),
             head,
         );
         f.render_widget(
             Paragraph::new(stacked_bar(bar.width, b.blocked, allowed, theme))
                 .style(theme.base()),
             bar,
-        );
-    }
-
-    // trend: one bar per sampling window, which the split above cannot show
-    if let Some(area) = take_rows(&mut rest, 3) {
-        let [label, spark] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-        f.render_widget(
-            Paragraph::new(Span::styled("blocks per 5s", dim)).style(theme.base()),
-            label,
-        );
-        // newest on the right, only as many windows as there are columns
-        let n = spark.width as usize;
-        let data: Vec<u64> = app
-            .blocked_hist
-            .iter()
-            .skip(app.blocked_hist.len().saturating_sub(n))
-            .copied()
-            .collect();
-        f.render_widget(
-            Sparkline::default()
-                .data(&data)
-                .style(Style::new().fg(theme.deny).bg(theme.bg)),
-            spark,
         );
     }
 
@@ -2300,6 +2610,17 @@ fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
     let figures_h = (lines.len() as u16).min(rest.height);
     if let Some(area) = take_rows(&mut rest, figures_h) {
         f.render_widget(Paragraph::new(lines).style(theme.base()), area);
+    }
+
+    // the switches: enough rows for the whole list where there is room, and
+    // a scrolling window where there isn't, but never at the cost of the
+    // recent names having nothing left
+    let cats_h = ((blocklist::CATEGORIES.len() + 1) as u16)
+        .min(rest.height.saturating_sub(3))
+        .max(4)
+        .min(rest.height);
+    if let Some(area) = take_rows(&mut rest, cats_h) {
+        draw_categories(f, app, area, focused);
     }
 
     let recent_area = rest;
@@ -2411,10 +2732,14 @@ fn draw_conflicts(f: &mut Frame, app: &mut App, area: Rect) {
             })
             .collect()
     };
-    let title = if conflicts.is_empty() {
-        "listening ports".to_string()
-    } else {
-        format!("listening ports — {} REAL CONFLICT(S)", conflicts.len())
+    let title = match (conflicts.is_empty(), app.listening_filter.is_empty()) {
+        (true, true) => "listening ports".to_string(),
+        (true, false) => format!(
+            "listening ports — /{} ({} shown)",
+            app.listening_filter,
+            app.listening.len()
+        ),
+        (false, _) => format!("listening ports — {} REAL CONFLICT(S)", conflicts.len()),
     };
     let list = List::new(items)
         .style(theme.base())
@@ -2459,8 +2784,7 @@ mod tests {
             ],
             updated_at: Some(now_ts() - 7200),
         };
-        app.blocked_hist = (0..40).map(|i| (i * 7) % 13).collect();
-        app.cfg.rule = vec![Rule {
+            app.cfg.rule = vec![Rule {
             id: 1,
             action: Action::Allow,
             proto: Proto::Tcp,
@@ -2545,12 +2869,13 @@ mod tests {
     fn every_screen_renders_at_any_terminal_size() {
         for (w, h) in [(200, 60), (120, 40), (80, 24), (60, 20), (40, 12), (20, 8)] {
             let mut app = demo_app();
-            app.listening = vec![ipc::ListenEntry {
+            app.listening_all = vec![ipc::ListenEntry {
                 proto: "tcp".into(),
                 addr: "0.0.0.0".into(),
                 port: 22,
                 exe: "/usr/bin/sshd".into(),
             }];
+            apply_listening_filter(&mut app);
             app.counts.insert("/usr/bin/curl".into(), 1_234_567);
             rebuild_apps(&mut app);
 
@@ -2559,6 +2884,7 @@ mod tests {
                 Focus::Rules,
                 Focus::Apps,
                 Focus::Flow,
+                Focus::Blocking,
                 Focus::AppLog,
                 Focus::Conflicts,
             ] {
@@ -2572,8 +2898,12 @@ mod tests {
             app.apps_filter = "fire".into();
             term.draw(|f| draw(f, &mut app)).unwrap();
             app.focus = Focus::AppLog;
-            app.mode = Mode::LogFilter;
+            app.mode = Mode::Filter;
             app.log_filter = "443".into();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            app.focus = Focus::Conflicts;
+            app.listening_filter = "22".into();
+            apply_listening_filter(&mut app);
             term.draw(|f| draw(f, &mut app)).unwrap();
             app.mode = Mode::Browse;
             app.app_log_confirm_flush = true;
@@ -2592,6 +2922,11 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
     }
 }
+
+
+
+
+
 
 
 

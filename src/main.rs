@@ -93,7 +93,9 @@ enum AppCmd {
 
 #[derive(Subcommand)]
 enum BlocklistCmd {
-    /// every list you can enable, with what it covers
+    /// what you can block — ads, tracking, phishing, porn… — and what is on
+    Categories,
+    /// every individual list behind those categories
     Sources,
     /// what is on, how many domains are loaded, when each list was fetched
     Status,
@@ -101,9 +103,9 @@ enum BlocklistCmd {
     On,
     /// turn it off — the downloaded lists are kept
     Off,
-    /// add a list, e.g. `hagezi:pro` (see `sources`)
+    /// block a category (`ads`, `phishing`, `porn`…) or one list (`hagezi:pro`)
     Enable { key: String },
-    /// remove a list
+    /// stop blocking a category or one list
     Disable { key: String },
     /// download the enabled lists now
     Update,
@@ -188,7 +190,10 @@ fn main() {
             | Cmd::Completions { .. }
             | Cmd::Man
             | Cmd::Blocklist(
-                BlocklistCmd::Sources | BlocklistCmd::Status | BlocklistCmd::Check { .. }
+                BlocklistCmd::Categories
+                    | BlocklistCmd::Sources
+                    | BlocklistCmd::Status
+                    | BlocklistCmd::Check { .. }
             )
     );
     if !read_only && !ruleset::is_root() {
@@ -470,22 +475,45 @@ fn save_blocklist(mut cfg: Config, mutate: impl FnOnce(&mut config::BlocklistCon
 
 fn blocklist_cmd(cfg: Config, sub: BlocklistCmd) {
     match sub {
+        BlocklistCmd::Categories => {
+            println!("{:<14}{:<8}COVERS", "CATEGORY", "LISTS");
+            for c in blocklist::CATEGORIES {
+                let on = cfg.blocklist.categories.iter().any(|k| k == c.key);
+                println!(
+                    "{} {:<12}{:<8}{}",
+                    if on { "*" } else { " " },
+                    c.key,
+                    c.sources.len(),
+                    c.about
+                );
+            }
+            println!(
+                "\n* = blocked. `guardit blocklist enable <category>`, several at a time."
+            );
+        }
         BlocklistCmd::Sources => {
-            println!("{:<28}COVERS", "LIST");
+            let on = blocklist::effective_sources(&cfg.blocklist);
+            let mut category = "";
             for s in blocklist::SOURCES {
-                let on = cfg.blocklist.sources.contains(&s.key());
+                if s.category != category {
+                    category = s.category;
+                    println!("\n{category}");
+                }
                 println!(
                     "{} {:<26}{}",
-                    if on { "*" } else { " " },
+                    if on.contains(&s.key()) { "*" } else { " " },
                     s.key(),
                     s.about
                 );
             }
-            println!("\n* = enabled. `guardit blocklist enable <list>` to add one.");
+            println!(
+                "\n* = in force. Turn on a whole category with `guardit blocklist enable <category>`,"
+            );
+            println!("or add one list on top with `guardit blocklist enable <list>`.");
         }
         BlocklistCmd::Status => {
             let b = &cfg.blocklist;
-            println!("blocking:      {}", if b.enabled { "on" } else { "off" });
+            println!("state:         {}", if b.enabled { "on" } else { "off" });
             println!(
                 "encrypted dns: {}",
                 if b.block_encrypted_dns {
@@ -501,13 +529,24 @@ fn blocklist_cmd(cfg: Config, sub: BlocklistCmd) {
                     h => format!("every {h}h"),
                 }
             );
-            if b.sources.is_empty() {
-                println!("lists:         none — `guardit blocklist enable hagezi:pro`");
+            println!(
+                "blocking:      {}",
+                if b.categories.is_empty() {
+                    "nothing — `guardit blocklist enable ads`".to_string()
+                } else {
+                    b.categories.join(", ")
+                }
+            );
+            let keys = blocklist::effective_sources(b);
+            if keys.is_empty() {
+                println!("lists:         none");
             } else {
                 println!("lists:");
-                for key in &b.sources {
+                for key in &keys {
                     let age = match blocklist::cached_at(key) {
-                        Some(t) => format!("updated {} ago", daemon::ago(now_ts().saturating_sub(t))),
+                        Some(t) => {
+                            format!("updated {} ago", daemon::ago(now_ts().saturating_sub(t)))
+                        }
                         None => "not downloaded — `guardit blocklist update`".into(),
                     };
                     println!("  {key:<26}{age}");
@@ -519,17 +558,20 @@ fn blocklist_cmd(cfg: Config, sub: BlocklistCmd) {
             }
         }
         BlocklistCmd::On => {
-            let seed = cfg.blocklist.sources.is_empty();
+            let seed = cfg.blocklist.categories.is_empty() && cfg.blocklist.sources.is_empty();
             save_blocklist(cfg, |b| {
                 b.enabled = true;
                 if seed {
-                    b.sources = blocklist::DEFAULT_SOURCES.iter().map(|s| s.to_string()).collect();
+                    b.categories = blocklist::DEFAULT_CATEGORIES
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
                 }
             });
             if seed {
                 println!(
-                    "blocking on, with {}",
-                    blocklist::DEFAULT_SOURCES.join(", ")
+                    "blocking on, covering {}",
+                    blocklist::DEFAULT_CATEGORIES.join(", ")
                 );
             } else {
                 println!("blocking on");
@@ -540,25 +582,40 @@ fn blocklist_cmd(cfg: Config, sub: BlocklistCmd) {
             save_blocklist(cfg, |b| b.enabled = false);
             println!("blocking off (downloaded lists kept)");
         }
+        // one pair of commands for both: a category is what you normally
+        // want, a list key is the escape hatch, and having to remember which
+        // verb takes which would be a needless thing to remember
         BlocklistCmd::Enable { key } => {
-            if blocklist::source(&key).is_none() {
+            if blocklist::category(&key).is_some() {
+                if cfg.blocklist.categories.contains(&key) {
+                    println!("{key} is already blocked");
+                    return;
+                }
+                save_blocklist(cfg, |b| b.categories.push(key.clone()));
+                println!("blocking {key} — `guardit blocklist update` to download its lists now");
+            } else if blocklist::source(&key).is_some() {
+                if cfg.blocklist.sources.contains(&key) {
+                    println!("{key} is already enabled");
+                    return;
+                }
+                save_blocklist(cfg, |b| b.sources.push(key.clone()));
+                println!("{key} enabled — `guardit blocklist update` to download it now");
+            } else {
                 fail(&format!(
-                    "unknown list {key:?} — see `guardit blocklist sources`"
+                    "unknown {key:?} — see `guardit blocklist categories` or `... sources`"
                 ));
             }
-            if cfg.blocklist.sources.contains(&key) {
-                println!("{key} is already enabled");
-                return;
-            }
-            save_blocklist(cfg, |b| b.sources.push(key.clone()));
-            println!("{key} enabled — `guardit blocklist update` to download it now");
         }
         BlocklistCmd::Disable { key } => {
-            if !cfg.blocklist.sources.contains(&key) {
-                fail(&format!("{key} is not enabled"));
+            if cfg.blocklist.categories.contains(&key) {
+                save_blocklist(cfg, |b| b.categories.retain(|k| *k != key));
+                println!("no longer blocking {key}");
+            } else if cfg.blocklist.sources.contains(&key) {
+                save_blocklist(cfg, |b| b.sources.retain(|k| *k != key));
+                println!("{key} disabled");
+            } else {
+                fail(&format!("{key} is not on"));
             }
-            save_blocklist(cfg, |b| b.sources.retain(|k| *k != key));
-            println!("{key} disabled");
         }
         BlocklistCmd::Update => {
             let results = blocklist::update_all(&cfg.blocklist);

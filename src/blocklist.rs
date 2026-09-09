@@ -20,10 +20,13 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// One downloadable list. `id` is the maintainer, `level` the flavour —
-/// together they form the `id:level` key used in the config and the CLI.
+/// together they form the `id:level` key used in the config and the CLI —
+/// and `category` is the kind of thing it blocks, which is what the TUI and
+/// `guardit blocklist block` actually work in.
 pub struct Source {
     pub id: &'static str,
     pub level: &'static str,
+    pub category: &'static str,
     pub url: &'static str,
     pub about: &'static str,
 }
@@ -34,159 +37,549 @@ impl Source {
     }
 }
 
+/// A kind of thing to block, and the lists turning it on enables.
+///
+/// One or two well-chosen lists per category, not every list that touches
+/// the subject: the catalogue overlaps heavily, and merging five lists that
+/// cover the same domains costs the memory five times for the coverage
+/// once. `guardit blocklist enable <list>` adds any other list on top.
+pub struct Category {
+    pub key: &'static str,
+    pub about: &'static str,
+    pub sources: &'static [&'static str],
+}
+
 /// The catalogue the TUI and `guardit blocklist sources` show.
 ///
 /// Every hagezi entry is a `wildcard/*-onlydomains.txt`: a plain domain per
 /// line, meaning "this name and everything under it" — exactly the matching
 /// `Blocklist::blocked` does, so no format-specific handling is needed. The
-/// hosts-format lists (StevenBlack, Peter Lowe) are exact-name lists; the
-/// same suffix walk still matches them, it just never fires above a listed
-/// name because their subdomains are listed individually.
+/// hosts-format lists are exact-name lists; the same suffix walk still
+/// matches them, it just never fires above a listed name because their
+/// subdomains are listed individually.
 pub const SOURCES: &[Source] = &[
     Source {
         id: "hagezi",
         level: "light",
+        category: "ads",
         url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt",
         about: "ads + trackers, size-optimised, near-zero breakage",
     },
     Source {
         id: "hagezi",
         level: "normal",
+        category: "ads",
         url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/multi-onlydomains.txt",
         about: "ads, trackers, telemetry, some badware",
     },
     Source {
         id: "hagezi",
         level: "pro",
+        category: "ads",
         url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt",
         about: "ads, trackers, telemetry, badware — the recommended default",
     },
     Source {
         id: "hagezi",
         level: "pro.plus",
+        category: "ads",
         url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro.plus-onlydomains.txt",
         about: "pro, plus aggressive tracking and telemetry",
     },
     Source {
         id: "hagezi",
         level: "ultimate",
+        category: "ads",
         url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/ultimate-onlydomains.txt",
         about: "maximum coverage — expect to need the allowlist",
     },
     Source {
         id: "hagezi",
         level: "popupads",
+        category: "ads",
         url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/popupads-onlydomains.txt",
         about: "pop-up ads and redirect chains",
     },
     Source {
-        id: "hagezi",
-        level: "tif",
-        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif-onlydomains.txt",
-        about: "threat intelligence: malware, phishing, scam, cryptojacking",
-    },
-    Source {
-        id: "hagezi",
-        level: "fake",
-        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/fake-onlydomains.txt",
-        about: "fake shops, fake streaming, fake support",
-    },
-    Source {
-        id: "hagezi",
-        level: "gambling",
-        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/gambling-onlydomains.txt",
-        about: "gambling and betting",
-    },
-    Source {
-        id: "hagezi",
-        level: "nsfw",
-        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/nsfw-onlydomains.txt",
-        about: "pornography",
-    },
-    Source {
-        id: "hagezi",
-        level: "doh",
-        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/doh-vpn-proxy-bypass-onlydomains.txt",
-        about: "DoH / VPN / proxy endpoints used to bypass DNS filtering",
-    },
-    Source {
-        id: "hagezi",
-        level: "native.tiktok",
-        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.tiktok-onlydomains.txt",
-        about: "TikTok's own telemetry endpoints",
-    },
-    Source {
-        id: "hagezi",
-        level: "native.winoffice",
-        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.winoffice-onlydomains.txt",
-        about: "Windows / Office telemetry endpoints",
-    },
-    Source {
-        id: "stevenblack",
-        level: "unified",
-        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
-        about: "the classic unified hosts list: ads + malware",
-    },
-    Source {
-        id: "stevenblack",
-        level: "fakenews",
-        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews/hosts",
-        about: "unified, plus fake-news sites",
-    },
-    Source {
-        id: "stevenblack",
-        level: "gambling",
-        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/gambling/hosts",
-        about: "unified, plus gambling",
-    },
-    Source {
-        id: "stevenblack",
-        level: "porn",
-        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts",
-        about: "unified, plus pornography",
-    },
-    Source {
-        id: "stevenblack",
-        level: "social",
-        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/social/hosts",
-        about: "unified, plus social networks",
-    },
-    Source {
         id: "oisd",
         level: "small",
+        category: "ads",
         url: "https://small.oisd.nl/domainswild2",
         about: "ads + trackers, tuned hard against false positives",
     },
     Source {
         id: "oisd",
         level: "big",
+        category: "ads",
         url: "https://big.oisd.nl/domainswild2",
         about: "ads, trackers, malware, phishing, scam",
     },
     Source {
-        id: "oisd",
-        level: "nsfw",
-        url: "https://nsfw.oisd.nl/domainswild2",
-        about: "pornography",
+        id: "stevenblack",
+        level: "unified",
+        category: "ads",
+        url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+        about: "the classic unified hosts list: ads + malware",
     },
     Source {
         id: "adguard",
         level: "dns",
+        category: "ads",
         url: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt",
         about: "AdGuard's own DNS filter: ads + trackers",
     },
     Source {
         id: "peterlowe",
         level: "ads",
+        category: "ads",
         url: "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext",
         about: "Peter Lowe's ad and tracking server list",
     },
+    Source {
+        id: "adaway",
+        level: "hosts",
+        category: "ads",
+        url: "https://adaway.org/hosts.txt",
+        about: "AdAway: mobile ad servers",
+    },
+    Source {
+        id: "someonewhocares",
+        level: "hosts",
+        category: "ads",
+        url: "https://someonewhocares.org/hosts/zero/hosts",
+        about: "Dan Pollock's hosts file",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "ads",
+        category: "ads",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/ads.txt",
+        about: "The Blocklist Project: ad servers",
+    },
+    Source {
+        id: "frogeye",
+        level: "multiparty",
+        category: "tracking",
+        url: "https://hostfiles.frogeye.fr/multiparty-trackers-hosts.txt",
+        about: "third-party trackers, resolved from the filter lists",
+    },
+    Source {
+        id: "frogeye",
+        level: "firstparty",
+        category: "tracking",
+        url: "https://hostfiles.frogeye.fr/firstparty-trackers-hosts.txt",
+        about: "CNAME-cloaked first-party trackers — no other list has these",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "tracking",
+        category: "tracking",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/tracking.txt",
+        about: "The Blocklist Project: trackers",
+    },
+    Source {
+        id: "hagezi",
+        level: "tif",
+        category: "phishing",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif-onlydomains.txt",
+        about: "threat intelligence: malware, phishing, scam, cryptojacking",
+    },
+    Source {
+        id: "hagezi",
+        level: "tif.medium",
+        category: "phishing",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif.medium-onlydomains.txt",
+        about: "threat intelligence, medium — fewer false positives",
+    },
+    Source {
+        id: "hagezi",
+        level: "tif.mini",
+        category: "phishing",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif.mini-onlydomains.txt",
+        about: "threat intelligence, minimal",
+    },
+    Source {
+        id: "phishingarmy",
+        level: "extended",
+        category: "phishing",
+        url: "https://phishing.army/download/phishing_army_blocklist_extended.txt",
+        about: "Phishing Army: active phishing domains",
+    },
+    Source {
+        id: "urlhaus",
+        level: "hosts",
+        category: "phishing",
+        url: "https://urlhaus.abuse.ch/downloads/hostfile/",
+        about: "abuse.ch URLhaus: hosts distributing malware",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "malware",
+        category: "phishing",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/malware.txt",
+        about: "The Blocklist Project: malware",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "phishing",
+        category: "phishing",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/phishing.txt",
+        about: "The Blocklist Project: phishing",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "ransomware",
+        category: "phishing",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/ransomware.txt",
+        about: "The Blocklist Project: ransomware",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "scam",
+        category: "phishing",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/scam.txt",
+        about: "The Blocklist Project: scams",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "fraud",
+        category: "phishing",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/fraud.txt",
+        about: "The Blocklist Project: fraud",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "abuse",
+        category: "phishing",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/abuse.txt",
+        about: "The Blocklist Project: abuse and reported hosts",
+    },
+    Source {
+        id: "hagezi",
+        level: "fake",
+        category: "fake",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/fake-onlydomains.txt",
+        about: "fake shops, fake streaming, fake support",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "redirect",
+        category: "fake",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/redirect.txt",
+        about: "The Blocklist Project: redirect and doorway pages",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "crypto",
+        category: "crypto",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/crypto.txt",
+        about: "cryptojacking and mining pools",
+    },
+    Source {
+        id: "hagezi",
+        level: "doh",
+        category: "dns-bypass",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/doh-vpn-proxy-bypass-onlydomains.txt",
+        about: "DoH / VPN / proxy endpoints used to bypass DNS filtering",
+    },
+    Source {
+        id: "hagezi",
+        level: "dyndns",
+        category: "dns-bypass",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/dyndns-onlydomains.txt",
+        about: "dynamic DNS providers, commonly used to evade filtering",
+    },
+    Source {
+        id: "hagezi",
+        level: "nosafesearch",
+        category: "dns-bypass",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/nosafesearch-onlydomains.txt",
+        about: "endpoints that let a browser skip enforced safe search",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.winoffice",
+        category: "telemetry",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.winoffice-onlydomains.txt",
+        about: "Windows / Office telemetry endpoints",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.apple",
+        category: "telemetry",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.apple-onlydomains.txt",
+        about: "Apple device telemetry endpoints",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.amazon",
+        category: "telemetry",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.amazon-onlydomains.txt",
+        about: "Amazon device telemetry endpoints",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.samsung",
+        category: "telemetry",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.samsung-onlydomains.txt",
+        about: "Samsung device telemetry endpoints",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.xiaomi",
+        category: "telemetry",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.xiaomi-onlydomains.txt",
+        about: "Xiaomi device telemetry endpoints",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.huawei",
+        category: "telemetry",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.huawei-onlydomains.txt",
+        about: "Huawei device telemetry endpoints",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.tiktok",
+        category: "telemetry",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.tiktok-onlydomains.txt",
+        about: "TikTok's own telemetry endpoints",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.lgwebos",
+        category: "telemetry",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.lgwebos-onlydomains.txt",
+        about: "LG webOS TV telemetry endpoints",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.roku",
+        category: "telemetry",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.roku-onlydomains.txt",
+        about: "Roku telemetry endpoints",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.vivo",
+        category: "telemetry",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.vivo-onlydomains.txt",
+        about: "Vivo device telemetry endpoints",
+    },
+    Source {
+        id: "hagezi",
+        level: "native.oppo-realme",
+        category: "telemetry",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/native.oppo-realme-onlydomains.txt",
+        about: "Oppo / Realme device telemetry endpoints",
+    },
+    Source {
+        id: "sinfonietta",
+        level: "social",
+        category: "social",
+        url: "https://raw.githubusercontent.com/Sinfonietta/hostfiles/master/social-hosts",
+        about: "social networks",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "facebook",
+        category: "social",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/facebook.txt",
+        about: "Facebook and Meta properties",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "tiktok",
+        category: "social",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/tiktok.txt",
+        about: "TikTok",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "youtube",
+        category: "social",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/youtube.txt",
+        about: "YouTube",
+    },
+    Source {
+        id: "hagezi",
+        level: "gambling",
+        category: "gambling",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/gambling-onlydomains.txt",
+        about: "gambling and betting",
+    },
+    Source {
+        id: "hagezi",
+        level: "gambling.medium",
+        category: "gambling",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/gambling.medium-onlydomains.txt",
+        about: "gambling and betting, medium",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "gambling",
+        category: "gambling",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/gambling.txt",
+        about: "The Blocklist Project: gambling",
+    },
+    Source {
+        id: "hagezi",
+        level: "nsfw",
+        category: "porn",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/nsfw-onlydomains.txt",
+        about: "pornography",
+    },
+    Source {
+        id: "oisd",
+        level: "nsfw",
+        category: "porn",
+        url: "https://nsfw.oisd.nl/domainswild2",
+        about: "pornography, oisd's list",
+    },
+    Source {
+        id: "sinfonietta",
+        level: "porn",
+        category: "porn",
+        url: "https://raw.githubusercontent.com/Sinfonietta/hostfiles/master/pornography-hosts",
+        about: "pornography, Sinfonietta's list",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "porn",
+        category: "porn",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/porn.txt",
+        about: "The Blocklist Project: pornography",
+    },
+    Source {
+        id: "hagezi",
+        level: "anti.piracy",
+        category: "piracy",
+        url: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/anti.piracy-onlydomains.txt",
+        about: "piracy and warez sites",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "piracy",
+        category: "piracy",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/piracy.txt",
+        about: "The Blocklist Project: piracy",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "torrent",
+        category: "piracy",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/torrent.txt",
+        about: "The Blocklist Project: torrent trackers and indexes",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "drugs",
+        category: "drugs",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/drugs.txt",
+        about: "drug marketplaces",
+    },
+    Source {
+        id: "blocklistproject",
+        level: "vaping",
+        category: "drugs",
+        url: "https://raw.githubusercontent.com/blocklistproject/Lists/master/vaping.txt",
+        about: "vaping and e-cigarette shops",
+    },
 ];
 
-/// what `guardit blocklist enable` suggests, and what the TUI ticks when you
-/// turn blocking on with nothing selected: the best ads/tracking coverage
-/// that does not routinely need an allowlist entry to use the web
-pub const DEFAULT_SOURCES: &[&str] = &["hagezi:pro"];
+pub const CATEGORIES: &[Category] = &[
+    Category {
+        key: "ads",
+        about: "advertising",
+        sources: &["hagezi:pro"],
+    },
+    Category {
+        key: "tracking",
+        about: "trackers and analytics",
+        sources: &["frogeye:multiparty", "frogeye:firstparty"],
+    },
+    Category {
+        key: "phishing",
+        about: "malware, phishing, scam, ransomware",
+        sources: &["hagezi:tif"],
+    },
+    Category {
+        key: "fake",
+        about: "fake shops, fake streaming, fake support",
+        sources: &["hagezi:fake"],
+    },
+    Category {
+        key: "crypto",
+        about: "cryptojacking and mining",
+        sources: &["blocklistproject:crypto"],
+    },
+    Category {
+        key: "dns-bypass",
+        about: "DoH, VPN and proxy endpoints that route around filtering",
+        sources: &["hagezi:doh"],
+    },
+    Category {
+        key: "telemetry",
+        about: "device and OS telemetry",
+        sources: &["hagezi:native.winoffice", "hagezi:native.apple", "hagezi:native.samsung", "hagezi:native.xiaomi", "hagezi:native.amazon", "hagezi:native.tiktok"],
+    },
+    Category {
+        key: "social",
+        about: "social networks",
+        sources: &["sinfonietta:social"],
+    },
+    Category {
+        key: "gambling",
+        about: "gambling and betting",
+        sources: &["hagezi:gambling"],
+    },
+    Category {
+        key: "porn",
+        about: "pornography",
+        sources: &["hagezi:nsfw"],
+    },
+    Category {
+        key: "piracy",
+        about: "piracy and torrents",
+        sources: &["hagezi:anti.piracy"],
+    },
+    Category {
+        key: "drugs",
+        about: "drug and vaping shops",
+        sources: &["blocklistproject:drugs"],
+    },
+];
+
+/// Ads and phishing are on by default when blocking is turned on: the first
+/// is what anyone installing this came for, and the second costs one list
+/// and blocks the things that actually hurt.
+pub const DEFAULT_CATEGORIES: &[&str] = &["ads", "phishing"];
+
+pub fn category(key: &str) -> Option<&'static Category> {
+    CATEGORIES.iter().find(|c| c.key == key)
+}
+
+/// Every list actually in force: the lists of each enabled category, plus
+/// any the user added by key. Deduplicated, since categories overlap.
+pub fn effective_sources(cfg: &BlocklistConfig) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |key: &str| {
+        if !out.iter().any(|k| k == key) {
+            out.push(key.to_string());
+        }
+    };
+    for name in &cfg.categories {
+        if let Some(cat) = category(name) {
+            for key in cat.sources {
+                push(key);
+            }
+        }
+    }
+    for key in &cfg.sources {
+        push(key);
+    }
+    out
+}
 
 /// Names that make encrypted DNS give up and fall back to the plain DNS this
 /// can actually filter. `use-application-dns.net` is Mozilla's canary: an
@@ -324,6 +717,11 @@ pub fn parse_into(text: &str, into: &mut HashSet<Box<str>>) -> usize {
 /// One flat set for all sources: which list a name came from is not worth
 /// the memory of keeping them apart on the hot path, and `check` re-reads
 /// the files when someone actually asks that question.
+///
+/// ponytail: every domain is an owned Box<str>, so the whole catalogue on at
+/// once is a couple of hundred MB resident — fine for one or two categories,
+/// which is the case. A shared arena, or a probabilistic filter in front of
+/// the set, if anyone ever runs all twelve.
 #[derive(Default)]
 pub struct Blocklist {
     blocked: HashSet<Box<str>>,
@@ -337,8 +735,8 @@ impl Blocklist {
     pub fn load(cfg: &BlocklistConfig) -> Blocklist {
         let mut blocked = HashSet::new();
         if cfg.enabled {
-            for key in &cfg.sources {
-                if let Ok(text) = fs::read_to_string(cache_path(key)) {
+            for key in effective_sources(cfg) {
+                if let Ok(text) = fs::read_to_string(cache_path(&key)) {
                     parse_into(&text, &mut blocked);
                 }
             }
@@ -487,12 +885,12 @@ pub fn doh_ips() -> Vec<std::net::IpAddr> {
 /// failing the whole update.
 pub fn update_all(cfg: &BlocklistConfig) -> Vec<(String, Result<usize, String>)> {
     let mut out = Vec::new();
-    for key in &cfg.sources {
-        let r = match source(key) {
-            Some(s) => fetch(key, s.url),
+    for key in effective_sources(cfg) {
+        let r = match source(&key) {
+            Some(s) => fetch(&key, s.url),
             None => Err("unknown list — see `guardit blocklist sources`".into()),
         };
-        out.push((key.clone(), r));
+        out.push((key, r));
     }
     if cfg.block_encrypted_dns {
         out.push((DOH_IPS_KEY.to_string(), fetch_doh_ips()));
@@ -594,7 +992,12 @@ mod tests {
         let mut failures = Vec::new();
         for src in SOURCES {
             match fetch(&src.key(), src.url) {
-                Ok(n) => assert!(n > 100, "{} parsed only {n} domains", src.key()),
+                // `fetch` already refuses a download that parses to nothing,
+                // which is what a moved url or an error page looks like.
+                // This is the weaker second check: a list can legitimately be
+                // small (native.roku is ~70 domains), it just can't be a
+                // handful of lines that happened to look like hostnames
+                Ok(n) => assert!(n >= 20, "{} parsed only {n} domains", src.key()),
                 Err(e) => failures.push(format!("{}: {e}", src.key())),
             }
         }
@@ -634,9 +1037,53 @@ mod tests {
             assert!(seen.insert(s.key()), "duplicate {}", s.key());
             assert!(s.url.starts_with("https://"), "{} is not https", s.key());
             assert!(!s.about.is_empty());
+            assert!(
+                category(s.category).is_some(),
+                "{} is in category {:?}, which is not one",
+                s.key(),
+                s.category
+            );
         }
-        for d in DEFAULT_SOURCES {
-            assert!(source(d).is_some(), "default {d} is not in the catalogue");
+    }
+
+    #[test]
+    fn every_category_points_at_lists_that_exist() {
+        let mut seen = HashSet::new();
+        for c in CATEGORIES {
+            assert!(seen.insert(c.key), "duplicate category {}", c.key);
+            assert!(!c.about.is_empty());
+            assert!(!c.sources.is_empty(), "{} enables nothing", c.key);
+            for key in c.sources {
+                let s = source(key)
+                    .unwrap_or_else(|| panic!("{} enables {key}, which is not a list", c.key));
+                assert_eq!(
+                    s.category, c.key,
+                    "{} enables {key}, which is filed under {}",
+                    c.key, s.category
+                );
+            }
         }
+        for d in DEFAULT_CATEGORIES {
+            assert!(category(d).is_some(), "default {d} is not a category");
+        }
+    }
+
+    #[test]
+    fn overlapping_categories_do_not_download_a_list_twice() {
+        let cfg = BlocklistConfig {
+            // ads and phishing share nothing, but adding a list by hand that
+            // a category already brings in must not duplicate it
+            categories: vec!["ads".into(), "phishing".into()],
+            sources: vec!["hagezi:pro".into(), "oisd:small".into()],
+            ..Default::default()
+        };
+        let got = effective_sources(&cfg);
+        let mut uniq = got.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(got.len(), uniq.len(), "{got:?}");
+        assert!(got.contains(&"hagezi:pro".to_string()));
+        assert!(got.contains(&"hagezi:tif".to_string()));
+        assert!(got.contains(&"oisd:small".to_string()));
     }
 }
