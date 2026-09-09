@@ -158,9 +158,8 @@ them at once:
 
 ```
 sudo guardit blocklist on                    # on, covering ads + phishing
-sudo guardit blocklist enable porn           # block another category
-sudo guardit blocklist enable gambling
-sudo guardit blocklist disable porn
+sudo guardit blocklist enable tracking telemetry   # several at a time
+sudo guardit blocklist disable porn gambling
 sudo guardit blocklist update                # download now (the daemon also does it daily)
 guardit blocklist categories                 # the twelve, * = blocked
 guardit blocklist status                     # what's on, domains loaded, how stale
