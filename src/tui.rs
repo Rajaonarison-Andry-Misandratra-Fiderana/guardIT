@@ -800,12 +800,9 @@ pub fn run(cfg: Config) {
                 && !matches!(app.mode, Mode::Add(_) | Mode::Filter)
             {
                 if app.focus == Focus::Blocking {
-                    app.focus = app.prev_focus;
+                    leave_tab(&mut app);
                 } else {
-                    if !in_tab(app.focus) {
-                        app.prev_focus = app.focus;
-                    }
-                    app.focus = Focus::Blocking;
+                    enter_tab(&mut app, Focus::Blocking);
                 }
                 continue;
             }
@@ -930,7 +927,7 @@ pub fn run(cfg: Config) {
                     _ => {}
                 },
                 Focus::Blocking => match key.code {
-                    KeyCode::Char('q') => app.focus = app.prev_focus,
+                    KeyCode::Char('q') => leave_tab(&mut app),
                     KeyCode::Char('j') | KeyCode::Down => app.blocking_state.select(step(
                         app.blocking_state.selected(),
                         blocklist::CATEGORIES.len(),
@@ -1279,13 +1276,35 @@ fn delete_selected(app: &mut App) {
 
 const APP_LOG_LIMIT: usize = 300;
 
-fn open_app_log(app: &mut App, filter: Option<String>) {
-    if !in_log_tab(app.focus) {
+/// Opens a tab, remembering where you were — and only ever a place in the
+/// grid, never another tab.
+///
+/// `prev_focus` holding a tab is a trap with no way out: leaving that tab
+/// puts you back in a tab, whose own way out is the same field, now pointing
+/// at itself. That is reachable by opening one tab from another, which the
+/// two keys that open them both allow.
+fn enter_tab(app: &mut App, tab: Focus) {
+    if !in_tab(app.focus) {
         app.prev_focus = app.focus;
     }
+    app.focus = tab;
+}
+
+/// Back to the grid, from any tab. Clamped rather than trusted: a
+/// `prev_focus` that ever held a tab would strand you, and landing on the
+/// apps pane is a poor outcome next to no way back at all.
+fn leave_tab(app: &mut App) {
+    app.focus = if in_tab(app.prev_focus) {
+        Focus::Apps
+    } else {
+        app.prev_focus
+    };
+}
+
+fn open_app_log(app: &mut App, filter: Option<String>) {
+    enter_tab(app, Focus::AppLog);
     app.app_log_filter = filter;
     app.app_log_confirm_flush = false;
-    app.focus = Focus::AppLog;
     app.app_log_all = read_app_log(APP_LOG_LIMIT, app.app_log_filter.as_deref());
     apply_log_filter(app);
     apply_listening_filter(app);
@@ -1384,7 +1403,7 @@ fn apply_log_filter(app: &mut App) {
 }
 
 fn close_app_log(app: &mut App) {
-    app.focus = app.prev_focus;
+    leave_tab(app);
     app.app_log_filter = None;
     app.log_filter.clear();
     app.listening_filter.clear();
@@ -3015,6 +3034,41 @@ mod tests {
         rebuild_apps(&mut app);
         app.focus = Focus::Apps;
         app
+    }
+
+    /// The sequence that used to strand you: open the blocking tab, open the
+    /// audit tab from inside it, then come back. `prev_focus` had been set
+    /// to the blocking tab on the way through, so leaving audit landed there
+    /// and leaving *that* went to itself — `q` and `B` both did nothing.
+    #[test]
+    fn no_route_through_the_tabs_leaves_you_without_a_way_back() {
+        let mut app = new_app(Config::default());
+        app.focus = Focus::Flow;
+
+        enter_tab(&mut app, Focus::Blocking);
+        enter_tab(&mut app, Focus::AppLog);
+        leave_tab(&mut app);
+        assert!(!in_tab(app.focus), "stranded in a tab: {:?}", app.focus);
+        assert_eq!(app.focus, Focus::Flow, "and back where you started");
+
+        // every order of the two tabs, in and out, ends in the grid
+        for first in [Focus::Blocking, Focus::AppLog] {
+            for second in [Focus::Blocking, Focus::AppLog, Focus::Conflicts] {
+                app.focus = Focus::Rules;
+                enter_tab(&mut app, first);
+                enter_tab(&mut app, second);
+                leave_tab(&mut app);
+                assert!(!in_tab(app.focus), "{first:?} then {second:?}");
+                leave_tab(&mut app);
+                assert!(!in_tab(app.focus), "{first:?} then {second:?}, twice out");
+            }
+        }
+
+        // and a prev_focus that somehow holds a tab still lets you out
+        app.focus = Focus::Blocking;
+        app.prev_focus = Focus::AppLog;
+        leave_tab(&mut app);
+        assert!(!in_tab(app.focus));
     }
 
     #[test]

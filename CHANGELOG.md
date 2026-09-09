@@ -120,6 +120,11 @@
   went on dropping it — the two policies decide on evidence of their own, which no reading
   of the rules can reach. The reason travels on the row, and the peer is truncated to make
   room for it rather than the other way round.
+- **Fixed: the blocking tab could trap you.** Opening it and then opening the audit tab
+  from inside it recorded the blocking tab as "where you were", so leaving audit landed
+  there and leaving *that* went to itself — `q` and `B` both did nothing and the grid was
+  unreachable. The two transitions are now the only way in and out, and neither can record
+  a tab as somewhere to go back to.
 - **The grid is about access control again.** Ads & tracking had grown to a full-height
   third of the screen — something you read, taking more room than the pane you operate — so
   it moves to its own tab on `B`, with its headline in the status line. What is left is
