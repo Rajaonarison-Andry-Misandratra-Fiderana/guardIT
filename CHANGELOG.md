@@ -16,15 +16,17 @@
   rejected, and the DoH bootstrap names plus Mozilla's `use-application-dns.net` canary
   return NXDOMAIN. `reject`, not `drop`, so clients fall back to plain DNS at once rather
   than hanging.
-- **New TUI layout**, one subject per column. System rules take the left column; Top apps
-  and a combined **Application blocking** pane — the app list and that app's live flow,
-  either side of a vertical rule, since neither is much use without the other — take the
-  middle; and the whole right column is the ads & tracking dashboard: a ring of lookups
-  allowed vs blocked with the block rate in the hole, every figure repeated under its own
-  label, then the names most recently blocked. The audit log tab (`L`) picks up the
-  listening ports alongside the log, `Tab` switching between them. Rule rows wrap onto two
-  lines rather than truncating the source, and the app-name column shrinks with its pane so
-  the allow/deny status never falls off the edge.
+- **New TUI layout**: a top band of three columns — System rules, Top apps, and the ads &
+  tracking dashboard — over a full-width **Application blocking** pane holding the app list
+  and that app's live flow either side of a vertical rule, since neither is much use
+  without the other. The dashboard shows a bar of lookups blocked vs allowed, a sparkline
+  of blocks per 5 s, the three counters each with their number under their label, then the
+  names most recently blocked; a short pane drops the tail rather than clipping anything.
+  The audit tab moves from `L` to **`A`** and picks up the listening ports alongside the
+  trail, `Tab` switching between them. Rule rows wrap onto two lines rather than truncating
+  the source, the app-name column shrinks with its pane so the allow/deny status never
+  falls off the edge, and the apps list is plain alphabetical (it used to float undecided
+  apps to the top, which moved rows under you as decisions landed).
 - **Filter the audit log** with `/`: a number matches the port exactly, anything else is a
   substring of the peer address, the resolved name or the app path.
 - **Rules by domain**: `guardit app deny <exe> --host '*.doubleclick.net'` restricts a

@@ -13,8 +13,6 @@ use crossterm::terminal::{
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::symbols::Marker;
-use ratatui::widgets::canvas::{Canvas, Context, Points};
 use ratatui::widgets::{
     Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, List, ListItem, ListState, Padding,
     Paragraph, Row, Sparkline, Table, TableState,
@@ -327,7 +325,7 @@ enum Focus {
     /// pairing them frees the grid's third column for the live flow
     Conflicts,
     /// the full audit trail — its own tab, rendered over the whole grid area
-    /// and jumpable to from anywhere via the global `L` key, same idea as
+    /// and jumpable to from anywhere via the global `A` key, same idea as
     /// `t` for theme
     AppLog,
 }
@@ -340,8 +338,8 @@ fn in_log_tab(focus: Focus) -> bool {
 
 // Grid tab order: system rules -> apps -> network flow, then back. Top apps
 // and the blocking dashboard are informational (nothing to focus), and the
-// log tab is reached only via the global `L`/`l` keys — a drill-down, not a
-// pane you'd casually cycle through.
+// audit tab is reached only via the global `A` key or a pane's `l` — a
+// drill-down, not a pane you'd casually cycle through.
 impl Focus {
     fn next(self) -> Focus {
         match self {
@@ -457,6 +455,11 @@ struct AppRow {
 }
 
 const FLOW_CAP: usize = 200;
+/// one sparkline bar per this much wall time. Matched to the daemon's own
+/// stats cadence (daemon::LISTEN_SCAN_INTERVAL) — sampling faster would just
+/// draw the same number spread across several bars
+const BLOCKED_SAMPLE: std::time::Duration = std::time::Duration::from_secs(5);
+const BLOCKED_HIST_CAP: usize = 120;
 
 /// `flow` is global across all apps (kept after decision so the pane reads as
 /// a history); the Apps pane's selection decides which slice Flow shows.
@@ -506,6 +509,12 @@ struct App {
     /// port / ip / name the log tab is narrowed to; empty = all
     log_filter: String,
     blocklist: ipc::BlocklistStats,
+    /// blocked lookups per sampling window, oldest first — sampled on our own
+    /// clock rather than on the daemon's updates, so a window in which
+    /// nothing was blocked is a zero rather than a gap
+    blocked_hist: VecDeque<u64>,
+    blocked_prev: u64,
+    blocked_sampled_at: Instant,
 }
 
 /// total rx/tx bytes across every interface except loopback, from
@@ -628,6 +637,9 @@ fn new_app(cfg: Config) -> App {
         app_log_all: Vec::new(),
         log_filter: String::new(),
         blocklist: ipc::BlocklistStats::default(),
+        blocked_hist: VecDeque::new(),
+        blocked_prev: 0,
+        blocked_sampled_at: Instant::now(),
     };
     if !app.cfg.rule.is_empty() {
         app.state.select(Some(0));
@@ -682,6 +694,19 @@ pub fn run(cfg: Config) {
                     }
                 }
             }
+            // the daemon only pushes blocklist counters when they move, so
+            // sampling on its messages would draw a quiet minute as no data
+            // at all instead of as zeroes. One bar per window, on our clock.
+            if now.duration_since(app.blocked_sampled_at) >= BLOCKED_SAMPLE {
+                app.blocked_sampled_at = now;
+                let total = app.blocklist.blocked;
+                app.blocked_hist
+                    .push_back(total.saturating_sub(app.blocked_prev));
+                app.blocked_prev = total;
+                while app.blocked_hist.len() > BLOCKED_HIST_CAP {
+                    app.blocked_hist.pop_front();
+                }
+            }
             continue;
         }
         if let Event::Key(key) = event::read().expect("read event") {
@@ -713,9 +738,9 @@ pub fn run(cfg: Config) {
                 save_theme_idx(app.theme_idx);
                 continue;
             }
-            // jumpable to from anywhere, same idea as `t` — the app log is
+            // jumpable to from anywhere, same idea as `t` — the audit tab is
             // its own tab, not nested under any pane's local keys
-            if key.code == KeyCode::Char('L')
+            if key.code == KeyCode::Char('A')
                 && !matches!(app.mode, Mode::Add(_) | Mode::Filter | Mode::LogFilter)
             {
                 if in_log_tab(app.focus) {
@@ -1016,9 +1041,7 @@ fn rebuild_apps(app: &mut App) {
             });
         }
     }
-    // apps with no rule at all first: they're the ones waiting on a decision,
-    // and they'd otherwise be buried alphabetically among the settled ones
-    rows.sort_by_key(|r| (r.rule.is_some() || r.port_overrides > 0, r.exe.clone()));
+    rows.sort_by(|a, b| a.exe.cmp(&b.exe));
     if !app.apps_filter.is_empty() {
         let needle = app.apps_filter.to_lowercase();
         rows.retain(|r| r.exe.to_lowercase().contains(&needle));
@@ -1446,21 +1469,24 @@ fn draw(f: &mut Frame, app: &mut App) {
         // (not Percentage) so the halves are exactly equal — no rounding
         // drift between panes, which is what breaks top/bottom alignment
         // across columns.
-        // one column per subject: the kernel-level rules on the left, the
-        // per-app picture in the middle, everything the blocklists do on the
-        // right. The middle gets the width because both of its panes need it
-        // — a bar per app, and an app list beside its own live flow
-        let main = Layout::horizontal([
-            Constraint::Percentage(24),
-            Constraint::Percentage(50),
-            Constraint::Percentage(26),
+        // Top band, one column per subject: the kernel-level rules on the
+        // left, what the machine has been doing in the middle, everything
+        // the blocklists do on the right. Bottom band: the pane you actually
+        // work in, across the whole width — an app list beside its own live
+        // flow, where every column of a flow row is a field worth reading.
+        let [top, bottom] =
+            Layout::vertical([Constraint::Percentage(52), Constraint::Percentage(48)])
+                .areas(outer[1]);
+        let cols = Layout::horizontal([
+            Constraint::Percentage(28),
+            Constraint::Percentage(44),
+            Constraint::Percentage(28),
         ])
-        .split(outer[1]);
-        let mid = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).split(main[1]);
-        draw_rules(f, app, main[0]);
-        draw_top_apps(f, app, mid[0]);
-        draw_app_control(f, app, mid[1]);
-        draw_blocking(f, app, main[2]);
+        .split(top);
+        draw_rules(f, app, cols[0]);
+        draw_top_apps(f, app, cols[1]);
+        draw_blocking(f, app, cols[2]);
+        draw_app_control(f, app, bottom);
     }
 
     draw_footer(f, app, outer[2]);
@@ -1576,7 +1602,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     };
     let in_tab = in_log_tab(app.focus);
     if !in_tab {
-        keys.push(("L", "log + ports"));
+        keys.push(("A", "audit"));
     }
     keys.push(("t", "theme"));
     if !(in_tab && app.app_log_confirm_flush) {
@@ -1713,7 +1739,7 @@ fn draw_app_log(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 format!(" /{}", app.log_filter)
             };
-            format!("app log — {scope}{needle} ({} entries)", app.app_log.len())
+            format!("audit — {scope}{needle} ({} entries)", app.app_log.len())
         },
         app.focus == Focus::AppLog,
     ));
@@ -1886,7 +1912,7 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let heading = if app.apps_filter.is_empty() {
-        "apps — undecided first".to_string()
+        format!("apps ({})", app.apps.len())
     } else {
         format!("apps — /{} ({} shown)", app.apps_filter, app.apps.len())
     };
@@ -1933,8 +1959,10 @@ fn draw_app_control(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     // the divider is a column of its own so neither list ever draws over it
+    // the app list is a name and a verdict; the flow is a whole record per
+    // row, so it takes the width the full-width band buys
     let [left, rule, right] = Layout::horizontal([
-        Constraint::Percentage(38),
+        Constraint::Percentage(26),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
@@ -2057,73 +2085,54 @@ fn group(n: u64) -> String {
     out
 }
 
-/// A ring chart of `segments`, drawn with braille dots on a Canvas.
+/// A one-row stacked bar: blocked on the left in the deny colour, allowed on
+/// the right in the allow colour, sized to `area.width`.
 ///
-/// `area` must be twice as wide as it is tall for the ring to come out
-/// round: a braille dot is half a cell wide and a quarter of one tall, and
-/// a terminal cell is about twice as tall as it is wide, so the dot grid is
-/// square only when there are twice as many cells across as down.
-fn draw_ring(f: &mut Frame, area: Rect, segments: Vec<(u64, Color)>, empty: Color) {
-    let total: u64 = segments.iter().map(|(v, _)| v).sum();
-    let canvas = Canvas::default()
-        .marker(Marker::Braille)
-        .x_bounds([-1.0, 1.0])
-        .y_bounds([-1.0, 1.0])
-        .paint(move |ctx| {
-            if total == 0 {
-                // an empty ring, not an empty pane: the shape is the label
-                ring_arc(ctx, 0.0, std::f64::consts::TAU, empty);
-                return;
-            }
-            // start at 12 o'clock and go clockwise, the way a share of a
-            // whole is read on paper
-            let mut from = std::f64::consts::FRAC_PI_2;
-            for (value, color) in &segments {
-                if *value == 0 {
-                    continue;
-                }
-                let sweep = -(*value as f64 / total as f64) * std::f64::consts::TAU;
-                ring_arc(ctx, from, sweep, *color);
-                from += sweep;
-            }
-        });
-    f.render_widget(canvas, area);
-}
-
-/// one band of the ring, sampled densely enough that it reads as solid at
-/// the handful of rows this pane gets
-fn ring_arc(ctx: &mut Context, from: f64, sweep: f64, color: Color) {
-    const INNER: f64 = 0.52;
-    const OUTER: f64 = 0.94;
-    const BANDS: usize = 14;
-    let steps = (sweep.abs() * 260.0).ceil().max(2.0) as usize;
-    let mut pts = Vec::with_capacity(steps * (BANDS + 1));
-    for i in 0..=steps {
-        let a = from + sweep * (i as f64 / steps as f64);
-        let (sin, cos) = a.sin_cos();
-        for b in 0..=BANDS {
-            let r = INNER + (OUTER - INNER) * (b as f64 / BANDS as f64);
-            pts.push((cos * r, sin * r));
-        }
+/// A proportion in a column this narrow is easier to read across than around
+/// — the bar carries the split, and the figures under it carry the numbers.
+/// Each side is given at least one cell whenever it is non-zero, so a rate
+/// too small to round up to a cell still shows as present rather than as
+/// nothing at all.
+fn stacked_bar(width: u16, blocked: u64, allowed: u64, theme: Theme) -> Line<'static> {
+    let width = width as usize;
+    let total = blocked + allowed;
+    if width == 0 {
+        return Line::from("");
     }
-    ctx.draw(&Points {
-        coords: &pts,
-        color,
-    });
+    if total == 0 {
+        return Line::from(Span::styled(
+            "░".repeat(width),
+            Style::new().fg(theme.border_idle),
+        ));
+    }
+    let mut n = (blocked as f64 / total as f64 * width as f64).round() as usize;
+    n = n.clamp(usize::from(blocked > 0), width - usize::from(allowed > 0));
+    Line::from(vec![
+        Span::styled("█".repeat(n), Style::new().fg(theme.deny)),
+        Span::styled("█".repeat(width - n), Style::new().fg(theme.allow)),
+    ])
 }
 
 /// The ads / tracking column: everything the blocklists are doing.
 ///
-/// A ring of DNS lookups allowed vs blocked with the block rate in the hole,
-/// then every figure repeated under its own label — a ring answers "roughly
-/// how much" and the number under it answers "how much" — then the names
-/// most recently blocked, which is where a false positive announces itself
-/// the moment a page breaks.
-///
-/// Laid out down the column rather than across it: this is the full height
-/// of the right-hand column, so there is room to stack, and stacking keeps
-/// the same shape at every terminal width instead of reflowing at some
-/// threshold.
+/// Splits `n` rows off the top of `rest`, leaving the remainder behind —
+/// None when there aren't that many, which is how a pane drops an element
+/// whole instead of drawing it clipped.
+fn take_rows(rest: &mut Rect, n: u16) -> Option<Rect> {
+    if rest.height < n || n == 0 {
+        return None;
+    }
+    let [got, left] = Layout::vertical([Constraint::Length(n), Constraint::Min(0)]).areas(*rest);
+    *rest = left;
+    Some(got)
+}
+
+/// Three views of the same thing, stacked down the column. A bar for the
+/// split of DNS lookups blocked vs allowed — proportion, read across. A
+/// sparkline of blocks per five-second window — trend, which the split
+/// cannot show. Then every figure under its own label, and the names most
+/// recently blocked, which is where a false positive announces itself the
+/// moment a page breaks.
 fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
     let theme = THEMES[app.theme_idx];
     let b = &app.blocklist;
@@ -2169,59 +2178,59 @@ fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
         b.blocked as f64 / b.queries as f64 * 100.0
     };
 
-    // the figures are the part that must always be readable, so they get
-    // their rows first and the ring takes what is left, up to a size where
-    // more braille stops adding anything
-    const FIGURES: u16 = 10;
-    let ring_h = (inner.width / 4)
-        .min(9)
-        .min(inner.height.saturating_sub(FIGURES + 2));
-    let (ring_area, rest) = if ring_h >= 3 {
-        let [r, rest] =
-            Layout::vertical([Constraint::Length(ring_h), Constraint::Min(0)]).areas(inner);
-        (Some(r), rest)
-    } else {
-        (None, inner)
-    };
+    let dim = Style::new().fg(theme.border_idle);
 
-    if let Some(r) = ring_area {
-        // twice as wide as tall, centred: see draw_ring
-        let w = (ring_h * 2).min(r.width);
-        let r = Rect {
-            x: r.x + (r.width - w) / 2,
-            width: w,
-            ..r
-        };
-        draw_ring(
-            f,
-            r,
-            vec![(b.blocked, theme.deny), (allowed, theme.allow)],
-            theme.border_idle,
+    // Rows are handed out in order of what you would miss most if it were
+    // gone, and each element is skipped whole rather than drawn clipped:
+    // the split first, then the figures, then the trend, then the names.
+    // A short pane loses the tail; it never loses the top.
+    let mut rest = inner;
+
+    if let Some(area) = take_rows(&mut rest, 2) {
+        let [head, bar] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("blocked ", dim),
+                Span::styled(
+                    format!("{rate:.1}%"),
+                    Style::new().fg(theme.deny).add_modifier(Modifier::BOLD),
+                ),
+            ]))
+            .style(theme.base()),
+            head,
         );
-        // the rate goes in the hole, where a donut puts its headline — but
-        // only if the hole can hold it, otherwise the label would be drawn
-        // over the band it is supposed to sit inside
-        let hole = (r.width as f64 * 0.52) as usize;
-        let label = match hole {
-            6.. => Some(format!("{rate:.1}%")),
-            4..=5 => Some(format!("{rate:.0}%")),
-            _ => None,
-        };
-        if let Some(label) = label {
-            f.render_widget(
-                Paragraph::new(label)
-                    .alignment(Alignment::Center)
-                    .style(theme.base().fg(theme.deny).add_modifier(Modifier::BOLD)),
-                Rect {
-                    y: r.y + r.height / 2,
-                    height: 1,
-                    ..r
-                },
-            );
-        }
+        f.render_widget(
+            Paragraph::new(stacked_bar(bar.width, b.blocked, allowed, theme))
+                .style(theme.base()),
+            bar,
+        );
     }
 
-    let dim = Style::new().fg(theme.border_idle);
+    // trend: one bar per sampling window, which the split above cannot show
+    if let Some(area) = take_rows(&mut rest, 3) {
+        let [label, spark] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        f.render_widget(
+            Paragraph::new(Span::styled("blocks per 5s", dim)).style(theme.base()),
+            label,
+        );
+        // newest on the right, only as many windows as there are columns
+        let n = spark.width as usize;
+        let data: Vec<u64> = app
+            .blocked_hist
+            .iter()
+            .skip(app.blocked_hist.len().saturating_sub(n))
+            .copied()
+            .collect();
+        f.render_widget(
+            Sparkline::default()
+                .data(&data)
+                .style(Style::new().fg(theme.deny).bg(theme.bg)),
+            spark,
+        );
+    }
+
     let figure = |dot_color: Color, label: &str, value: String| {
         [
             Line::from(vec![
@@ -2238,45 +2247,48 @@ fn draw_blocking(f: &mut Frame, app: &App, area: Rect) {
     lines.extend(figure(theme.fg, "lookups", group(b.queries)));
     lines.extend(figure(theme.deny, "blocked", group(b.blocked)));
     lines.extend(figure(theme.allow, "allowed", group(allowed)));
-    let pair = |label: &str, value: String, color: Color| {
-        Line::from(vec![
-            Span::styled(format!("{label:<9}"), dim),
-            Span::styled(value, Style::new().fg(color)),
-        ])
-    };
-    lines.push(pair("domains", group(b.domains as u64), theme.fg));
-    lines.push(pair("lists", b.sources.len().to_string(), theme.fg));
-    lines.push(pair(
-        "updated",
-        match b.updated_at {
-            Some(t) => format!("{} ago", ago(now_ts().saturating_sub(t))),
-            None => "never".into(),
-        },
-        if b.updated_at.is_some() {
-            theme.fg
-        } else {
-            theme.warn
-        },
-    ));
-    lines.push(pair(
-        "enc dns",
-        if b.encrypted_dns_blocked {
-            "refused".into()
-        } else {
-            "bypassable".into()
-        },
-        if b.encrypted_dns_blocked {
-            theme.allow
-        } else {
-            theme.warn
-        },
-    ));
-
+    // the three counters get a line each for their number, as the headline
+    // figures; what the lists themselves are doing is state, not a quantity
+    // you read off, so it pairs up onto two lines
+    lines.push(Line::from(vec![
+        Span::styled("lists ", dim),
+        Span::styled(b.sources.len().to_string(), Style::new().fg(theme.fg)),
+        Span::styled(" · domains ", dim),
+        Span::styled(group(b.domains as u64), Style::new().fg(theme.fg)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("updated ", dim),
+        Span::styled(
+            match b.updated_at {
+                Some(t) => format!("{} ago", ago(now_ts().saturating_sub(t))),
+                None => "never".into(),
+            },
+            Style::new().fg(if b.updated_at.is_some() {
+                theme.fg
+            } else {
+                theme.warn
+            }),
+        ),
+        Span::styled(" · dns ", dim),
+        Span::styled(
+            if b.encrypted_dns_blocked {
+                "refused"
+            } else {
+                "bypassable"
+            },
+            Style::new().fg(if b.encrypted_dns_blocked {
+                theme.allow
+            } else {
+                theme.warn
+            }),
+        ),
+    ]));
     let figures_h = (lines.len() as u16).min(rest.height);
-    let [figures_area, recent_area] =
-        Layout::vertical([Constraint::Length(figures_h), Constraint::Min(0)]).areas(rest);
-    f.render_widget(Paragraph::new(lines).style(theme.base()), figures_area);
+    if let Some(area) = take_rows(&mut rest, figures_h) {
+        f.render_widget(Paragraph::new(lines).style(theme.base()), area);
+    }
 
+    let recent_area = rest;
     if recent_area.height < 2 {
         return;
     }
@@ -2416,6 +2428,58 @@ mod tests {
         }
     }
 
+    /// a populated App, for the render tests and for eyeballing a layout
+    fn demo_app() -> App {
+        let mut app = new_app(Config::default());
+        app.blocklist = ipc::BlocklistStats {
+            enabled: true,
+            encrypted_dns_blocked: true,
+            sources: vec!["hagezi:pro".into()],
+            domains: 224_039,
+            queries: 12_345,
+            blocked: 2_345,
+            recent: vec![
+                (now_ts() - 400, "ads.doubleclick.net".into()),
+                (now_ts() - 90, "telemetry.microsoft.com".into()),
+                (now_ts() - 5, "graph.facebook.com".into()),
+            ],
+            updated_at: Some(now_ts() - 7200),
+        };
+        app.blocked_hist = (0..40).map(|i| (i * 7) % 13).collect();
+        app.cfg.rule = vec![Rule {
+            id: 1,
+            action: Action::Allow,
+            proto: Proto::Tcp,
+            src: "192.168.1.0/24".into(),
+            port: Some(22),
+            enabled: true,
+        }];
+        for (exe, n) in [
+            ("/usr/bin/firefox", 4210u64),
+            ("/usr/bin/curl", 91),
+            ("/usr/lib/thunderbird/thunderbird", 12),
+        ] {
+            app.counts.insert(exe.into(), n);
+            app.flow
+                .push(demo_flow(443, "140.82.121.4", Some("github.com"), exe));
+            app.flow.push(demo_flow(80, "93.184.216.34", None, exe));
+        }
+        app.app_rules = vec![AppRule {
+            id: 1,
+            exe: "/usr/bin/firefox".into(),
+            port: None,
+            direction: None,
+            action: Action::Allow,
+            enabled: true,
+            expires: None,
+            fingerprint: None,
+            host: None,
+        }];
+        rebuild_apps(&mut app);
+        app.focus = Focus::Apps;
+        app
+    }
+
     #[test]
     fn a_numeric_log_filter_is_a_port_not_a_substring() {
         let e = demo_flow(443, "140.82.121.4", Some("github.com"), "/usr/bin/curl");
@@ -2466,18 +2530,7 @@ mod tests {
     #[test]
     fn every_screen_renders_at_any_terminal_size() {
         for (w, h) in [(200, 60), (120, 40), (80, 24), (60, 20), (40, 12), (20, 8)] {
-            let mut app = new_app(Config::default());
-            app.blocklist = ipc::BlocklistStats {
-                enabled: true,
-                encrypted_dns_blocked: true,
-                sources: vec!["hagezi:pro".into()],
-                domains: 224_039,
-                queries: 12_345,
-                blocked: 2_345,
-                recent: vec![(0, "ads.example.com".into())],
-                updated_at: Some(1),
-            };
-            app.flow = vec![demo_flow(443, "140.82.121.4", Some("github.com"), "/usr/bin/curl")];
+            let mut app = demo_app();
             app.listening = vec![ipc::ListenEntry {
                 proto: "tcp".into(),
                 addr: "0.0.0.0".into(),
@@ -2485,7 +2538,6 @@ mod tests {
                 exe: "/usr/bin/sshd".into(),
             }];
             app.counts.insert("/usr/bin/curl".into(), 1_234_567);
-            app.counts.insert("/usr/bin/firefox".into(), 42);
             rebuild_apps(&mut app);
 
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -2526,4 +2578,5 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
     }
 }
+
 
