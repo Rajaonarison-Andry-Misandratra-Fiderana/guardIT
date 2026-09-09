@@ -296,6 +296,13 @@ pub struct Config {
     /// open, and can answer with `guardit answer`
     #[serde(default = "default_true")]
     pub notify: bool,
+    /// Also filter traffic that only passes through this machine —
+    /// containers, bridged VMs. Off by default, and accept-by-default when
+    /// on: there is no local process behind a forwarded packet, so per-app
+    /// control cannot apply, and only the ip/port rules and the name-based
+    /// blocking do. See `ruleset::forward_chain`
+    #[serde(default)]
+    pub filter_forwarded: bool,
     #[serde(default)]
     pub blocklist: BlocklistConfig,
     /// Settings this build does not know about, carried through untouched.
@@ -318,6 +325,7 @@ impl Default for Config {
             pending_timeout_secs: default_pending_timeout(),
             default_verdict: default_verdict(),
             notify: true,
+            filter_forwarded: false,
             blocklist: BlocklistConfig::default(),
             extra: toml::Table::new(),
         }

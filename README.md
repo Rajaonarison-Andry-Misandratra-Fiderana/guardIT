@@ -67,10 +67,16 @@ that stays true. Three things could break it, and all three are handled:
   no network until someone intervenes. The unit sets `StartLimitIntervalSec=0` so it never
   stops trying.
 
-What is out of scope: **forwarded traffic**. guardit hooks `input` and `output`, so a
-container or a bridged VM sending through this host is not seen. Per-app control means
-nothing there anyway — there is no local process to attribute a packet to — and a `forward`
-chain that dropped by default would break every container runtime on the machine.
+**Forwarded traffic** — containers, bridged VMs — is off by default and covered by
+`filter_forwarded = true`. Per-app control cannot apply there: a forwarded packet has no
+local process to attribute it to, which is a fact about routing rather than a gap to close.
+What does apply is everything about addresses and names — your ip/port rules, the
+encrypted-DNS refusals, and the blocklists, since the forward chain taps DNS the same way
+and a container's own lookups feed the same name map.
+
+The chain accepts by default and its queue bypasses, so it can only ever subtract from what
+already flows: a container runtime that stopped working because the firewall daemon
+restarted would be a far worse bargain than the filtering is worth.
 
 Check it's running:
 

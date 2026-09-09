@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **`filter_forwarded`**: guardit can now filter traffic that only passes through this
+  machine — containers, bridged VMs. Names and addresses only: your ip/port rules, the
+  encrypted-DNS refusals, and the blocklists, fed by the same DNS tap, which now watches
+  the forward chain too. Per-app control cannot apply, since a forwarded packet has no
+  local process behind it. Off by default; accept-by-default and bypassing when on, so it
+  can only subtract from what already flows and a restarting daemon never cuts container
+  networking.
 - **A blocked name is answered locally now, not refused on the way back.** The query is
   dropped before it leaves the machine and the answer is put on the wire from here, so it
   costs no round trip and the name is never asked out loud — the privacy half of blocking,

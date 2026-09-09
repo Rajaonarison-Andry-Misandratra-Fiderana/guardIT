@@ -22,6 +22,12 @@ pub const QUEUE_OUT: u16 = 1;
 /// DOES bypass: it decides nothing, so a stopped daemon must not stall
 /// name resolution on top of everything else it already blocks.
 pub const QUEUE_DNS: u16 = 2;
+/// Forwarded traffic — containers, bridged VMs — when `filter_forwarded` is
+/// on. This one DOES bypass, and the chain's policy is accept: there is no
+/// local process behind a forwarded packet, so per-app control cannot mean
+/// anything here, and a default-drop forward chain would take down every
+/// container runtime on the machine the first time the daemon hiccuped.
+pub const QUEUE_FWD: u16 = 3;
 
 fn rule_line(r: &Rule) -> String {
     let mut parts = vec![];
@@ -153,8 +159,41 @@ pub fn render(cfg: &Config) -> String {
         "    ct state new log prefix \"{LOG_PREFIX_OUT}\" queue num {QUEUE_OUT}\n"
     ));
     out.push_str("  }\n");
+    if cfg.filter_forwarded {
+        forward_chain(&mut out, cfg, block_dns);
+    }
     out.push_str("}\n");
     out
+}
+
+/// What guardit can say about traffic that is only passing through.
+///
+/// Not per-app: a forwarded packet has no local process to attribute it to,
+/// which is not a gap to be closed but a fact about routing. What it can
+/// carry is everything that is about addresses and names — the ip/port
+/// rules, the encrypted-dns refusals, and the blocklists via the DNS tap,
+/// which sees a container's lookups the same way it sees anything else.
+///
+/// Accept by default, and the queue bypasses. A container runtime that
+/// stops working because the firewall daemon restarted would be a far worse
+/// bargain than the filtering is worth.
+fn forward_chain(out: &mut String, cfg: &Config, block_dns: bool) {
+    out.push_str("  chain forward {\n");
+    out.push_str("    type filter hook forward priority 0; policy accept;\n");
+    out.push_str(&format!("    udp sport 53 queue num {QUEUE_DNS} bypass\n"));
+    out.push_str(&format!("    tcp sport 53 queue num {QUEUE_DNS} bypass\n"));
+    out.push_str(&format!("    udp dport 53 queue num {QUEUE_DNS} bypass\n"));
+    if block_dns {
+        encrypted_dns_chain(out);
+    }
+    for r in cfg.rule.iter().filter(|r| r.enabled) {
+        out.push_str(&rule_line(r));
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "    ct state new queue num {QUEUE_FWD} bypass\n"
+    ));
+    out.push_str("  }\n");
 }
 
 pub fn apply(cfg: &Config) -> Result<(), String> {
@@ -272,6 +311,36 @@ mod tests {
         };
         let out = render(&cfg);
         assert!(out.contains("ip6 saddr fd00::1/64 tcp dport 22 accept"));
+    }
+
+    #[test]
+    fn forwarded_traffic_is_untouched_unless_asked_for_and_never_fails_closed() {
+        let mut cfg = Config::default();
+        cfg.rule.push(Rule {
+            id: 1,
+            action: Action::Deny,
+            proto: Proto::Tcp,
+            src: "any".into(),
+            port: Some(23),
+            enabled: true,
+        });
+        assert!(
+            !render(&cfg).contains("hook forward"),
+            "off by default — a forward chain nobody asked for can only break things"
+        );
+
+        cfg.filter_forwarded = true;
+        let out = render(&cfg);
+        let chain = out.split("chain forward").nth(1).unwrap();
+        assert!(chain.contains("policy accept;"), "must never default-drop");
+        assert!(
+            chain.contains(&format!("queue num {QUEUE_FWD} bypass")),
+            "must bypass: a restarting daemon cannot be allowed to cut container networking"
+        );
+        assert!(chain.contains("tcp dport 23 drop"), "the ip rules apply here too");
+        // the tap, so a container's own lookups feed the same name map
+        assert!(chain.contains(&format!("udp sport 53 queue num {QUEUE_DNS} bypass")));
+        assert!(chain.contains(&format!("udp dport 53 queue num {QUEUE_DNS} bypass")));
     }
 
     #[test]

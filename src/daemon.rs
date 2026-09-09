@@ -3,7 +3,7 @@ use crate::config::{
     Action, AppRule, Config, Direction, config_path, fingerprint, match_rule, now_ts,
 };
 use crate::ipc::{self, ClientMsg, FlowStatus, FlowWire, ServerMsg};
-use crate::ruleset::{QUEUE_DNS, QUEUE_IN, QUEUE_OUT};
+use crate::ruleset::{QUEUE_DNS, QUEUE_FWD, QUEUE_IN, QUEUE_OUT};
 use nfq::{Queue, Verdict};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -1677,6 +1677,41 @@ fn ensure_ruleset_loaded() {
     }
 }
 
+/// Blocklist enforcement for traffic that is only passing through.
+///
+/// One check and no others. There is no local process behind a forwarded
+/// packet, so nothing here can ask which app wanted it, which rules to
+/// consult, or whether the address was ever looked up by anyone we watch —
+/// `require_resolved` in particular would refuse a container's every
+/// connection, since its lookups may never cross this machine at all.
+///
+/// What does work is names: the forward chain taps DNS the same way the
+/// input chain does, so a container's own lookups populate the same map,
+/// and a destination whose name is on a list can be turned away.
+///
+/// Everything else is accepted. The chain's policy is accept and its queue
+/// bypasses, so this can only ever subtract from what already flows.
+fn forward_loop() -> std::io::Result<()> {
+    let mut queue = Queue::open()?;
+    queue.bind(QUEUE_FWD)?;
+    eprintln!("guardit daemon: bound queue {QUEUE_FWD} (forwarded) — containers and bridged vms");
+    loop {
+        let mut msg = queue.recv()?;
+        let blocked = parse_packet(msg.get_payload()).and_then(|pkt| {
+            let name = peer_name(&pkt.dst_ip)?;
+            BLOCKLIST.read().unwrap().blocked(&name).then_some(name)
+        });
+        match blocked {
+            Some(name) => {
+                note_blocked(&name, None);
+                msg.set_verdict(Verdict::Drop);
+            }
+            None => msg.set_verdict(Verdict::Accept),
+        }
+        queue.verdict(msg)?;
+    }
+}
+
 fn to_verdict(action: Action) -> Verdict {
     match action {
         Action::Allow => Verdict::Accept,
@@ -1749,6 +1784,17 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
 
     if !debug {
         std::thread::spawn(blocklist_update_loop);
+    }
+
+    if cfg.filter_forwarded && !debug {
+        std::thread::spawn(|| {
+            if let Err(e) = forward_loop() {
+                eprintln!(
+                    "guardit daemon: forwarded queue ({QUEUE_FWD}) stopped: {e} — \
+                     traffic through this machine is no longer filtered"
+                );
+            }
+        });
     }
 
     if !debug {
