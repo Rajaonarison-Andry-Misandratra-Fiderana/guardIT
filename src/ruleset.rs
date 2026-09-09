@@ -181,6 +181,21 @@ pub fn apply(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Is guardit's table actually in the kernel right now?
+///
+/// nftables keeps nothing across a reboot, and any privileged thing on the
+/// machine — another firewall front-end, a container runtime, a hand-typed
+/// `nft flush ruleset` — can take the table out from under a running daemon.
+/// The daemon would go on holding its queues while no rule sent anything to
+/// them, which is not a failure anybody would notice: traffic simply stops
+/// being controlled.
+pub fn is_loaded() -> bool {
+    Command::new("nft")
+        .args(["list", "table", "inet", TABLE])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 pub fn status() -> String {
     let out = Command::new("nft")
         .args(["list", "table", "inet", TABLE])

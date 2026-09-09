@@ -1,6 +1,14 @@
 [Unit]
 Description=guardit — per-app firewall daemon
 After=network-pre.target
+# systemd gives up on a unit that fails 5 times in 10s and leaves it stopped.
+# That is the one outcome this daemon must never reach: the ruleset stays
+# loaded with `queue num 0/1` and nothing listening on them, so every new
+# connection is dropped — deliberately, since the queues have no `bypass` —
+# and the machine has no network until someone notices and intervenes by
+# hand. Never stop trying instead: a crash loop costs connectivity only
+# while it lasts, and recovers by itself the moment the cause clears.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

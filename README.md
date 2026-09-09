@@ -49,6 +49,29 @@ autodetects which one you have:
   root `cron @reboot` entry. If `cron` isn't installed either, the script stops and tells
   you to install it first.
 
+### Everything goes through it, or nothing is enforced
+
+The queue rules for connections carry no `bypass`, so a dead daemon means new
+connections are dropped rather than let through — the deny-first guarantee only holds if
+that stays true. Three things could break it, and all three are handled:
+
+- **A reboot.** nftables keeps nothing across one. Both start paths load the ruleset before
+  the daemon binds its queues (`ExecStartPre` in the unit, the loop in
+  `guardit-supervise.sh`).
+- **Something flushing the table underneath.** A container runtime, another firewall
+  front-end, one hand-typed `nft flush ruleset` — the daemon would carry on holding queues
+  nothing routes to any more, which looks like nothing at all from the outside. It checks
+  every 5 seconds, reloads, and says so.
+- **A crash loop.** systemd gives up on a unit that fails five times in ten seconds and
+  leaves it stopped — with the ruleset still loaded and no listener, that is a machine with
+  no network until someone intervenes. The unit sets `StartLimitIntervalSec=0` so it never
+  stops trying.
+
+What is out of scope: **forwarded traffic**. guardit hooks `input` and `output`, so a
+container or a bridged VM sending through this host is not seen. Per-app control means
+nothing there anyway — there is no local process to attribute a packet to — and a `forward`
+chain that dropped by default would break every container runtime on the machine.
+
 Check it's running:
 
 ```

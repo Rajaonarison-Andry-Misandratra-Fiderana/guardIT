@@ -93,6 +93,15 @@
   rejected, and the DoH bootstrap names plus Mozilla's `use-application-dns.net` canary
   return NXDOMAIN. `reject`, not `drop`, so clients fall back to plain DNS at once rather
   than hanging.
+- **The ruleset can no longer go missing without the daemon noticing.** Anything with root
+  can flush guardit's nftables table, and the daemon would carry on holding queues nothing
+  routed to any more — traffic simply stops being controlled, and nothing about that looks
+  broken. It now checks every 5 seconds and reloads, loudly.
+- **The daemon never gets abandoned by systemd.** The unit hit the default start limit —
+  five failures in ten seconds and it is left stopped, with the ruleset still loaded and
+  no listener on the queues, which is a machine with no network at all until someone
+  intervenes by hand. `StartLimitIntervalSec=0`: a crash loop now costs connectivity only
+  while it lasts.
 - **A connection refused by a blocklist now reads as refused in the flow pane**, and says
   which policy did it. The pane recomputed each row's colour from the app rules alone, so a
   connection to a blocked name under a whole-app `allow` was painted green while the daemon

@@ -1494,6 +1494,35 @@ fn note_unresolved(exe: &str, peer: &str, port: u16) {
     }
 }
 
+/// Puts the ruleset back if something took it away.
+///
+/// Both start-up paths load it, so this is only about what happens
+/// afterwards: nftables holds nothing across a reboot, and anything with
+/// root — a container runtime, another firewall front-end, one hand-typed
+/// `nft flush ruleset` — can drop guardit's table while the daemon carries
+/// on holding queues that nothing routes to any more. Nothing about that
+/// looks broken from the outside. Traffic simply stops being controlled.
+///
+/// Said loudly, because it means something on this machine is fighting us
+/// and putting the table back is treating a symptom.
+fn ensure_ruleset_loaded() {
+    if crate::ruleset::is_loaded() {
+        return;
+    }
+    eprintln!(
+        "guardit daemon: the nftables table is gone — something flushed it. Reloading; \
+         if this repeats, another firewall tool on this machine is taking it out."
+    );
+    match Config::try_load() {
+        Ok(cfg) => {
+            if let Err(e) = crate::ruleset::apply(&cfg) {
+                eprintln!("guardit daemon: could not reload the ruleset: {e}");
+            }
+        }
+        Err(e) => eprintln!("guardit daemon: cannot reload the ruleset: {e}"),
+    }
+}
+
 fn to_verdict(action: Action) -> Verdict {
     match action {
         Action::Allow => Verdict::Accept,
@@ -1593,6 +1622,7 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
                 if changed {
                     let _ = scan_event_tx.send(ServerMsg::Listening(fresh));
                 }
+                ensure_ruleset_loaded();
                 let stats = blocklist_stats(&BLOCKLIST_CFG.lock().unwrap().clone());
                 if stats != last_stats {
                     last_stats = stats.clone();
