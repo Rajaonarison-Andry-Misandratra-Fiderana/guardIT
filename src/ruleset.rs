@@ -146,6 +146,9 @@ pub fn render(cfg: &Config) -> String {
     if block_dns {
         encrypted_dns_chain(&mut out);
     }
+    // queries, not just the replies the input chain taps: a blocked name is
+    // answered from here, so the question never leaves the machine
+    out.push_str(&format!("    udp dport 53 queue num {QUEUE_DNS} bypass\n"));
     out.push_str(&format!(
         "    ct state new log prefix \"{LOG_PREFIX_OUT}\" queue num {QUEUE_OUT}\n"
     ));
@@ -303,13 +306,16 @@ mod tests {
         let out = render(&cfg);
         assert!(out.contains(&format!("queue num {QUEUE_IN}\n")));
         for line in out.lines().filter(|l| l.contains("bypass")) {
-            assert!(line.contains("sport 53"), "unexpected bypass: {line}");
+            assert!(
+                line.contains("sport 53") || line.contains("dport 53"),
+                "unexpected bypass: {line}"
+            );
         }
         assert!(out.contains(&format!("queue num {QUEUE_OUT}\n")));
         assert_eq!(
             out.matches("bypass").count(),
-            2,
-            "only the DNS tap bypasses — its udp and tcp halves"
+            3,
+            "only the DNS tap bypasses — replies over udp and tcp, and queries"
         );
         assert!(out.contains(&format!("udp sport 53 queue num {QUEUE_DNS} bypass\n")));
         let dns = out.find("sport 53").unwrap();

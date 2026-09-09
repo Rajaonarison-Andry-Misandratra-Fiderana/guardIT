@@ -313,6 +313,8 @@ fn dns_loop() -> std::io::Result<()> {
             Nothing,
             Learn(String, Vec<IpAddr>),
             Nxdomain(String, Option<String>, Vec<IpAddr>, Vec<u8>),
+            /// answered here and now; the question never leaves
+            Sinkhole(String, Option<String>, Vec<u8>, Ipv4Addr),
         }
         let act = {
             let payload = msg.get_payload();
@@ -347,9 +349,40 @@ fn dns_loop() -> std::io::Result<()> {
                         None => Act::Nothing,
                     }
                 }
+                // A query on its way out. Answering it here is the whole
+                // point: the name is never asked out loud, and the app has
+                // its answer without waiting for a round trip it was only
+                // ever going to lose.
+                Some(pkt) if pkt.proto == 17 && pkt.dst_port == 53 => {
+                    let blocked = payload
+                        .get(pkt.l4 + 8..)
+                        .and_then(dns_question)
+                        .filter(|(name, _)| BLOCKLIST.read().unwrap().blocked(name));
+                    match blocked {
+                        Some((name, q_end)) => {
+                            match (sinkhole_reply_v4(payload, pkt.l4, q_end), pkt.src_ip) {
+                                (Some(reply), IpAddr::V4(back_to)) => {
+                                    DNS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                                    let exe = resolve_exe_cached(17, pkt.src_port)
+                                        .filter(|e| Some(e) != local_resolver().as_ref());
+                                    Act::Sinkhole(name, exe, reply, back_to)
+                                }
+                                // ipv6, or a packet we could not build an
+                                // answer for: let it go and refuse the reply
+                                _ => Act::Nothing,
+                            }
+                        }
+                        None => Act::Nothing,
+                    }
+                }
                 Some(pkt) if pkt.proto == 17 && pkt.src_port == 53 => {
                     DNS_TOTAL.fetch_add(1, Ordering::Relaxed);
                     match payload.get(pkt.l4 + 8..) {
+                        // already NXDOMAIN: either upstream said so, or it is
+                        // the answer we injected ourselves coming back past
+                        // this tap. Either way there is nothing to rewrite,
+                        // and counting it would count the same refusal twice
+                        Some(dns) if dns.len() > 3 && dns[3] & 0x0F == 3 => Act::Nothing,
                         Some(dns) => match dns_question(dns) {
                             Some((name, q_end)) if BLOCKLIST.read().unwrap().blocked(&name) => {
                                 match nxdomain_reply(payload, pkt.l4, q_end) {
@@ -395,6 +428,17 @@ fn dns_loop() -> std::io::Result<()> {
                 learn_names(&name, ips);
                 msg.set_payload(new);
                 note_blocked(&name, exe);
+            }
+            Act::Sinkhole(name, exe, reply, back_to) => {
+                // the query is dropped only once its answer is on the wire —
+                // failing to send it would otherwise leave the app waiting
+                // for something nobody is going to say
+                if send_raw_v4(&reply, back_to) {
+                    note_blocked(&name, exe);
+                    msg.set_verdict(Verdict::Drop);
+                    queue.verdict(msg)?;
+                    continue;
+                }
             }
         }
 
@@ -512,6 +556,116 @@ fn ones_complement(runs: &[&[u8]]) -> u16 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+/// Builds the answer to a query we are about to drop, addressed back to
+/// whoever asked.
+///
+/// This is the sinkhole: the query never leaves the machine, so a blocked
+/// name costs no round trip and leaks nothing to the upstream resolver.
+/// Rewriting the *reply* — which is what happens when this cannot be used —
+/// gets the same verdict one round trip later, and after the name has been
+/// asked out loud.
+///
+/// IPv4 only. Supplying a whole IPv6 header on a raw socket needs
+/// `IPV6_HDRINCL` and a different socket shape for no gain worth the second
+/// code path; an IPv6 query falls through to the reply rewrite, which
+/// works, so the failure mode here is "as before" rather than "unhandled".
+fn sinkhole_reply_v4(query: &[u8], l4: usize, q_end: usize) -> Option<Vec<u8>> {
+    if query.first()? >> 4 != 4 {
+        return None;
+    }
+    let dns = query.get(l4 + 8..)?;
+    let question = dns.get(12..q_end)?;
+
+    let mut body = Vec::with_capacity(12 + question.len() + 64);
+    body.extend_from_slice(&dns[0..2]);
+    body.push(0x80 | (dns[2] & 0x01));
+    body.push(0x83);
+    body.extend_from_slice(&[0, 1, 0, 0, 0, 1, 0, 0]);
+    body.extend_from_slice(question);
+    push_soa(&mut body);
+
+    // the ip header of the query, with the two ends swapped: the answer goes
+    // back exactly the way the question came
+    let mut out = query.get(..l4 + 8)?.to_vec();
+    out[12..16].copy_from_slice(&query[16..20]);
+    out[16..20].copy_from_slice(&query[12..16]);
+    out[l4..l4 + 2].copy_from_slice(&query[l4 + 2..l4 + 4]);
+    out[l4 + 2..l4 + 4].copy_from_slice(&query[l4..l4 + 2]);
+    out.extend_from_slice(&body);
+
+    let udp_len = (8 + body.len()) as u16;
+    let total = (l4 + udp_len as usize) as u16;
+    out[2..4].copy_from_slice(&total.to_be_bytes());
+    out[8] = 64; // a fresh ttl: this packet starts here
+    out[10..12].copy_from_slice(&[0, 0]);
+    let ip_ck = ones_complement(&[&out[..l4]]);
+    out[10..12].copy_from_slice(&ip_ck.to_be_bytes());
+
+    out[l4 + 4..l4 + 6].copy_from_slice(&udp_len.to_be_bytes());
+    out[l4 + 6..l4 + 8].copy_from_slice(&[0, 0]);
+    let ck = ones_complement(&[
+        &out[12..20],
+        &[0, 17],
+        &udp_len.to_be_bytes(),
+        &out[l4..l4 + udp_len as usize],
+    ]);
+    let ck = if ck == 0 { 0xFFFF } else { ck };
+    out[l4 + 6..l4 + 8].copy_from_slice(&ck.to_be_bytes());
+    Some(out)
+}
+
+/// One raw socket for the whole daemon, opened on first use.
+///
+/// `IPPROTO_RAW` means the header we build is the header that goes out,
+/// which is what lets the answer carry the resolver's address as its source
+/// — the client is waiting to hear from that address and will ignore
+/// anything else.
+static RAW4: LazyLock<Option<std::os::fd::OwnedFd>> = LazyLock::new(|| {
+    // SAFETY: a plain socket(2) with constant arguments; the descriptor is
+    // adopted by OwnedFd, which closes it, and never handed out elsewhere
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW) };
+    if fd < 0 {
+        eprintln!(
+            "guardit daemon: no raw socket ({}) — blocked names will be refused on the reply \
+             instead of locally, which costs a round trip each",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    // SAFETY: fd is a fresh, valid, owned descriptor
+    Some(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+});
+
+/// Puts a packet we built on the wire, addressed to `dst`.
+fn send_raw_v4(packet: &[u8], dst: Ipv4Addr) -> bool {
+    use std::os::fd::AsRawFd;
+    let Some(sock) = RAW4.as_ref() else {
+        return false;
+    };
+    let addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(dst.octets()),
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: `packet` is a live slice whose length is passed alongside it,
+    // and `addr` is a fully initialised sockaddr_in whose size is passed as
+    // its own length. sendto reads both and retains neither.
+    let sent = unsafe {
+        libc::sendto(
+            sock.as_raw_fd(),
+            packet.as_ptr() as *const libc::c_void,
+            packet.len(),
+            0,
+            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    sent == packet.len() as isize
 }
 
 /// A DNS message carried over TCP: the payload offset and its length.
@@ -2449,6 +2603,73 @@ mod tests {
         let mut p = dns_reply_packet_tcp(0);
         p[40] = 0xFF;
         assert!(tcp_dns_span(&p, 20).is_none());
+    }
+
+    /// a query for the same name, as an app would send it
+    fn dns_query_packet() -> Vec<u8> {
+        let mut dns = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in ["ads", "example", "com"] {
+            dns.push(label.len() as u8);
+            dns.extend_from_slice(label.as_bytes());
+        }
+        dns.push(0);
+        dns.extend_from_slice(&[0, 1, 0, 1]);
+
+        let udp_len = (8 + dns.len()) as u16;
+        let total = (20 + udp_len) as u16;
+        let mut p = vec![0x45, 0];
+        p.extend_from_slice(&total.to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
+        p.extend_from_slice(&[10, 0, 0, 2]); // src: us
+        p.extend_from_slice(&[1, 1, 1, 1]); // dst: the resolver
+        p.extend_from_slice(&40000u16.to_be_bytes());
+        p.extend_from_slice(&53u16.to_be_bytes());
+        p.extend_from_slice(&udp_len.to_be_bytes());
+        p.extend_from_slice(&[0, 0]);
+        p.extend_from_slice(&dns);
+        p
+    }
+
+    #[test]
+    fn the_sinkhole_answers_the_asker_as_the_resolver_would_have() {
+        let q = dns_query_packet();
+        let (name, q_end) = dns_question(&q[28..]).unwrap();
+        assert_eq!(name, "ads.example.com");
+        let out = sinkhole_reply_v4(&q, 20, q_end).unwrap();
+
+        // the two ends swapped: the client is waiting to hear from the
+        // address it asked, on the port it asked from
+        assert_eq!(&out[12..16], &q[16..20], "from the resolver");
+        assert_eq!(&out[16..20], &q[12..16], "to whoever asked");
+        assert_eq!(&out[20..22], &q[22..24], "from port 53");
+        assert_eq!(&out[22..24], &q[20..22], "to their ephemeral port");
+
+        let dns = &out[28..];
+        assert_eq!(&dns[0..2], &q[28..30], "same transaction id");
+        assert_eq!(dns[2] & 0x80, 0x80, "an answer");
+        assert_eq!(dns[3] & 0x0F, 3, "NXDOMAIN");
+        assert_eq!(u16::from_be_bytes([dns[8], dns[9]]), 1, "with an SOA");
+        assert_eq!(dns_question(dns).unwrap().0, "ads.example.com");
+
+        // lengths and both checksums, or no stack will accept it
+        assert_eq!(u16::from_be_bytes([out[2], out[3]]) as usize, out.len());
+        assert_eq!(u16::from_be_bytes([out[24], out[25]]) as usize, out.len() - 20);
+        assert_eq!(ones_complement(&[&out[..20]]), 0, "ip checksum");
+        let udp_len = (out.len() - 20) as u16;
+        assert_eq!(
+            ones_complement(&[&out[12..20], &[0, 17], &udp_len.to_be_bytes(), &out[20..]]),
+            0,
+            "udp checksum"
+        );
+    }
+
+    #[test]
+    fn the_sinkhole_declines_what_it_cannot_answer() {
+        // ipv6 falls through to the reply rewrite rather than being answered
+        let mut v6 = dns_query_packet();
+        v6[0] = 0x60;
+        assert!(sinkhole_reply_v4(&v6, 20, 21).is_none());
+        assert!(sinkhole_reply_v4(&[0u8; 8], 20, 21).is_none());
     }
 
     #[test]

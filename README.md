@@ -152,6 +152,12 @@ A host rule is the **most specific** kind, so it beats a per-port rule, which be
 app's whole-app default. `allow firefox --port 443` plus `deny firefox --host
 '*.doubleclick.net'` means exactly what it reads: HTTPS everywhere except that domain.
 
+A blocked name is answered **here**, not upstream: the query is refused before it leaves
+the machine, so it costs no round trip and the name is never asked out loud. That needs a
+raw socket to put the answer on the wire as the resolver would have; where one is not
+available, or for an IPv6 query, it falls back to rewriting the reply — same verdict, one
+round trip later.
+
 Blocking happens twice, at both layers. A blocked name's DNS answer is rewritten to
 NXDOMAIN, so nothing connects. And if a connection reaches a blocked name anyway — the app
 had the address cached, or resolved it somewhere unreadable — it is refused at the

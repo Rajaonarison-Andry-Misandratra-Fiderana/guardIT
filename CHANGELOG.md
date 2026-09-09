@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A blocked name is answered locally now, not refused on the way back.** The query is
+  dropped before it leaves the machine and the answer is put on the wire from here, so it
+  costs no round trip and the name is never asked out loud — the privacy half of blocking,
+  which rewriting the reply could never give. IPv6 queries and machines without a raw
+  socket fall back to the reply rewrite: same verdict, one round trip later.
 - **DNS over TCP is filtered too.** The tap only ever saw UDP, so a resolver falling back
   to TCP after a truncated answer — or one configured to prefer it — walked past the lists
   for free. TCP replies are rewritten in place at exactly their original length, since
