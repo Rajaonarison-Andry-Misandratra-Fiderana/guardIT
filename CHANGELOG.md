@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **An app's flow survives a restart.** The daemon hands a new client a capped slice of
+  recent history across all apps, so a program busy yesterday and quiet today showed an
+  empty pane while its whole trail sat in `history.jsonl`. Selecting an app now reads its
+  earlier flow back off that file, once, and the pane's cap is per app rather than overall
+  — a global one let a single chatty program evict everything else.
 - **`y`/`n` in the flow pane rules the row, not the port.** Denying
   `curl -> port 53 -> ads.example.com` used to deny curl port 53 outright, which stopped
   its DNS rather than stopping it reaching that name. The rule now carries the peer the row

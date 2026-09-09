@@ -489,7 +489,12 @@ struct AppRow {
     port_overrides: usize,
 }
 
-const FLOW_CAP: usize = 200;
+/// How much of each app's history the flow pane holds.
+///
+/// Per app, not overall: a global cap means one chatty program evicts every
+/// other app's history, so selecting a quiet one shows an empty pane even
+/// though its whole trail is on disk.
+const FLOW_PER_APP: usize = 300;
 
 /// `flow` is global across all apps (kept after decision so the pane reads as
 /// a history); the Apps pane's selection decides which slice Flow shows.
@@ -524,8 +529,11 @@ struct App {
     /// which pane to return to on q/L from AppLog — it's not a Tab stop, so
     /// "back" has to remember where you came from
     prev_focus: Focus,
-    /// None = full unthrottled trail (global L); Some(exe) = just that app
-    /// (l from Apps/Flow/Conflicts)
+    /// apps whose earlier flow has already been read back off disk — once
+    /// each, since the disk copy does not change behind us
+    flow_hydrated: HashSet<String>,
+    /// None = full unthrottled trail (global A); Some(exe) = just that app
+    /// (a from Apps/Flow/Conflicts)
     app_log_filter: Option<String>,
     app_log_confirm_flush: bool,
     /// case-insensitive substring the Apps pane is narrowed to; empty = all.
@@ -675,6 +683,7 @@ fn new_app(cfg: Config) -> App {
         app_log: Vec::new(),
         app_log_state: TableState::default(),
         prev_focus: Focus::Rules,
+        flow_hydrated: HashSet::new(),
         app_log_filter: None,
         app_log_confirm_flush: false,
         apps_filter: String::new(),
@@ -1042,10 +1051,7 @@ fn drain_ipc(app: &mut App) {
             }
         }
     }
-    if app.flow.len() > FLOW_CAP {
-        let excess = app.flow.len() - FLOW_CAP;
-        app.flow.drain(0..excess);
-    }
+    trim_flow(app);
     rebuild_apps(app);
     reset_flow_selection(app);
 }
@@ -1131,7 +1137,68 @@ fn current_flow_indices(app: &App) -> Vec<usize> {
     idxs
 }
 
+/// Keeps the newest `FLOW_PER_APP` rows of every app, rather than the newest
+/// N rows overall — otherwise one busy program's traffic evicts the history
+/// of every app you might actually want to look at.
+fn trim_flow(app: &mut App) {
+    if app.flow.len() <= FLOW_PER_APP {
+        return;
+    }
+    let mut kept: HashMap<&str, usize> = HashMap::new();
+    let mut keep = vec![false; app.flow.len()];
+    for (i, e) in app.flow.iter().enumerate().rev() {
+        let n = kept.entry(e.exe.as_str()).or_default();
+        if *n < FLOW_PER_APP {
+            *n += 1;
+            keep[i] = true;
+        }
+    }
+    let mut it = keep.into_iter();
+    app.flow.retain(|_| it.next().unwrap_or(false));
+}
+
+/// Reads an app's earlier flow back off disk, the first time you look at it.
+///
+/// The daemon hands a new client a capped slice of recent history across all
+/// apps, so a program that was busy yesterday and quiet today arrives with
+/// an empty pane — while its whole trail is sitting in history.jsonl, which
+/// is where the audit tab reads it from. Same file, filtered to the app,
+/// merged in front of what is already held.
+///
+/// Cut by time rather than deduplicated: everything in memory is newer than
+/// everything being added, so taking only entries older than the oldest one
+/// held cannot double up a row.
+fn hydrate_flow(app: &mut App, exe: &str) {
+    if !app.flow_hydrated.insert(exe.to_string()) {
+        return;
+    }
+    let oldest = app
+        .flow
+        .iter()
+        .filter(|e| e.exe == exe)
+        .map(|e| e.ts)
+        .min()
+        .unwrap_or(u64::MAX);
+    let mut older: Vec<FlowWire> = read_app_log(FLOW_PER_APP, Some(exe))
+        .into_iter()
+        .filter(|e| e.ts < oldest)
+        .collect();
+    if older.is_empty() {
+        return;
+    }
+    older.append(&mut app.flow);
+    app.flow = older;
+}
+
 fn reset_flow_selection(app: &mut App) {
+    if let Some(exe) = app
+        .apps_state
+        .selected()
+        .and_then(|i| app.apps.get(i))
+        .map(|r| r.exe.clone())
+    {
+        hydrate_flow(app, &exe);
+    }
     let idxs = current_flow_indices(app);
     app.flow_state
         .select(if idxs.is_empty() { None } else { Some(0) });
@@ -1416,6 +1483,9 @@ fn apps_delete_selected(app: &mut App) {
     ipc.send(&ClientMsg::RmAppRule { exe: exe.clone() });
 
     app.flow.retain(|e| e.exe != exe);
+    // forgetting the app forgets what we read for it too, so selecting it
+    // again reads its trail back rather than showing nothing
+    app.flow_hydrated.remove(&exe);
     rebuild_apps(app);
     reset_flow_selection(app);
 }
@@ -2885,6 +2955,35 @@ mod tests {
         rebuild_apps(&mut app);
         app.focus = Focus::Apps;
         app
+    }
+
+    #[test]
+    fn trimming_the_flow_keeps_each_apps_own_history() {
+        let mut app = new_app(Config::default());
+        // one chatty app and one quiet one, interleaved oldest-first
+        for i in 0..(FLOW_PER_APP * 2) {
+            let mut e = demo_flow(443, "1.1.1.1", None, "/usr/bin/chatty");
+            e.ts = i as u64;
+            app.flow.push(e);
+            if i == 0 {
+                let mut q = demo_flow(443, "2.2.2.2", None, "/usr/bin/quiet");
+                q.ts = 0;
+                app.flow.push(q);
+            }
+        }
+        trim_flow(&mut app);
+        assert_eq!(
+            app.flow.iter().filter(|e| e.exe.ends_with("quiet")).count(),
+            1,
+            "a global cap would have evicted the quiet app entirely"
+        );
+        assert_eq!(
+            app.flow.iter().filter(|e| e.exe.ends_with("chatty")).count(),
+            FLOW_PER_APP
+        );
+        // and it kept the newest of the chatty ones, not the oldest
+        let newest = app.flow.iter().map(|e| e.ts).max().unwrap();
+        assert_eq!(newest, (FLOW_PER_APP * 2 - 1) as u64);
     }
 
     #[test]
