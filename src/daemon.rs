@@ -868,12 +868,55 @@ fn inode_pid_map() -> HashMap<u64, u32> {
 }
 
 /// inode -> owning pid, by scanning /proc/*/fd for a `socket:[inode]` symlink
+/// The processes that owned the last few sockets we resolved.
+///
+/// Small on purpose: this is a guess at who is about to open the next
+/// connection, and the guess is usually right — a page load is one browser
+/// opening fifty sockets, not fifty programs opening one each.
+const RECENT_PIDS: usize = 16;
+static RECENT: LazyLock<Mutex<VecDeque<u32>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+fn remember_pid(pid: u32) {
+    let mut recent = RECENT.lock().unwrap();
+    if let Some(i) = recent.iter().position(|&p| p == pid) {
+        recent.remove(i);
+    }
+    if recent.len() >= RECENT_PIDS {
+        recent.pop_back();
+    }
+    recent.push_front(pid);
+}
+
+/// Who owns this socket, asked the cheap way first.
+///
+/// The expensive way — the only way, before this — is to walk every
+/// /proc/<pid>/fd on the machine, and it runs while the connection's first
+/// packet sits in the queue waiting for a verdict. Measured here: ~9 ms
+/// unprivileged over 298 processes, and the daemon is root, so it sees all
+/// of them and rather more descriptors.
+///
+/// Every outbound connection gets a fresh ephemeral port, so the (proto,
+/// port) cache above never helps it: before this, opening a page meant one
+/// full walk of /proc per connection, serialised behind one another in the
+/// queue thread.
+///
+/// So the recently-seen processes are checked first, and a browser opening
+/// fifty sockets pays the full walk once and a single directory listing for
+/// the other forty-nine. The full walk is still there, still authoritative,
+/// and still what answers for a process we have not seen before.
 fn find_pid_by_inode(inode: u64) -> Option<u32> {
-    fs::read_dir("/proc")
+    let recent: Vec<u32> = RECENT.lock().unwrap().iter().copied().collect();
+    if let Some(&pid) = recent.iter().find(|&&pid| pid_owns_inode(pid, inode)) {
+        remember_pid(pid);
+        return Some(pid);
+    }
+    let pid = fs::read_dir("/proc")
         .ok()?
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .find(|&pid| pid_owns_inode(pid, inode))
+        .find(|&pid| pid_owns_inode(pid, inode))?;
+    remember_pid(pid);
+    Some(pid)
 }
 
 /// does `pid` still hold an fd pointing at socket `inode` right now?
@@ -1887,6 +1930,31 @@ fn handle_client_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fast path guesses which process to check first; it must never
+    /// guess an *answer*. Every candidate is confirmed against /proc before
+    /// it is returned, so a stale or dead pid in the recent list can only
+    /// cost a directory listing, never produce a wrong owner.
+    #[test]
+    fn a_stale_recent_pid_cannot_produce_a_wrong_owner() {
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let inode = find_inode(6, port).expect("our listener is in /proc/net/tcp");
+
+        // pid 1 is real but does not own this socket; the second is not a
+        // process at all. Both are the kind of thing the recent list holds
+        // after a program exits.
+        RECENT.lock().unwrap().clear();
+        remember_pid(1);
+        remember_pid(u32::MAX);
+        assert_eq!(
+            find_pid_by_inode(inode),
+            Some(std::process::id()),
+            "the guess is checked, not trusted"
+        );
+        // and having answered, the process that did own it is remembered
+        assert_eq!(RECENT.lock().unwrap().front().copied(), Some(std::process::id()));
+    }
 
     /// the one check that fails if inode_pid_map stops agreeing with the
     /// per-inode scan it replaced: bind a real socket, then look it up both ways

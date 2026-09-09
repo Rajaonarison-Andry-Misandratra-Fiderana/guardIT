@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Connection setup got a lot cheaper.** Resolving which process owns a socket walked
+  every `/proc/<pid>/fd` on the machine, once per connection, while that connection's first
+  packet sat in the queue waiting for a verdict — and serialised, since the queue thread
+  handles one at a time. Every outbound connection gets a fresh ephemeral port, so the
+  existing (proto, port) cache never helped it. The processes that owned the last few
+  sockets are now checked first, so a browser opening fifty sockets pays the full walk once
+  and a single directory listing for the other forty-nine. Every candidate is still
+  confirmed against `/proc`, so the guess can cost a listing but never name the wrong app.
 - **`require_resolved`**: refuse outbound HTTPS to an address no DNS answer ever named.
   `block_encrypted_dns` closes the DoH endpoints there are lists for; this closes the ones
   there aren't, on the evidence that an app which never asked for a name cannot have

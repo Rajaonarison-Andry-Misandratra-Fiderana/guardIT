@@ -2066,7 +2066,7 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let heading = if app.apps_filter.is_empty() {
-        format!("apps ({}) — new first", app.apps.len())
+        format!("apps ({})", app.apps.len())
     } else {
         format!("apps — /{} ({} shown)", app.apps_filter, app.apps.len())
     };
@@ -2674,8 +2674,8 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = THEMES[app.theme_idx];
     let heading = match app.apps_state.selected().and_then(|i| app.apps.get(i)) {
-        Some(row) => format!("flow — {}", basename(&row.exe)),
-        None => "flow — select an app".to_string(),
+        Some(row) => basename(&row.exe).to_string(),
+        None => "select an app".to_string(),
     };
     let idxs = current_flow_indices(app);
     let items: Vec<ListItem> = idxs
