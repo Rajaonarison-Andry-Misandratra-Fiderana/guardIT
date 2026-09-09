@@ -538,6 +538,14 @@ fn blocklist_cmd(cfg: Config, sub: BlocklistCmd) {
                 }
             );
             println!(
+                "unresolved:    {}",
+                if b.require_resolved {
+                    "refused (:443 and :853 to addresses no lookup was seen for)"
+                } else {
+                    "allowed — an unlisted DoH endpoint still gets through"
+                }
+            );
+            println!(
                 "auto-update:   {}",
                 match b.update_hours {
                     0 => "off".to_string(),

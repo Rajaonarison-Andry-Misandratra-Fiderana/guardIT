@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **`require_resolved`**: refuse outbound HTTPS to an address no DNS answer ever named.
+  `block_encrypted_dns` closes the DoH endpoints there are lists for; this closes the ones
+  there aren't, on the evidence that an app which never asked for a name cannot have
+  learnt the address from a resolver we can read. Off by default — an app with a hardcoded
+  address is refused on the same evidence — and a rule naming that exact port overrides it.
+  The name map now evicts its oldest half at the cap instead of emptying itself, which was
+  harmless while it only labelled a dashboard and would have been an outage here.
 - **Blocked lookups are written to `/etc/guardit/blocked.jsonl`** and read back by
   `guardit blocklist log`, so a page that broke this morning is still answerable this
   afternoon. Capped at 8 MB (the older half is dropped) because this is written per DNS

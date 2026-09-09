@@ -5,7 +5,7 @@ use crate::config::{
 use crate::ipc::{self, ClientMsg, FlowStatus, FlowWire, ServerMsg};
 use crate::ruleset::{QUEUE_DNS, QUEUE_IN, QUEUE_OUT};
 use nfq::{Queue, Verdict};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -254,14 +254,38 @@ fn parse_ipv6(payload: &[u8]) -> Option<PktInfo> {
     })
 }
 
-/// ip -> the name whose lookup returned it, fed by dns_loop
-static DNS_NAMES: LazyLock<Mutex<HashMap<IpAddr, String>>> =
+/// ip -> the name whose lookup returned it, and when we learnt it. Fed by
+/// dns_loop; read for display, for host rules, and — once
+/// `require_resolved` is on — to decide whether a destination was ever
+/// asked for at all.
+static DNS_NAMES: LazyLock<Mutex<HashMap<IpAddr, (String, Instant)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// ponytail: no TTL, the whole map is dropped past this many entries
-const DNS_NAMES_CAP: usize = 8192;
+const DNS_NAMES_CAP: usize = 16384;
 
 pub fn peer_name(ip: &IpAddr) -> Option<String> {
-    DNS_NAMES.lock().unwrap().get(ip).cloned()
+    DNS_NAMES.lock().unwrap().get(ip).map(|(n, _)| n.clone())
+}
+
+/// Records every address a lookup returned, evicting the oldest half at the
+/// cap rather than emptying the map.
+///
+/// It used to clear wholesale, which was harmless while this only put names
+/// next to addresses on a dashboard. It is not harmless now: with
+/// `require_resolved` on, an empty map means every destination looks
+/// unasked-for, and the machine would lose the network the moment the
+/// 16384th name arrived.
+fn learn_names(name: &str, ips: Vec<IpAddr>) {
+    let mut map = DNS_NAMES.lock().unwrap();
+    if map.len() >= DNS_NAMES_CAP {
+        let mut ages: Vec<Instant> = map.values().map(|(_, at)| *at).collect();
+        ages.sort_unstable();
+        let cutoff = ages[ages.len() / 2];
+        map.retain(|_, (_, at)| *at >= cutoff);
+    }
+    let now = Instant::now();
+    for ip in ips {
+        map.insert(ip, (name.to_string(), now));
+    }
 }
 
 /// DNS tap on QUEUE_DNS: every UDP reply from port 53 passes through here.
@@ -324,15 +348,7 @@ fn dns_loop() -> std::io::Result<()> {
 
         match act {
             Act::Nothing => {}
-            Act::Learn(name, ips) => {
-                let mut map = DNS_NAMES.lock().unwrap();
-                if map.len() >= DNS_NAMES_CAP {
-                    map.clear();
-                }
-                for ip in ips {
-                    map.insert(ip, name.clone());
-                }
-            }
+            Act::Learn(name, ips) => learn_names(&name, ips),
             Act::Nxdomain(name, exe, new) => {
                 msg.set_payload(new);
                 note_blocked(&name, exe);
@@ -1218,6 +1234,91 @@ fn blocklist_update_loop() {
     }
 }
 
+/// how long after start the daemon refuses to enforce `require_resolved`.
+/// The name map is empty when it comes up and every app's own DNS cache is
+/// not, so the first minute would otherwise deny connections that were
+/// resolved perfectly legitimately just before we started watching.
+const REQUIRE_RESOLVED_GRACE: Duration = Duration::from_secs(60);
+
+/// Addresses this policy never applies to: the machine itself, the local
+/// network, and everything that is not a routable unicast destination.
+/// A lookup is how you find a *remote* service by name; nobody resolves a
+/// name to reach their own router's admin page, and denying that would make
+/// the policy unusable rather than strict.
+fn is_local_address(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                // 100.64/10, carrier-grade NAT — the address of a router, not
+                // of anything anyone looked up
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                // fc00::/7 unique-local and fe80::/10 link-local
+                || (v6.segments()[0] & 0xFE00) == 0xFC00
+                || (v6.segments()[0] & 0xFFC0) == 0xFE80
+        }
+    }
+}
+
+/// Ports the policy covers.
+///
+/// Not every port: an app with an address in its configuration is ordinary
+/// for a mail client, a game, an NTP client, and denying all of that to
+/// close one hole would be a bad trade. Encrypted DNS lives on 443 (DoH,
+/// and DoH3 over QUIC) and 853 (DoT/DoQ), so those are what this watches.
+/// ponytail: fixed pair of ports, make it a config list if anyone needs a
+/// DoH endpoint on a nonstandard one closed
+const REQUIRE_RESOLVED_PORTS: [u16; 2] = [443, 853];
+
+/// Was this destination ever named in a DNS answer we saw?
+///
+/// `None` means the policy does not apply here at all; `Some(false)` means
+/// it applies and the address was never asked for — which, for a public
+/// address on an HTTPS port, means the app resolved it somewhere this daemon
+/// cannot read. That is the DoH bypass, without needing a list of who
+/// provides DoH.
+fn unresolved_destination(
+    started: Instant,
+    peer: &IpAddr,
+    port: u16,
+    dir: Direction,
+    name: Option<&str>,
+) -> bool {
+    dir == Direction::Out
+        && name.is_none()
+        && REQUIRE_RESOLVED_PORTS.contains(&port)
+        && !is_local_address(peer)
+        && started.elapsed() >= REQUIRE_RESOLVED_GRACE
+        // an empty map means the tap is not working, not that nothing was
+        // ever resolved — failing closed on that would be a self-inflicted
+        // outage every time the DNS queue is misconfigured
+        && !DNS_NAMES.lock().unwrap().is_empty()
+}
+
+/// Says so once per app, then keeps quiet.
+///
+/// A refusal with no explanation anywhere is the worst thing this policy
+/// could do — the flow row shows a drop to a bare address, which is the
+/// signature but not the reason. One journal line per app names both.
+fn note_unresolved(exe: &str, peer: &str, port: u16) {
+    static SAID: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    if SAID.lock().unwrap().insert(exe.to_string()) {
+        eprintln!(
+            "guardit daemon: {exe} -> {peer}:{port} refused: no lookup was seen for that address \
+             (blocklist.require_resolved). `guardit app allow {exe} --port {port}` if it is meant to."
+        );
+    }
+}
+
 fn to_verdict(action: Action) -> Verdict {
     match action {
         Action::Allow => Verdict::Accept,
@@ -1244,6 +1345,7 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<ServerMsg>();
     let timeout = Duration::from_secs(cfg.pending_timeout_secs as u64);
     let default_verdict = cfg.default_verdict;
+    let require_resolved = cfg.blocklist.enabled && cfg.blocklist.require_resolved;
     let notify = cfg.notify;
 
     let mut threads = Vec::new();
@@ -1266,6 +1368,7 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
                 event_tx,
                 timeout,
                 default_verdict,
+                require_resolved,
                 debug,
             ) {
                 eprintln!("guardit daemon: queue {queue_num} ({dir:?}) stopped: {e}");
@@ -1352,8 +1455,10 @@ fn queue_loop(
     event_tx: Sender<ServerMsg>,
     timeout: Duration,
     default_verdict: Action,
+    require_resolved: bool,
     debug: bool,
 ) -> std::io::Result<()> {
+    let started = Instant::now();
     let mut queue = Queue::open()?;
     queue.bind(queue_num)?;
     eprintln!("guardit daemon: bound queue {queue_num} ({dir:?}) — waiting for new connections");
@@ -1399,13 +1504,55 @@ fn queue_loop(
 
         // a per-port override (Flow pane) wins over the app's whole-app
         // default (Apps/Conflicts panes) when both exist for this app
-        let matched = ruled(
+        let rule = match_rule(
             &app_rules.lock().unwrap(),
             &exe,
-            rule_port,
-            dir,
+            Some(rule_port),
+            Some(dir),
             peer_name.as_deref(),
-        );
+        )
+        .filter(|r| !r.stale())
+        .cloned();
+        let matched = rule.as_ref().map(|r| r.action);
+
+        // An address nothing ever resolved, on an HTTPS port, reached by an
+        // app: it did not learn that address from any lookup this daemon
+        // saw, which is what an app talking DoH to an endpoint we have no
+        // list for looks like.
+        //
+        // A rule naming this exact port beats it — that is someone saying
+        // "yes, this one" about a specific service, which is a decision the
+        // policy has no business overriding. A whole-app allow does not: it
+        // means "this app may use the network", not "by any means it likes".
+        let deliberate = rule
+            .as_ref()
+            .is_some_and(|r| r.port.is_some() && r.action == Action::Allow);
+        if require_resolved
+            && !deliberate
+            && unresolved_destination(started, &peer_addr, rule_port, dir, peer_name.as_deref())
+        {
+            note_unresolved(&exe, &peer_ip, rule_port);
+            let wire = FlowWire {
+                req_id: None,
+                exe: exe.clone(),
+                direction: dir,
+                proto: proto_name(pkt.proto).to_string(),
+                port: Some(rule_port),
+                peer_ip: peer_ip.clone(),
+                peer_name: None,
+                status: FlowStatus::Denied,
+                ts: now_ts(),
+            };
+            append_history_line(&wire);
+            let throttle_key = (exe.clone(), pkt.proto, rule_port, true);
+            if should_log_matched(&throttle, throttle_key) {
+                push_history(&history, wire.clone());
+                let _ = event_tx.send(ServerMsg::FlowNew(wire));
+            }
+            msg.set_verdict(Verdict::Drop);
+            queue.verdict(msg)?;
+            continue;
+        }
 
         let verdict = match matched {
             Some(action) => {
@@ -1793,6 +1940,65 @@ mod tests {
         p.extend_from_slice(&[0, 0]);
         p.extend_from_slice(&dns);
         p
+    }
+
+    #[test]
+    fn only_routable_remote_addresses_can_be_refused_for_lack_of_a_lookup() {
+        // getting this wrong takes the machine off its own network, so it is
+        // spelled out rather than trusted to the std helpers alone
+        for local in [
+            "127.0.0.1", "10.1.2.3", "192.168.1.1", "172.16.0.1", "169.254.1.1",
+            "100.64.0.1", "224.0.0.1", "0.0.0.0", "255.255.255.255",
+            "::1", "fe80::1", "fd00::1", "ff02::1", "::",
+        ] {
+            assert!(
+                is_local_address(&local.parse().unwrap()),
+                "{local} must never be refused"
+            );
+        }
+        for remote in ["1.1.1.1", "140.82.121.4", "8.8.8.8", "2606:4700::1111", "2001:db8::1"] {
+            assert!(!is_local_address(&remote.parse().unwrap()), "{remote}");
+        }
+        // 172.16/12 stops at 172.31; 172.32 is public
+        assert!(!is_local_address(&"172.32.0.1".parse().unwrap()));
+        // 100.64/10 stops at 100.127
+        assert!(!is_local_address(&"100.128.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn require_resolved_only_fires_on_an_unnamed_remote_https_destination() {
+        let old = Instant::now()
+            .checked_sub(REQUIRE_RESOLVED_GRACE * 2)
+            .expect("a clock that far along");
+        let remote: IpAddr = "140.82.121.4".parse().unwrap();
+        // the map has to have something in it, or an unconfigured dns queue
+        // would read as "nothing was ever resolved"
+        learn_names("example.com", vec!["93.184.216.34".parse().unwrap()]);
+
+        assert!(
+            unresolved_destination(old, &remote, 443, Direction::Out, None),
+            "public https address nobody looked up"
+        );
+        assert!(
+            !unresolved_destination(old, &remote, 443, Direction::Out, Some("github.com")),
+            "we saw the lookup that produced it"
+        );
+        assert!(
+            !unresolved_destination(old, &remote, 22, Direction::Out, None),
+            "ssh to an address from a config file is ordinary"
+        );
+        assert!(
+            !unresolved_destination(old, &"192.168.1.10".parse().unwrap(), 443, Direction::Out, None),
+            "the local network is reached without asking anyone"
+        );
+        assert!(
+            !unresolved_destination(old, &remote, 443, Direction::In, None),
+            "inbound: nobody here resolved anything"
+        );
+        assert!(
+            !unresolved_destination(Instant::now(), &remote, 443, Direction::Out, None),
+            "within the grace, every app's own dns cache is warmer than ours"
+        );
     }
 
     #[test]

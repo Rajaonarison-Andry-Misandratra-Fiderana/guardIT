@@ -199,6 +199,20 @@ for Firefox to turn its own DoH off. `reject`, not `drop`, so a client falls bac
 DNS immediately instead of hanging. Turn it off with `block_encrypted_dns = false` if you
 run your own encrypted resolver on purpose.
 
+That closes the DoH endpoints anyone has a list of. `require_resolved = true` closes the
+ones nobody does: the daemon already records every address it saw a DNS answer produce, so
+an app connecting to a public address on port 443 or 853 that **no lookup ever named** did
+not learn it from any resolver guardit can read. That is what talking DoH to an unlisted
+endpoint looks like, without needing to know who provides it.
+
+It is off by default, because an app with an address compiled in is refused on the same
+evidence. A rule naming that exact port beats the policy — `guardit app allow /usr/bin/foo
+--port 443` is you saying "yes, this one" — while a whole-app allow does not, since that
+means "may use the network", not "by any means it likes". The daemon says which app it
+refused, once per app, in its log. Local, private, link-local and CGNAT addresses are never
+subject to it, and neither is anything in the first minute after the daemon starts, when
+its name map is empty and every app's own DNS cache is not.
+
 ### Configuration
 
 ```toml
@@ -208,6 +222,7 @@ categories = ["ads", "phishing", "telemetry"]
 sources = ["oisd:small"]     # extra lists on top of the categories
 allow = ["cdn.example.com"]
 block_encrypted_dns = true
+require_resolved = false     # refuse :443/:853 to addresses no lookup named
 update_hours = 24            # 0 to never auto-update
 ```
 

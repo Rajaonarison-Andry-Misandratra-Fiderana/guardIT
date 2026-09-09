@@ -248,6 +248,14 @@ pub struct BlocklistConfig {
     /// its own DoH ignores blocking entirely — see the README
     #[serde(default = "default_true")]
     pub block_encrypted_dns: bool,
+    /// refuse outbound HTTPS to an address no lookup was ever seen for.
+    /// `block_encrypted_dns` closes the DoH endpoints we know about; this
+    /// closes the ones we don't, because an app that resolved out of band
+    /// has no other way to have learnt the address. Off by default: an app
+    /// with a hardcoded ip is refused too, which is the point and also the
+    /// risk — see the README
+    #[serde(default)]
+    pub require_resolved: bool,
     /// how often the daemon refetches the enabled lists; 0 = never
     #[serde(default = "default_update_hours")]
     pub update_hours: u32,
@@ -261,6 +269,7 @@ impl Default for BlocklistConfig {
             sources: Vec::new(),
             allow: Vec::new(),
             block_encrypted_dns: true,
+            require_resolved: false,
             update_hours: default_update_hours(),
         }
     }
