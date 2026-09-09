@@ -104,6 +104,7 @@ guardit export > backup.toml                                # whole config as TO
 guardit import backup.toml                                  # replace it (daemon reloads)
 guardit log-app [--n 100] [--exe <substr>]                  # full per-app audit trail
 guardit daemon [--debug]                                    # per-app enforcement (needs root)
+guardit reset [--yes]                                       # wipe every rule, log and list
 guardit completions fish|bash|zsh                           # shell completion script
 guardit man                                                 # man page (roff)
 guardit tui   (or just guardit)                             # the dashboard (default with no args)

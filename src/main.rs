@@ -8,6 +8,7 @@ mod tui;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use config::{Action as RuleAction, Config, Direction, Proto, Rule, now_ts};
 use ipc::{ClientMsg, FlowStatus, ServerMsg};
+use std::fs;
 
 #[derive(Parser)]
 #[command(
@@ -171,6 +172,12 @@ enum Cmd {
     Status,
     /// interactive rule browser
     Tui,
+    /// wipe every rule, every log and every downloaded list — back to a fresh install
+    Reset {
+        /// skip the confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// bind NFQUEUE and enforce per-app rules (needs root; runs in the foreground,
     /// no daemonization — wrap it yourself if you want it as a service)
     Daemon {
@@ -256,6 +263,7 @@ fn main() {
             }
         }
         Cmd::LogApp { n, exe } => daemon::print_log_app(exe.as_deref(), n),
+        Cmd::Reset { yes } => reset_everything(&cfg, yes),
         Cmd::Blocklist(sub) => blocklist_cmd(cfg, sub),
         Cmd::App(AppCmd::List) => print_app_list(&cfg),
         Cmd::App(AppCmd::Allow(args)) => set_app_rule(RuleAction::Allow, args),
@@ -746,6 +754,77 @@ fn blocklist_cmd(cfg: Config, sub: BlocklistCmd) {
             }
         }
     }
+}
+
+/// Everything guardit has been told or has learnt, gone.
+///
+/// Named and counted before anything is touched: this throws away decisions
+/// that took real time to make, and a confirmation you cannot see the size
+/// of is not a confirmation. The kernel ruleset is reloaded from the
+/// defaults afterwards rather than left as it was, so what is loaded still
+/// matches what is on disk.
+fn reset_everything(cfg: &Config, yes: bool) {
+    let lists = fs::read_dir(blocklist::cache_dir())
+        .map(|d| d.flatten().count())
+        .unwrap_or(0);
+    let lines = |p: std::path::PathBuf| {
+        fs::read_to_string(p).map(|t| t.lines().count()).unwrap_or(0)
+    };
+    println!("this will delete:");
+    println!("  {} ip/port rule(s)", cfg.rule.len());
+    println!("  {} per-app rule(s)", cfg.app_rule.len());
+    println!(
+        "  the blocklist settings ({} categor(ies), {} extra list(s))",
+        cfg.blocklist.categories.len(),
+        cfg.blocklist.sources.len()
+    );
+    println!(
+        "  {} audit entr(ies)   {}",
+        lines(daemon::history_log_path()),
+        daemon::history_log_path().display()
+    );
+    println!(
+        "  {} blocked entr(ies) {}",
+        lines(daemon::blocked_log_path()),
+        daemon::blocked_log_path().display()
+    );
+    println!(
+        "  {lists} downloaded list(s)  {}",
+        blocklist::cache_dir().display()
+    );
+
+    if !yes {
+        print!("\ntype 'reset' to confirm: ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() || answer.trim() != "reset" {
+            println!("cancelled");
+            return;
+        }
+    }
+
+    Config::default().save();
+    for path in [daemon::history_log_path(), daemon::blocked_log_path()] {
+        if let Err(e) = fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("warning: {}: {e}", path.display());
+        }
+    }
+    if let Err(e) = fs::remove_dir_all(blocklist::cache_dir())
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("warning: {}: {e}", blocklist::cache_dir().display());
+    }
+    // the kernel keeps whatever was last applied, so leaving it alone would
+    // mean a wiped config and a live ruleset built from the old one
+    if let Err(e) = ruleset::apply(&Config::default()) {
+        eprintln!("warning: could not reload the ruleset: {e}");
+    }
+    if let Ok(mut c) = ipc::Client::connect() {
+        let _ = c.send(&ClientMsg::Reload);
+    }
+    println!("reset. `sudo guardit blocklist on` to start blocking again.");
 }
 
 fn print_app_list(cfg: &Config) {

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`sudo guardit reset`**: every rule, every log and every downloaded list gone, back to
+  a fresh install. It names and counts what will go before asking, and wants the word
+  `reset` typed back — a confirmation you cannot see the size of is not one. The kernel
+  ruleset is reloaded from the defaults afterwards, so what is loaded still matches what is
+  on disk. `--yes` skips the prompt.
 - **An app's flow survives a restart.** The daemon hands a new client a capped slice of
   recent history across all apps, so a program busy yesterday and quiet today showed an
   empty pane while its whole trail sat in `history.jsonl`. Selecting an app now reads its
