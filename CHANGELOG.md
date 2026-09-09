@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`install.sh` finishes the job.** It now checks for `nft` and `curl`, turns on ads +
+  phishing blocking and downloads the lists on a first install, and loads the ruleset into
+  the kernel — which had been left as three commands to remember, with the consequence that
+  the encrypted-DNS rules never reached the kernel at all. An existing configuration is
+  left alone, including a deliberate `blocklist off`.
 - **Connection setup got a lot cheaper.** Resolving which process owns a socket walked
   every `/proc/<pid>/fd` on the machine, once per connection, while that connection's first
   packet sat in the queue waiting for a verdict — and serialised, since the queue thread

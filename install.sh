@@ -27,6 +27,15 @@ else
     SRC="$TMP"
 fi
 
+for tool in nft curl; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "error: $tool is required but not installed." >&2
+        echo "  nft  — guardit drives nftables; install the 'nftables' package" >&2
+        echo "  curl — used to download the ads/tracking blocklists" >&2
+        exit 1
+    }
+done
+
 sudo install -Dm755 "$SRC/guardit" /usr/local/bin/guardit
 sudo install -Dm755 "$SRC/guardit-supervise.sh" /usr/local/bin/guardit-supervise.sh
 
@@ -77,3 +86,33 @@ else
     disown
     echo "daemon:    started via guardit-supervise.sh — tail -f /var/log/guardit-supervise.log"
 fi
+
+# Everything below is what used to be left as "now go and run these": the
+# kernel ruleset, and the ads/tracking lists. An install that leaves the
+# firewall unloaded and the blocklists undownloaded has not installed
+# anything you can use.
+
+# A first install picks the safe defaults; an existing one is left alone,
+# including a deliberate `blocklist off`.
+if ! sudo grep -q '^\[blocklist\]' /etc/guardit/rules.toml 2>/dev/null; then
+    echo
+    echo "setting up ads and tracking blocking (ads + phishing)"
+    sudo guardit blocklist on
+    # in the foreground: the daemon would fetch these within ten minutes on
+    # its own, and ten minutes of "blocking is on but blocks nothing" is
+    # worse than a wait you can see
+    sudo guardit blocklist update || echo "warning: some lists failed — \`guardit blocklist update\` to retry"
+fi
+
+# Last, because the ruleset it generates depends on the blocklist settings
+# above (the DoT/DoH rules are part of it), and because until this runs the
+# kernel has none of guardit's rules at all.
+echo
+if sudo guardit apply; then
+    echo "ruleset:   loaded into the kernel"
+else
+    echo "warning: could not load the ruleset — run \`sudo guardit apply\` once the cause is fixed" >&2
+fi
+
+echo
+echo "done. \`sudo guardit\` for the dashboard, \`guardit blocklist categories\` for what else it can block."

@@ -37,8 +37,11 @@ cd guardIT
 ./install.sh
 ```
 
-Either way `install.sh` puts the binary in `/usr/local/bin/guardit` and sets up the daemon
-to survive reboots. It works with or without systemd — the installer
+Either way `install.sh` leaves you with a working install, not a to-do list: the binary in
+`/usr/local/bin/guardit`, the man page and shell completions, the daemon set up to survive
+reboots, the ads and tracking lists downloaded, and the ruleset loaded into the kernel. It
+picks `ads` + `phishing` on a first install and leaves an existing configuration alone,
+including a deliberate `blocklist off`. It works with or without systemd — the installer
 autodetects which one you have:
 
 - **systemd present** → installs and enables `guardit.service` (`Restart=always`).
