@@ -91,10 +91,26 @@ pub struct BlocklistStats {
     pub blocked: u64,
     /// most recent blocked names, oldest first — a false positive is
     /// supposed to be visible here the moment a page breaks
-    pub recent: Vec<(u64, String)>,
+    pub recent: Vec<Blocked>,
+    /// apps with the most blocked lookups, most first — who is doing the
+    /// asking, which the totals alone never say
+    #[serde(default)]
+    pub by_app: Vec<(String, u64)>,
     /// unix seconds of the oldest enabled list's last download; None = at
     /// least one list has never been fetched
     pub updated_at: Option<u64>,
+}
+
+/// one name the daemon answered NXDOMAIN for
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Blocked {
+    pub ts: u64,
+    pub name: String,
+    /// the app whose socket the reply was headed for; None when the owning
+    /// process could not be resolved, and deliberately None for the local
+    /// resolver's own upstream leg — it asked on someone else's behalf
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
 }
 
 /// daemon -> tui

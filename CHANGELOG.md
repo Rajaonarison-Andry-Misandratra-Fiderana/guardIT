@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Blocked lookups are attributed to the app that asked.** The reply is held on its way
+  to the socket that wanted it, so its destination port names the process — no second
+  queue, no bookkeeping. The dashboard's recent list now says who, and the busiest blocked
+  app gets a line of its own. A local stub resolver's own upstream leg is deliberately not
+  attributed: it asks on everyone's behalf, and counting it would file the machine's whole
+  total under one process.
 - `guardit blocklist check` now says **which** list blocks a name and which entry matched,
   so a false positive points at the category to drop. With sixty-one lists merged into one
   set, "BLOCKED" on its own left you nowhere to go.

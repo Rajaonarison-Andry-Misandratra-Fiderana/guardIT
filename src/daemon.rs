@@ -287,7 +287,7 @@ fn dns_loop() -> std::io::Result<()> {
         enum Act {
             Nothing,
             Learn(String, Vec<IpAddr>),
-            Nxdomain(String, Vec<u8>),
+            Nxdomain(String, Option<String>, Vec<u8>),
         }
         let act = {
             let payload = msg.get_payload();
@@ -298,7 +298,15 @@ fn dns_loop() -> std::io::Result<()> {
                         Some(dns) => match dns_question(dns) {
                             Some((name, q_end)) if BLOCKLIST.read().unwrap().blocked(&name) => {
                                 match nxdomain_reply(payload, pkt.l4, q_end) {
-                                    Some(new) => Act::Nxdomain(name, new),
+                                    // the reply is on its way to the socket
+                                    // that asked, so its destination port
+                                    // names the process — still open, since
+                                    // we are holding the answer it waits for
+                                    Some(new) => {
+                                        let exe = resolve_exe_cached(17, pkt.dst_port)
+                                            .filter(|e| Some(e) != local_resolver().as_ref());
+                                        Act::Nxdomain(name, exe, new)
+                                    }
                                     None => Act::Nothing,
                                 }
                             }
@@ -325,9 +333,9 @@ fn dns_loop() -> std::io::Result<()> {
                     map.insert(ip, name.clone());
                 }
             }
-            Act::Nxdomain(name, new) => {
+            Act::Nxdomain(name, exe, new) => {
                 msg.set_payload(new);
-                note_blocked(&name);
+                note_blocked(&name, exe);
             }
         }
 
@@ -558,8 +566,32 @@ static DNS_TOTAL: AtomicU64 = AtomicU64::new(0);
 const BLOCKED_RECENT_CAP: usize = 200;
 /// newest last; what the TUI's blocklist tab shows so a false positive is
 /// visible the moment it happens instead of being inferred from a broken page
-static BLOCKED_RECENT: LazyLock<Mutex<VecDeque<(u64, String)>>> =
+static BLOCKED_RECENT: LazyLock<Mutex<VecDeque<ipc::Blocked>>> =
     LazyLock::new(|| Mutex::new(VecDeque::new()));
+/// exe -> how many of its lookups we refused, since the daemon started
+static BLOCKED_BY_APP: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The process listening on port 53 here, if any.
+///
+/// A stub resolver forwards on everyone's behalf, so both legs of a lookup
+/// cross the tap — the app asking it, and it asking upstream — and counting
+/// the second as "the resolver wanted this name" would put the machine's
+/// whole blocked total under one process. Cached: this changes when a
+/// service restarts, not per packet.
+fn local_resolver() -> Option<String> {
+    type Cached = Option<(Option<String>, Instant)>;
+    static CACHE: LazyLock<Mutex<Cached>> = LazyLock::new(|| Mutex::new(None));
+    const TTL: Duration = Duration::from_secs(30);
+    if let Some((exe, at)) = CACHE.lock().unwrap().as_ref()
+        && at.elapsed() < TTL
+    {
+        return exe.clone();
+    }
+    let exe = resolve_exe(17, 53).or_else(|| resolve_exe(6, 53));
+    *CACHE.lock().unwrap() = Some((exe.clone(), Instant::now()));
+    exe
+}
 
 /// the blocklist section the loaded lists were built from, so a config
 /// write that didn't touch it (every rule edit does write the file) doesn't
@@ -590,8 +622,21 @@ fn reload_blocklist_if_changed(cfg: &Config) {
     }
 }
 
-pub fn blocked_recent() -> Vec<(u64, String)> {
+pub fn blocked_recent() -> Vec<ipc::Blocked> {
     BLOCKED_RECENT.lock().unwrap().iter().cloned().collect()
+}
+
+/// the busiest few, most blocked first
+fn blocked_by_app(limit: usize) -> Vec<(String, u64)> {
+    let mut v: Vec<(String, u64)> = BLOCKED_BY_APP
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(e, &n)| (e.clone(), n))
+        .collect();
+    v.sort_by_key(|(exe, n)| (std::cmp::Reverse(*n), exe.clone()));
+    v.truncate(limit);
+    v
 }
 
 /// the dashboard payload, assembled from the live counters and the config
@@ -606,6 +651,7 @@ pub fn blocklist_stats(cfg: &crate::config::BlocklistConfig) -> ipc::BlocklistSt
         queries: DNS_TOTAL.load(Ordering::Relaxed),
         blocked: BLOCKED_TOTAL.load(Ordering::Relaxed),
         recent: blocked_recent(),
+        by_app: blocked_by_app(5),
         // the oldest list is the one that decides how stale the set is, and
         // a never-downloaded list makes the whole thing unknown
         updated_at: sources
@@ -617,13 +663,20 @@ pub fn blocklist_stats(cfg: &crate::config::BlocklistConfig) -> ipc::BlocklistSt
     }
 }
 
-fn note_blocked(name: &str) {
+fn note_blocked(name: &str, exe: Option<String>) {
     BLOCKED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if let Some(exe) = &exe {
+        *BLOCKED_BY_APP.lock().unwrap().entry(exe.clone()).or_default() += 1;
+    }
     let mut recent = BLOCKED_RECENT.lock().unwrap();
     if recent.len() >= BLOCKED_RECENT_CAP {
         recent.pop_front();
     }
-    recent.push_back((now_ts(), name.to_string()));
+    recent.push_back(ipc::Blocked {
+        ts: now_ts(),
+        name: name.to_string(),
+        exe,
+    });
 }
 
 fn proto_name(proto: u8) -> &'static str {

@@ -2581,6 +2581,13 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(" · domains ", dim),
         Span::styled(group(b.domains as u64), Style::new().fg(theme.fg)),
     ]));
+    if let Some((exe, n)) = b.by_app.first() {
+        lines.push(Line::from(vec![
+            Span::styled("worst   ", dim),
+            Span::styled(basename(exe).to_string(), Style::new().fg(theme.deny)),
+            Span::styled(format!(" {}", group(*n)), dim),
+        ]));
+    }
     lines.push(Line::from(vec![
         Span::styled("updated ", dim),
         Span::styled(
@@ -2636,18 +2643,23 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         // newest first, and only as many as there are rows for
         let rows = recent_area.height.saturating_sub(1) as usize;
-        for (ts, name) in b.recent.iter().rev().take(rows) {
-            let age = ago(now_ts().saturating_sub(*ts));
+        for entry in b.recent.iter().rev().take(rows) {
+            // who asked, when we know it — more use than how long ago, in a
+            // column with room for one of the two
+            let tail = match &entry.exe {
+                Some(exe) => basename(exe).to_string(),
+                None => ago(now_ts().saturating_sub(entry.ts)),
+            };
             let width = recent_area.width as usize;
-            let room = width.saturating_sub(age.chars().count() + 2);
-            let name = if name.chars().count() > room && room > 1 {
-                format!("{}…", name.chars().take(room - 1).collect::<String>())
+            let room = width.saturating_sub(tail.chars().count() + 2);
+            let name = if entry.name.chars().count() > room && room > 1 {
+                format!("{}…", entry.name.chars().take(room - 1).collect::<String>())
             } else {
-                name.clone()
+                entry.name.clone()
             };
             recent.push(Line::from(vec![
                 Span::styled(name, Style::new().fg(theme.deny)),
-                Span::styled(format!(" {age}"), dim),
+                Span::styled(format!(" {tail}"), dim),
             ]));
         }
     }
@@ -2781,10 +2793,23 @@ mod tests {
             queries: 12_345,
             blocked: 2_345,
             recent: vec![
-                (now_ts() - 400, "ads.doubleclick.net".into()),
-                (now_ts() - 90, "telemetry.microsoft.com".into()),
-                (now_ts() - 5, "graph.facebook.com".into()),
+                ipc::Blocked {
+                    ts: now_ts() - 400,
+                    name: "ads.doubleclick.net".into(),
+                    exe: Some("/usr/bin/firefox".into()),
+                },
+                ipc::Blocked {
+                    ts: now_ts() - 90,
+                    name: "telemetry.microsoft.com".into(),
+                    exe: None,
+                },
+                ipc::Blocked {
+                    ts: now_ts() - 5,
+                    name: "graph.facebook.com".into(),
+                    exe: Some("/usr/bin/firefox".into()),
+                },
             ],
+            by_app: vec![("/usr/bin/firefox".into(), 2_301)],
             updated_at: Some(now_ts() - 7200),
         };
             app.cfg.rule = vec![Rule {
