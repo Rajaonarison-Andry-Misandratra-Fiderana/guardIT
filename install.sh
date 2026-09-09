@@ -61,8 +61,16 @@ fi
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     sudo install -Dm644 "$SRC/guardit.service" /etc/systemd/system/guardit.service
     sudo systemctl daemon-reload
-    sudo systemctl enable --now guardit
-    echo "daemon:    systemctl status guardit"
+    # `enable --now` starts a stopped daemon but leaves a running one alone,
+    # so an upgrade would install a new binary and keep serving from the old
+    # one — for as long as the machine stays up. Restart it explicitly.
+    if systemctl is-active --quiet guardit; then
+        sudo systemctl restart guardit
+        echo "daemon:    restarted on the new binary"
+    else
+        sudo systemctl enable --now guardit
+        echo "daemon:    systemctl status guardit"
+    fi
 else
     echo "no systemd detected — falling back to cron for autostart"
 

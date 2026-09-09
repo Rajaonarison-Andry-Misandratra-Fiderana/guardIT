@@ -226,7 +226,7 @@ fn default_update_hours() -> u32 {
 /// Ads / tracking blocking (see src/blocklist.rs). Off until someone turns
 /// it on: it changes what every DNS lookup on the machine resolves to, which
 /// is not something an install should start doing on its own.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlocklistConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -259,6 +259,9 @@ pub struct BlocklistConfig {
     /// how often the daemon refetches the enabled lists; 0 = never
     #[serde(default = "default_update_hours")]
     pub update_hours: u32,
+    /// see `Config::extra`
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
 
 impl Default for BlocklistConfig {
@@ -271,6 +274,7 @@ impl Default for BlocklistConfig {
             block_encrypted_dns: true,
             require_resolved: false,
             update_hours: default_update_hours(),
+            extra: toml::Table::new(),
         }
     }
 }
@@ -294,6 +298,16 @@ pub struct Config {
     pub notify: bool,
     #[serde(default)]
     pub blocklist: BlocklistConfig,
+    /// Settings this build does not know about, carried through untouched.
+    ///
+    /// Every write of this file is a read-modify-write, so without this a
+    /// binary older than the file silently deletes whatever was added since
+    /// — which is not hypothetical: a daemon left running across an upgrade
+    /// erased a `categories` list it had never heard of, on its next
+    /// unrelated write. Unknown keys now survive the round trip, so an
+    /// update, a downgrade, or a stale daemon costs nothing.
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
 
 impl Default for Config {
@@ -305,6 +319,7 @@ impl Default for Config {
             default_verdict: default_verdict(),
             notify: true,
             blocklist: BlocklistConfig::default(),
+            extra: toml::Table::new(),
         }
     }
 }
@@ -512,6 +527,43 @@ mod tests {
         for bad in ["", "*.", "*", "ex ample.com", "a//b", "a..b", ".example.com", "http://x"] {
             assert!(validate_host(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn settings_this_build_does_not_know_survive_a_rewrite() {
+        // what a newer version might have written
+        let newer = r#"
+notify = true
+some_future_setting = 7
+
+[[rule]]
+id = 1
+action = "allow"
+proto = "tcp"
+src = "any"
+port = 22
+enabled = true
+
+[blocklist]
+enabled = true
+categories = ["ads"]
+some_future_blocklist_setting = "yes"
+"#;
+        let mut cfg: Config = toml::from_str(newer).expect("parses");
+        // an older binary changes something it does understand
+        cfg.notify = false;
+        let out = toml::to_string_pretty(&cfg).expect("serializes");
+
+        assert!(out.contains("some_future_setting"), "{out}");
+        assert!(out.contains("some_future_blocklist_setting"), "{out}");
+        assert!(out.contains("categories"), "{out}");
+        assert!(out.contains("notify = false"), "{out}");
+        // and what came back out is still a config, not just text that
+        // happens to contain the right words
+        let again: Config = toml::from_str(&out).expect("round trips");
+        assert_eq!(again.rule.len(), 1);
+        assert!(again.blocklist.enabled);
+        assert!(!again.notify);
     }
 
     #[test]
