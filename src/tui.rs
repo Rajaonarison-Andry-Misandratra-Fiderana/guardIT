@@ -1486,10 +1486,11 @@ fn draw(f: &mut Frame, app: &mut App) {
                 .areas(top);
         draw_rules(f, app, rules);
         draw_top_apps(f, app, top_apps);
-        // the divider lands on the column where Top apps begins, so the two
+        // the divider reproduces the seam above it — the two adjacent border
+        // columns where System rules ends and Top apps begins — so the two
         // halves sit under the panes they belong with: the app list under
         // the rules, its flow under what the machine has been doing
-        draw_app_control(f, app, bottom, top_apps.x);
+        draw_app_control(f, app, bottom, rules.right().saturating_sub(1));
         draw_blocking(f, app, blocking);
     }
 
@@ -1954,31 +1955,34 @@ fn half_heading(theme: Theme, focused: bool) -> Style {
 /// separate ones did. Both halves stay in the Tab ring; the border lights up
 /// for either.
 ///
-/// `divider_x` is an absolute column, so the rule can be lined up with a
-/// pane boundary elsewhere on the screen rather than falling wherever a
-/// percentage of this pane happens to land. It is clamped to leave at least
-/// one usable column on each side.
+/// `divider_x` is the absolute column the rule starts at, so it can be lined
+/// up with a pane boundary elsewhere on the screen rather than falling
+/// wherever a percentage of this pane happens to land. The rule is two
+/// columns wide because the seam it continues is: two panes side by side
+/// meet as two adjacent border columns, and a single line under them would
+/// sit half a pane off. Clamped to leave a usable column on each side.
 fn draw_app_control(f: &mut Frame, app: &mut App, area: Rect, divider_x: u16) {
     let theme = THEMES[app.theme_idx];
     let focused = matches!(app.focus, Focus::Apps | Focus::Flow);
     let block = theme.pane("application blocking".into(), focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    if inner.width < 4 || inner.height == 0 {
+    if inner.width < 6 || inner.height == 0 {
         return;
     }
     // the divider is a column of its own so neither list ever draws over it
-    let divider_x = divider_x.clamp(inner.x + 1, inner.right().saturating_sub(2));
+    const RULE_W: u16 = 2;
+    let divider_x = divider_x.clamp(inner.x + 1, inner.right().saturating_sub(RULE_W + 1));
     let [left, rule, right] = Layout::horizontal([
         Constraint::Length(divider_x - inner.x),
-        Constraint::Length(1),
+        Constraint::Length(RULE_W),
         Constraint::Min(0),
     ])
     .areas(inner);
     draw_apps(f, app, left);
     f.render_widget(
         Block::new()
-            .borders(Borders::LEFT)
+            .borders(Borders::LEFT | Borders::RIGHT)
             .border_style(Style::new().fg(theme.border_idle))
             .style(theme.base()),
         rule,
@@ -2588,6 +2592,7 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
     }
 }
+
 
 
 
