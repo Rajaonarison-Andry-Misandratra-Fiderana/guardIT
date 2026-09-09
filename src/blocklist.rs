@@ -772,19 +772,76 @@ impl Blocklist {
             return false;
         }
         let name = name.trim_end_matches('.').to_ascii_lowercase();
-        let mut rest = name.as_str();
-        loop {
-            if self.allow.contains(rest) {
+        for rest in suffixes(&name) {
+            if self.allow.contains(rest.as_str()) {
                 return false;
             }
-            if self.blocked.contains(rest) {
+            if self.blocked.contains(rest.as_str()) {
                 return true;
             }
-            match rest.split_once('.') {
-                Some((_, tail)) if tail.contains('.') => rest = tail,
-                _ => return false,
-            }
         }
+        false
+    }
+}
+
+/// Why a name is or isn't blocked: the allowlist entry that rescued it, or
+/// every enabled list that carries it and the exact entry each matched.
+///
+/// With sixty-one lists merged into one set, "BLOCKED" on its own leaves you
+/// no way to know which category to drop — so this re-reads the files rather
+/// than keeping provenance for every domain in memory, which would cost the
+/// hot path a great deal for a question asked by hand once in a while.
+pub struct Why {
+    pub allowed_by: Option<String>,
+    /// (list key, the entry that matched), most specific match first
+    pub blocked_by: Vec<(String, String)>,
+}
+
+/// The names `Blocklist::blocked` consults for `name`, most specific first —
+/// the same walk, factored out so `explain` reports on exactly what the
+/// matcher looks at rather than on a second, drifting copy of the rule.
+fn suffixes(name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = name;
+    loop {
+        out.push(rest.to_string());
+        match rest.split_once('.') {
+            Some((_, tail)) if tail.contains('.') => rest = tail,
+            _ => return out,
+        }
+    }
+}
+
+pub fn explain(cfg: &BlocklistConfig, name: &str) -> Why {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    let suffixes = suffixes(&name);
+
+    let allow: HashSet<Box<str>> = cfg
+        .allow
+        .iter()
+        .map(|d| d.trim_end_matches('.').to_ascii_lowercase().into_boxed_str())
+        .collect();
+    let allowed_by = suffixes
+        .iter()
+        .find(|s| allow.contains(s.as_str()))
+        .cloned();
+
+    let mut blocked_by = Vec::new();
+    for key in effective_sources(cfg) {
+        let Ok(text) = fs::read_to_string(cache_path(&key)) else {
+            continue;
+        };
+        let mut set = HashSet::new();
+        parse_into(&text, &mut set);
+        if let Some(hit) = suffixes.iter().find(|s| set.contains(s.as_str())) {
+            blocked_by.push((key, hit.clone()));
+        }
+    }
+    // the same order the matcher walks: the most specific entry decides
+    blocked_by.sort_by_key(|(_, hit)| std::cmp::Reverse(hit.len()));
+    Why {
+        allowed_by,
+        blocked_by,
     }
 }
 
@@ -942,6 +999,17 @@ mod tests {
         ] {
             assert_eq!(parse_line(line), None, "{line:?}");
         }
+    }
+
+    #[test]
+    fn the_suffix_walk_stops_above_the_registrable_name() {
+        assert_eq!(
+            suffixes("ads.a.example.com"),
+            ["ads.a.example.com", "a.example.com", "example.com"],
+            "most specific first, and never the bare tld"
+        );
+        assert_eq!(suffixes("example.com"), ["example.com"]);
+        assert_eq!(suffixes("localhost"), ["localhost"]);
     }
 
     #[test]

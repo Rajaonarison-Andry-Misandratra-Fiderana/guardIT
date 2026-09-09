@@ -163,7 +163,7 @@ sudo guardit blocklist disable porn gambling
 sudo guardit blocklist update                # download now (the daemon also does it daily)
 guardit blocklist categories                 # the twelve, * = blocked
 guardit blocklist status                     # what's on, domains loaded, how stale
-guardit blocklist check ads.example.com      # would this be blocked, right now
+guardit blocklist check ads.example.com      # blocked? by which list, via which entry
 sudo guardit blocklist allow cdn.example.com # never block this name, nor anything under it
 sudo guardit blocklist off
 ```

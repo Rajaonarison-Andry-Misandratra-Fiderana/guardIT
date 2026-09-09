@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `guardit blocklist check` now says **which** list blocks a name and which entry matched,
+  so a false positive points at the category to drop. With sixty-one lists merged into one
+  set, "BLOCKED" on its own left you nowhere to go.
+
 - **Ads and tracking blocking** (`guardit blocklist`): pick **what** to block — `ads`,
   `tracking`, `phishing`, `fake`, `crypto`, `dns-bypass`, `telemetry`, `social`,
   `gambling`, `porn`, `piracy`, `drugs` — any number at once, from the CLI or with `space`

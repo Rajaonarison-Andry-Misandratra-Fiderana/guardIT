@@ -681,14 +681,34 @@ fn blocklist_cmd(cfg: Config, sub: BlocklistCmd) {
             println!("{domain} removed from the allowlist");
         }
         BlocklistCmd::Check { domain } => {
-            let list = blocklist::Blocklist::load(&cfg.blocklist);
             if !cfg.blocklist.enabled {
                 println!("(blocking is off — this is what would happen if it were on)");
             }
-            if list.blocked(&domain) {
-                println!("{domain}: BLOCKED");
-            } else {
-                println!("{domain}: allowed");
+            let why = blocklist::explain(&cfg.blocklist, &domain);
+            match (&why.allowed_by, why.blocked_by.is_empty()) {
+                (Some(entry), _) => {
+                    println!("{domain}: allowed");
+                    println!("  allowlist entry {entry} wins over the lists");
+                    if !why.blocked_by.is_empty() {
+                        println!("  (it is on {} list(s) otherwise)", why.blocked_by.len());
+                    }
+                }
+                (None, true) => println!("{domain}: allowed — on none of the enabled lists"),
+                (None, false) => {
+                    println!("{domain}: BLOCKED");
+                    for (key, hit) in &why.blocked_by {
+                        let cat = blocklist::source(key).map(|s| s.category).unwrap_or("?");
+                        let how = if *hit == domain.trim_end_matches('.').to_lowercase() {
+                            String::new()
+                        } else {
+                            format!(" — via {hit}")
+                        };
+                        println!("  {key} ({cat}){how}");
+                    }
+                    println!(
+                        "\n  `guardit blocklist allow {domain}` to keep it, or disable a category above"
+                    );
+                }
             }
         }
     }
