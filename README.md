@@ -129,6 +129,12 @@ A host rule is the **most specific** kind, so it beats a per-port rule, which be
 app's whole-app default. `allow firefox --port 443` plus `deny firefox --host
 '*.doubleclick.net'` means exactly what it reads: HTTPS everywhere except that domain.
 
+Blocking happens twice, at both layers. A blocked name's DNS answer is rewritten to
+NXDOMAIN, so nothing connects. And if a connection reaches a blocked name anyway — the app
+had the address cached, or resolved it somewhere unreadable — it is refused at the
+connection too, using the name the tap had already attached to that address. An app rule
+naming the host beats it, and so does the blocklist's own allowlist.
+
 It rides on the same passive DNS tap that puts names in the dashboard, so it inherits its
 limits: a peer whose lookup the daemon never saw has no name, and a rule with `--host`
 can't match it — the connection falls through to the app's port and whole-app rules. An

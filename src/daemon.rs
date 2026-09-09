@@ -1347,6 +1347,21 @@ fn unresolved_destination(
         && !DNS_NAMES.lock().unwrap().is_empty()
 }
 
+/// The connection-layer counterpart of the NXDOMAIN path: said once per
+/// (app, name), because an app that ignored the refusal once will do it
+/// again and a line per attempt would bury the journal.
+fn note_blocked_peer(exe: &str, name: &str) {
+    static SAID: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    let key = format!("{exe}\0{name}");
+    if SAID.lock().unwrap().insert(key) {
+        eprintln!(
+            "guardit daemon: {exe} -> {name} refused: that name is on a blocklist and the app \
+             reached it without a lookup we saw (cached, or resolved elsewhere). \
+             `guardit blocklist allow {name}` if it should be kept."
+        );
+    }
+}
+
 /// Says so once per app, then keeps quiet.
 ///
 /// A refusal with no explanation anywhere is the worst thing this policy
@@ -1557,6 +1572,44 @@ fn queue_loop(
         .filter(|r| !r.stale())
         .cloned();
         let matched = rule.as_ref().map(|r| r.action);
+
+        // A name on a blocklist, reached anyway. The DNS layer normally
+        // stops this before a connection exists — but only for lookups it
+        // saw: an app with the address already cached, or one that resolved
+        // it somewhere unreadable, arrives here with a name we know to be
+        // blocked and a connection half-open. Denying it here costs one hash
+        // lookup on a name we had resolved anyway.
+        //
+        // A rule naming the host beats it, which is the app-level way of
+        // saying "this one is fine" — the blocklist's own allowlist is the
+        // other, and applies to every app at once.
+        let host_ruled = rule.as_ref().is_some_and(|r| r.host.is_some());
+        if !host_ruled
+            && let Some(name) = peer_name.as_deref()
+            && BLOCKLIST.read().unwrap().blocked(name)
+        {
+            note_blocked_peer(&exe, name);
+            let wire = FlowWire {
+                req_id: None,
+                exe: exe.clone(),
+                direction: dir,
+                proto: proto_name(pkt.proto).to_string(),
+                port: Some(rule_port),
+                peer_ip: peer_ip.clone(),
+                peer_name: peer_name.clone(),
+                status: FlowStatus::Denied,
+                ts: now_ts(),
+            };
+            append_history_line(&wire);
+            let throttle_key = (exe.clone(), pkt.proto, rule_port, dir == Direction::Out);
+            if should_log_matched(&throttle, throttle_key) {
+                push_history(&history, wire.clone());
+                let _ = event_tx.send(ServerMsg::FlowNew(wire));
+            }
+            msg.set_verdict(Verdict::Drop);
+            queue.verdict(msg)?;
+            continue;
+        }
 
         // An address nothing ever resolved, on an HTTPS port, reached by an
         // app: it did not learn that address from any lookup this daemon

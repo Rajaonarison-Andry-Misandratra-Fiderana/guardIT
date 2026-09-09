@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Blocklists now apply to connections too, not only to lookups.** A blocked name whose
+  address an app already had cached used to sail through: the DNS layer never saw a lookup
+  to refuse, and the connection layer never consulted the lists — even though the dashboard
+  was already showing the blocked name next to that connection. The peer name is right
+  there, so checking it costs one hash lookup. An app rule naming the host overrides it.
 - **`sudo guardit reset`**: every rule, every log and every downloaded list gone, back to
   a fresh install. It names and counts what will go before asking, and wants the word
   `reset` typed back — a confirmation you cannot see the size of is not one. The kernel
