@@ -1091,7 +1091,10 @@ fn rebuild_apps(app: &mut App) {
             });
         }
     }
-    rows.sort_by(|a, b| a.exe.cmp(&b.exe));
+    // apps with no rule at all first — they're the ones waiting on a
+    // decision — and alphabetical within each half, so a row only ever moves
+    // when its own state changes
+    rows.sort_by_key(|r| (r.rule.is_some() || r.port_overrides > 0, r.exe.clone()));
     if !app.apps_filter.is_empty() {
         let needle = app.apps_filter.to_lowercase();
         rows.retain(|r| r.exe.to_lowercase().contains(&needle));
@@ -2058,7 +2061,7 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let heading = if app.apps_filter.is_empty() {
-        format!("apps ({})", app.apps.len())
+        format!("apps ({}) — new first", app.apps.len())
     } else {
         format!("apps — /{} ({} shown)", app.apps_filter, app.apps.len())
     };

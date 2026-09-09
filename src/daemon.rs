@@ -458,14 +458,17 @@ fn nxdomain_reply(payload: &[u8], l4: usize, q_end: usize) -> Option<Vec<u8>> {
     let dns = payload.get(l4 + 8..)?;
     let question = dns.get(12..q_end)?;
 
-    let mut body = Vec::with_capacity(12 + question.len());
+    let mut body = Vec::with_capacity(12 + question.len() + 64);
     body.extend_from_slice(&dns[0..2]); // same transaction id
     // QR=1, opcode 0, AA=0, TC=0, RD copied from the exchange; RA=1, rcode 3
     body.push(0x80 | (dns[2] & 0x01));
     body.push(0x83);
     body.extend_from_slice(&[0, 1]); // QDCOUNT — the question is kept
-    body.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // AN, NS, AR: nothing
+    body.extend_from_slice(&[0, 0]); // ANCOUNT: nothing resolved
+    body.extend_from_slice(&[0, 1]); // NSCOUNT: the SOA below
+    body.extend_from_slice(&[0, 0]); // ARCOUNT
     body.extend_from_slice(question);
+    push_soa(&mut body);
 
     let udp_len = (8 + body.len()) as u16;
     let mut out = Vec::with_capacity(l4 + udp_len as usize);
@@ -505,6 +508,43 @@ fn nxdomain_reply(payload: &[u8], l4: usize, q_end: usize) -> Option<Vec<u8>> {
     let ck = if ck == 0 { 0xFFFF } else { ck };
     out[l4 + 6..l4 + 8].copy_from_slice(&ck.to_be_bytes());
     Some(out)
+}
+
+/// How long a resolver may cache one of our NXDOMAINs.
+///
+/// The trade: without negative caching a blocked name is re-asked on every
+/// single lookup, forever, which both inflates the blocked counter and costs
+/// a full round trip to the upstream resolver each time. With it, unblocking
+/// a name takes up to this long to be believed. A minute is short enough
+/// that allowlisting something feels immediate and long enough to end the
+/// retry storm.
+const NXDOMAIN_TTL: u32 = 60;
+
+/// The SOA that makes an NXDOMAIN cacheable (RFC 2308): a resolver may only
+/// cache a negative answer for the TTL in the authority section's SOA, and
+/// an answer without one it may not cache at all.
+///
+/// The owner name is a compression pointer to the question at offset 12 —
+/// strictly the SOA should name the zone rather than the exact name asked
+/// for, but every resolver takes the QNAME here, and it is what the local
+/// forwarders that sit in front of this do themselves.
+fn push_soa(body: &mut Vec<u8>) {
+    body.extend_from_slice(&[0xC0, 0x0C]); // NAME: the question, by pointer
+    body.extend_from_slice(&[0, 6]); // TYPE: SOA
+    body.extend_from_slice(&[0, 1]); // CLASS: IN
+    body.extend_from_slice(&NXDOMAIN_TTL.to_be_bytes());
+
+    let mut rdata = Vec::with_capacity(64);
+    // MNAME "localhost.", RNAME "hostmaster.localhost."
+    rdata.extend_from_slice(b"\x09localhost\x00");
+    rdata.extend_from_slice(b"\x0Ahostmaster\x09localhost\x00");
+    rdata.extend_from_slice(&1u32.to_be_bytes()); // SERIAL
+    rdata.extend_from_slice(&3600u32.to_be_bytes()); // REFRESH
+    rdata.extend_from_slice(&600u32.to_be_bytes()); // RETRY
+    rdata.extend_from_slice(&86400u32.to_be_bytes()); // EXPIRE
+    rdata.extend_from_slice(&NXDOMAIN_TTL.to_be_bytes()); // MINIMUM: the negative ttl
+    body.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    body.extend_from_slice(&rdata);
 }
 
 /// the lists in force, swapped wholesale on a config reload or an update —
@@ -1637,11 +1677,31 @@ mod tests {
         assert_eq!(u16::from_be_bytes([dns[4], dns[5]]), 1, "question kept");
         assert_eq!(u16::from_be_bytes([dns[6], dns[7]]), 0, "no answer records");
         assert_eq!(
+            u16::from_be_bytes([dns[8], dns[9]]),
+            1,
+            "an SOA, without which the negative answer may not be cached"
+        );
+        assert_eq!(u16::from_be_bytes([dns[10], dns[11]]), 0, "no additionals");
+        // the SOA sits right after the question: pointer to it, type SOA,
+        // class IN, then the ttl a resolver is allowed to cache us for
+        let soa = &dns[q_end..];
+        assert_eq!(&soa[0..2], &[0xC0, 0x0C], "owner is the question name");
+        assert_eq!(&soa[2..6], &[0, 6, 0, 1], "SOA IN");
+        assert_eq!(u32::from_be_bytes(soa[6..10].try_into().unwrap()), NXDOMAIN_TTL);
+        let rdlen = u16::from_be_bytes([soa[10], soa[11]]) as usize;
+        assert_eq!(soa.len(), 12 + rdlen, "rdlength matches what follows it");
+        // MINIMUM, the last field, is the negative ttl resolvers actually use
+        let min = u32::from_be_bytes(soa[soa.len() - 4..].try_into().unwrap());
+        assert_eq!(min, NXDOMAIN_TTL);
+        assert_eq!(
             dns_question(dns).unwrap().0,
             "ads.example.com",
             "answers the question that was asked"
         );
-        assert_eq!(dns.len(), q_end, "the answer section is gone, not just zeroed");
+        assert!(
+            dns.len() > q_end,
+            "the answer records are gone but the SOA is there"
+        );
 
         // lengths agree with the bytes actually present
         assert_eq!(u16::from_be_bytes([out[2], out[3]]) as usize, out.len());
