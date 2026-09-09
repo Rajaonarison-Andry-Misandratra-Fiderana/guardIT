@@ -20,6 +20,8 @@
   app gets a line of its own. A local stub resolver's own upstream leg is deliberately not
   attributed: it asks on everyone's behalf, and counting it would file the machine's whole
   total under one process.
+- Opening the audit tab for one app (`a`) now scopes **both** halves to it: the listening
+  ports pane shows that app's ports, not every socket on the machine.
 - `guardit blocklist check` now says **which** list blocks a name and which entry matched,
   so a false positive points at the category to drop. With sixty-one lists merged into one
   set, "BLOCKED" on its own left you nowhere to go.

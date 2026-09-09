@@ -258,7 +258,8 @@ pane gets a thick border:
 | ↳ right half | **flow** | live connection history for whichever app is selected on the left | `j/k` select · `a` this app's audit trail · `y`/`n` allow/deny **this port and direction only** (remembered as a per-port rule) · `Y`/`N` allow/deny **this peer's hostname**, any port (needs a resolved name; uses the exact name — `--host '*.foo.com'` on the CLI for a whole domain) |
 
 `A` opens the audit tab, holding the two "what has already happened" views side by side —
-`Tab` switches between them, `q`/`A` goes back:
+`Tab` switches between them, `q`/`A` goes back. A pane's own `a` opens it scoped to the
+selected app: both halves then show only that app, its trail and its ports.
 
 | Pane | What it shows | Keys |
 |---|---|---|

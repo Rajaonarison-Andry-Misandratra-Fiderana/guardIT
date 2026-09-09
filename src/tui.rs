@@ -1199,6 +1199,7 @@ fn open_app_log(app: &mut App, filter: Option<String>) {
     app.focus = Focus::AppLog;
     app.app_log_all = read_app_log(APP_LOG_LIMIT, app.app_log_filter.as_deref());
     apply_log_filter(app);
+    apply_listening_filter(app);
 }
 
 /// Narrows the tab to one port, address or name.
@@ -1247,10 +1248,14 @@ fn apply_filter(app: &mut App) {
 /// Narrows the listening pane to one port, address or owner, on the same
 /// terms as the audit trail's filter: a digits-only needle is the port as a
 /// whole number, anything else a substring of the bound address or the exe.
+///
+/// The tab's own scope comes first: opened for one app with `a`, both halves
+/// are about that app, so the ports shown are its ports.
 fn apply_listening_filter(app: &mut App) {
     app.listening = app
         .listening_all
         .iter()
+        .filter(|e| app.app_log_filter.as_deref().is_none_or(|exe| e.exe == exe))
         .filter(|e| {
             let needle = &app.listening_filter;
             if needle.is_empty() {
@@ -2747,14 +2752,22 @@ fn draw_conflicts(f: &mut Frame, app: &mut App, area: Rect) {
             })
             .collect()
     };
-    let title = match (conflicts.is_empty(), app.listening_filter.is_empty()) {
-        (true, true) => "listening ports".to_string(),
-        (true, false) => format!(
-            "listening ports — /{} ({} shown)",
-            app.listening_filter,
+    let title = if !conflicts.is_empty() {
+        format!("listening ports — {} REAL CONFLICT(S)", conflicts.len())
+    } else {
+        let scope = match &app.app_log_filter {
+            Some(exe) => format!(" — {}", basename(exe)),
+            None => String::new(),
+        };
+        let needle = if app.listening_filter.is_empty() {
+            String::new()
+        } else {
+            format!(" /{}", app.listening_filter)
+        };
+        format!(
+            "listening ports{scope}{needle} ({})",
             app.listening.len()
-        ),
-        (false, _) => format!("listening ports — {} REAL CONFLICT(S)", conflicts.len()),
+        )
     };
     let list = List::new(items)
         .style(theme.base())
@@ -2950,6 +2963,7 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
     }
 }
+
 
 
 
