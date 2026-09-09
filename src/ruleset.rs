@@ -121,6 +121,9 @@ pub fn render(cfg: &Config) -> String {
     out.push_str("    type filter hook input priority 0; policy drop;\n");
     // before `iif lo`: a local resolver's replies to apps come over lo
     out.push_str(&format!("    udp sport 53 queue num {QUEUE_DNS} bypass\n"));
+    // tcp too: a truncated answer is retried over tcp, and filtering only udp
+    // left that retry as a way past the lists
+    out.push_str(&format!("    tcp sport 53 queue num {QUEUE_DNS} bypass\n"));
     out.push_str("    iif lo accept\n");
     out.push_str("    ct state established,related accept\n");
     for r in cfg.rule.iter().filter(|r| r.enabled) {
@@ -284,11 +287,14 @@ mod tests {
         };
         let out = render(&cfg);
         assert!(out.contains(&format!("queue num {QUEUE_IN}\n")));
+        for line in out.lines().filter(|l| l.contains("bypass")) {
+            assert!(line.contains("sport 53"), "unexpected bypass: {line}");
+        }
         assert!(out.contains(&format!("queue num {QUEUE_OUT}\n")));
         assert_eq!(
             out.matches("bypass").count(),
-            1,
-            "only the DNS tap bypasses"
+            2,
+            "only the DNS tap bypasses — its udp and tcp halves"
         );
         assert!(out.contains(&format!("udp sport 53 queue num {QUEUE_DNS} bypass\n")));
         let dns = out.find("sport 53").unwrap();

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **DNS over TCP is filtered too.** The tap only ever saw UDP, so a resolver falling back
+  to TCP after a truncated answer — or one configured to prefer it — walked past the lists
+  for free. TCP replies are rewritten in place at exactly their original length, since
+  shortening a segment mid-stream would put every sequence number after it out by the
+  difference; a reply split across segments is left alone rather than half rewritten, and
+  one too small to hold an SOA is answered without one.
+- **The addresses a blocked name resolves to are recorded before the answer is refused.**
+  That is what lets the connection layer turn away an app that got them another way, and it
+  is the only thing covering a DoH endpoint whose address is on no list — hagezi's DoH
+  address list is IPv4-only, so the nft set never had a single IPv6 entry.
 - **Blocklists now apply to connections too, not only to lookups.** A blocked name whose
   address an app already had cached used to sail through: the DNS layer never saw a lookup
   to refuse, and the connection layer never consulted the lists — even though the dashboard

@@ -288,7 +288,8 @@ fn learn_names(name: &str, ips: Vec<IpAddr>) {
     }
 }
 
-/// DNS tap on QUEUE_DNS: every UDP reply from port 53 passes through here.
+/// DNS tap on QUEUE_DNS: every reply from port 53 passes through here, over
+/// UDP or TCP.
 ///
 /// Two jobs, in this order. If the name is on an enabled blocklist the reply
 /// is rewritten to NXDOMAIN, so the app never learns an address and never
@@ -298,9 +299,9 @@ fn learn_names(name: &str, ips: Vec<IpAddr>) {
 /// Both are blind to anything the daemon can't read: DoH/DoT, and names the
 /// app already had cached. `blocklist.block_encrypted_dns` exists to shrink
 /// the first of those to nothing.
-/// ponytail: udp only — a stub resolver that falls back to DNS over TCP
-/// (truncated reply, or one configured to prefer it) is unfiltered; queue
-/// `tcp sport 53` and length-prefix the same rewrite if that ever shows up
+/// ponytail: a TCP reply too small to hold an SOA is answered without one,
+/// so it is correct but not cacheable — nothing can grow a segment. Rare
+/// enough to leave; a local sinkhole would remove the constraint entirely
 fn dns_loop() -> std::io::Result<()> {
     let mut queue = Queue::open()?;
     queue.bind(QUEUE_DNS)?;
@@ -311,11 +312,41 @@ fn dns_loop() -> std::io::Result<()> {
         enum Act {
             Nothing,
             Learn(String, Vec<IpAddr>),
-            Nxdomain(String, Option<String>, Vec<u8>),
+            Nxdomain(String, Option<String>, Vec<IpAddr>, Vec<u8>),
         }
         let act = {
             let payload = msg.get_payload();
             match parse_packet(payload) {
+                // TCP is the fallback a resolver uses for a truncated answer,
+                // and the one an app can be configured to prefer — filtering
+                // only udp left a way past the lists that cost nothing to use
+                Some(pkt) if pkt.proto == 6 && pkt.src_port == 53 => {
+                    DNS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    match tcp_dns_span(payload, pkt.l4).and_then(|(dns, len)| {
+                        payload.get(dns..dns + len)
+                    }) {
+                        Some(dns) => match dns_question(dns) {
+                            Some((name, q_end)) if BLOCKLIST.read().unwrap().blocked(&name) => {
+                                match nxdomain_reply_tcp(payload, pkt.l4, q_end) {
+                                    Some(new) => {
+                                        let exe = resolve_exe_cached(6, pkt.dst_port)
+                                            .filter(|e| Some(e) != local_resolver().as_ref());
+                                        let ips = parse_dns_answers(dns)
+                                            .map(|(_, ips)| ips)
+                                            .unwrap_or_default();
+                                        Act::Nxdomain(name, exe, ips, new)
+                                    }
+                                    None => Act::Nothing,
+                                }
+                            }
+                            _ => match parse_dns_answers(dns) {
+                                Some((name, ips)) => Act::Learn(name, ips),
+                                None => Act::Nothing,
+                            },
+                        },
+                        None => Act::Nothing,
+                    }
+                }
                 Some(pkt) if pkt.proto == 17 && pkt.src_port == 53 => {
                     DNS_TOTAL.fetch_add(1, Ordering::Relaxed);
                     match payload.get(pkt.l4 + 8..) {
@@ -329,7 +360,18 @@ fn dns_loop() -> std::io::Result<()> {
                                     Some(new) => {
                                         let exe = resolve_exe_cached(17, pkt.dst_port)
                                             .filter(|e| Some(e) != local_resolver().as_ref());
-                                        Act::Nxdomain(name, exe, new)
+                                        // the answers are read before being
+                                        // thrown away: knowing which
+                                        // addresses a blocked name resolves
+                                        // to is what lets the connection
+                                        // layer refuse an app that got them
+                                        // some other way, and it is the only
+                                        // thing that covers a DoH endpoint
+                                        // whose address is on no list of ours
+                                        let ips = parse_dns_answers(dns)
+                                            .map(|(_, ips)| ips)
+                                            .unwrap_or_default();
+                                        Act::Nxdomain(name, exe, ips, new)
                                     }
                                     None => Act::Nothing,
                                 }
@@ -349,7 +391,8 @@ fn dns_loop() -> std::io::Result<()> {
         match act {
             Act::Nothing => {}
             Act::Learn(name, ips) => learn_names(&name, ips),
-            Act::Nxdomain(name, exe, new) => {
+            Act::Nxdomain(name, exe, ips, new) => {
+                learn_names(&name, ips);
                 msg.set_payload(new);
                 note_blocked(&name, exe);
             }
@@ -469,6 +512,80 @@ fn ones_complement(runs: &[&[u8]]) -> u16 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+/// A DNS message carried over TCP: the payload offset and its length.
+///
+/// TCP puts a two-byte length in front of the message and its own header is
+/// variable-length, so both have to be read rather than assumed. Only a
+/// segment holding one whole message is handled — a reply split across
+/// segments, or several packed into one, is left alone rather than half
+/// rewritten. That is rare for the small answers a blocked name produces,
+/// and the honest failure here is to let it through, not to corrupt a
+/// stream.
+fn tcp_dns_span(payload: &[u8], l4: usize) -> Option<(usize, usize)> {
+    let data_off = (*payload.get(l4 + 12)? >> 4) as usize * 4;
+    let start = l4.checked_add(data_off)?;
+    let len = u16::from_be_bytes([*payload.get(start)?, *payload.get(start + 1)?]) as usize;
+    let dns = start + 2;
+    (len >= 12 && payload.len() == dns + len).then_some((dns, len))
+}
+
+/// The same NXDOMAIN rewrite, for a reply arriving over TCP.
+///
+/// In place and at exactly the original length: shortening a segment
+/// mid-stream would put every sequence number after it out by the
+/// difference. The answer records are replaced by the SOA and the remainder
+/// zeroed — a resolver reads records by the counts in the header and stops,
+/// so what is left after them is never looked at.
+fn nxdomain_reply_tcp(payload: &[u8], l4: usize, q_end: usize) -> Option<Vec<u8>> {
+    let (dns, len) = tcp_dns_span(payload, l4)?;
+    let question = payload.get(dns + 12..dns + q_end)?;
+
+    let mut body = Vec::with_capacity(12 + question.len() + 64);
+    body.extend_from_slice(&payload[dns..dns + 2]);
+    body.push(0x80 | (payload[dns + 2] & 0x01));
+    body.push(0x83);
+    body.extend_from_slice(&[0, 1]);
+    body.extend_from_slice(&[0, 0]);
+    body.extend_from_slice(&[0, 1]);
+    body.extend_from_slice(&[0, 0]);
+    body.extend_from_slice(question);
+    push_soa(&mut body);
+    if body.len() > len {
+        // no room for the SOA: answer without it rather than not at all
+        body.truncate(12 + question.len());
+        body[8] = 0;
+        body[9] = 0;
+        if body.len() > len {
+            return None;
+        }
+    }
+
+    let mut out = payload.to_vec();
+    out[dns..dns + body.len()].copy_from_slice(&body);
+    out[dns + body.len()..dns + len].fill(0);
+
+    // lengths are untouched, so only the tcp checksum moves
+    out[l4 + 16..l4 + 18].copy_from_slice(&[0, 0]);
+    let tcp_len = (out.len() - l4) as u16;
+    let ck = match payload[0] >> 4 {
+        4 => ones_complement(&[
+            &out[12..20],
+            &[0, 6],
+            &tcp_len.to_be_bytes(),
+            &out[l4..],
+        ]),
+        6 => ones_complement(&[
+            &out[8..40],
+            &(tcp_len as u32).to_be_bytes(),
+            &[0, 0, 0, 6],
+            &out[l4..],
+        ]),
+        _ => return None,
+    };
+    out[l4 + 16..l4 + 18].copy_from_slice(&ck.to_be_bytes());
+    Some(out)
 }
 
 /// Rewrites a DNS *reply* packet into an NXDOMAIN for the same question.
@@ -2210,6 +2327,94 @@ mod tests {
             0,
             "udp checksum"
         );
+    }
+
+    /// the same reply, carried over tcp: two-byte length prefix in front of
+    /// the message, and a 20-byte tcp header instead of udp's 8. `pad` grows
+    /// the answer section, which is what decides whether the SOA fits
+    fn dns_reply_packet_tcp(pad: usize) -> Vec<u8> {
+        let udp = dns_reply_packet();
+        let mut dns = udp[28..].to_vec();
+        dns.extend(std::iter::repeat_n(0u8, pad));
+        let mut p = vec![0x45, 0];
+        let total = (20 + 20 + 2 + dns.len()) as u16;
+        p.extend_from_slice(&total.to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0, 0, 64, 6, 0, 0]);
+        p.extend_from_slice(&[1, 1, 1, 1]);
+        p.extend_from_slice(&[10, 0, 0, 2]);
+        p.extend_from_slice(&53u16.to_be_bytes());
+        p.extend_from_slice(&40000u16.to_be_bytes());
+        p.extend_from_slice(&[0; 8]); // seq, ack
+        p.push(0x50); // data offset 5 words, no options
+        p.extend_from_slice(&[0x18, 0, 0, 0, 0, 0, 0]); // flags, window, cksum, urg
+        p.extend_from_slice(&(dns.len() as u16).to_be_bytes());
+        p.extend_from_slice(&dns);
+        p
+    }
+
+    fn rewritten_tcp(pad: usize) -> (Vec<u8>, Vec<u8>, usize, usize) {
+        let p = dns_reply_packet_tcp(pad);
+        let (at, len) = tcp_dns_span(&p, 20).expect("one whole message in the segment");
+        let (_, q_end) = dns_question(&p[at..at + len]).unwrap();
+        let out = nxdomain_reply_tcp(&p, 20, q_end).unwrap();
+        (p, out, at, len)
+    }
+
+    #[test]
+    fn a_tcp_reply_is_rewritten_without_changing_its_length() {
+        for pad in [0, 200] {
+            let (p, out, at, len) = rewritten_tcp(pad);
+            assert_eq!(
+                out.len(),
+                p.len(),
+                "shortening a segment would put every sequence number after it out by the difference"
+            );
+            assert_eq!(&out[at - 2..at], &p[at - 2..at], "the length prefix is untouched");
+
+            let dns = &out[at..at + len];
+            assert_eq!(dns[3] & 0x0F, 3, "NXDOMAIN");
+            assert_eq!(u16::from_be_bytes([dns[6], dns[7]]), 0, "no answers");
+            assert_eq!(dns_question(dns).unwrap().0, "ads.example.com");
+
+            // a correct checksum makes the sum over the covered bytes come out 0
+            let tcp_len = (out.len() - 20) as u16;
+            assert_eq!(
+                ones_complement(&[&out[12..20], &[0, 6], &tcp_len.to_be_bytes(), &out[20..]]),
+                0,
+                "tcp checksum"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tcp_soa_is_included_when_the_segment_has_room_and_dropped_when_it_does_not() {
+        // the answer records cannot be grown into, so a small reply has no
+        // space for an SOA and is answered without one — uncacheable, but a
+        // correct answer, which beats letting the name through
+        let (_, out, at, len) = rewritten_tcp(0);
+        assert_eq!(
+            u16::from_be_bytes([out[at + 8], out[at + 9]]),
+            0,
+            "no room, so no SOA"
+        );
+        assert!(out[at + len - 4..at + len].iter().all(|&b| b == 0), "tail zeroed");
+
+        let (_, out, at, _) = rewritten_tcp(200);
+        assert_eq!(
+            u16::from_be_bytes([out[at + 8], out[at + 9]]),
+            1,
+            "room for the SOA, so the answer can be cached"
+        );
+    }
+
+    #[test]
+    fn a_tcp_segment_that_is_not_one_whole_message_is_left_alone() {
+        // a length prefix claiming more than the segment carries is what a
+        // reply split across segments looks like; rewriting half of one
+        // would corrupt the stream
+        let mut p = dns_reply_packet_tcp(0);
+        p[40] = 0xFF;
+        assert!(tcp_dns_span(&p, 20).is_none());
     }
 
     #[test]

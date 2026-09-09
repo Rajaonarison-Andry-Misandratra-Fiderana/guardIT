@@ -241,9 +241,11 @@ seconds.
 
 ### What it does not cover
 
-The DNS tap sees plain DNS over UDP only. A name an app already had cached, resolved over
-a channel guardit could not read, or looked up over DNS-over-TCP, is not filtered — nor is
-a connection made straight to a hardcoded ip with no lookup at all. Blocking works on names, so treat it as an ad and
+The DNS tap sees plain DNS, over UDP and over TCP. What it cannot see is a channel it
+cannot read: DoH, DoT, or a name an app already had cached — though a connection to a
+blocked name is now refused at the connection too, whichever way the app learnt the
+address. A connection made straight to a hardcoded ip with no lookup at all is only reached
+by `require_resolved`. Blocking works on names, so treat it as an ad and
 tracker blocker, which is what it is, rather than as a containment boundary; for that,
 deny the app and allow the ports you mean.
 
