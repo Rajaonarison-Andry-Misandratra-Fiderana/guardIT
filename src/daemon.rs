@@ -1662,8 +1662,18 @@ fn queue_loop(
                             peer_name.as_deref(),
                         ) != Some(verdict)
                         {
-                            let rules =
-                                upsert_rule(&exe, Some(rule_port), Some(dir), verdict, None, None);
+                            // scoped to what was actually asked about: this
+                            // app, this port, and the peer it was reaching.
+                            // Answering "no" to one domain on port 53 must
+                            // not be answering "no" to DNS
+                            let rules = upsert_rule(
+                                &exe,
+                                Some(rule_port),
+                                Some(dir),
+                                verdict,
+                                None,
+                                peer_name.clone(),
+                            );
                             *app_rules.lock().unwrap() = rules.clone();
                             let _ = event_tx.send(ServerMsg::AppRules(rules));
                         }

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`y`/`n` in the flow pane rules the row, not the port.** Denying
+  `curl -> port 53 -> ads.example.com` used to deny curl port 53 outright, which stopped
+  its DNS rather than stopping it reaching that name. The rule now carries the peer the row
+  named, so the three scopes read as they look: `y`/`n` this row, `Y`/`N` this host on any
+  port, the Apps pane the whole app. A row whose peer has no resolved name still falls back
+  to the port — that is all such a row says. Answering a pending ask, from the TUI or
+  `guardit answer`, records the same scope.
+- An app with rules of its own for particular ports or hosts now reads `(custom)` instead
+  of showing one of them and a count of the others.
 - **`install.sh` finishes the job.** It now checks for `nft` and `curl`, turns on ads +
   phishing blocking and downloads the lists on a first install, and loads the ruleset into
   the kernel — which had been left as three commands to remember, with the consequence that

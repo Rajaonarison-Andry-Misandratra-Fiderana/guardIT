@@ -1426,10 +1426,20 @@ fn flow_select(app: &mut App, back: bool) {
         .select(step(app.flow_state.selected(), len, back));
 }
 
-/// on a still-pending request this verdicts the actual held packet (the
-/// daemon persists it as a per-port rule); on an already-resolved history
-/// entry there's no packet left to verdict, so it just (re)sets that port's
-/// rule — this is how you flip an earlier deny back to allow, or vice versa
+/// Rules the row you are looking at, and only that.
+///
+/// A flow row is an app reaching one peer on one port, so the rule is about
+/// that pair: `deny` on `curl -> port 53 -> ads.example.com` must stop curl
+/// reaching *that name*, not stop curl doing DNS. Where the peer has no
+/// resolved name there is nothing else to key on and it falls back to the
+/// port alone, which is all a nameless row actually says.
+///
+/// `Y`/`N` widen it to the host on any port; the Apps pane widens it to the
+/// whole app. Three deliberate scopes, narrowest under the plain keys.
+///
+/// On a still-pending request this verdicts the held packet and the daemon
+/// records the same rule; on a resolved row there is no packet left, so it
+/// just (re)sets the rule — which is how you flip an earlier deny to allow.
 fn flow_decide(app: &mut App, verdict: Action) {
     let idxs = current_flow_indices(app);
     let Some(sel) = app.flow_state.selected() else {
@@ -1444,11 +1454,14 @@ fn flow_decide(app: &mut App, verdict: Action) {
     let exe = entry.exe.clone();
     let port = entry.port;
     let direction = entry.direction;
+    let host = entry.peer_name.clone();
     let was_pending = matches!(entry.status, FlowStatus::Pending);
     let req_id = entry.req_id;
     let Some(ipc) = &mut app.ipc else { return };
 
     if was_pending {
+        // the daemon records the same scope from the packet it is holding,
+        // which is where the peer name for it comes from
         let Some(req_id) = req_id else { return };
         ipc.send(&ClientMsg::Decide { req_id, verdict });
     } else {
@@ -1458,13 +1471,16 @@ fn flow_decide(app: &mut App, verdict: Action) {
             direction: Some(direction),
             action: verdict,
             expires: None,
-            host: None,
+            host: host.clone(),
         });
     }
-    // the rule covers this app's OTHER rows on the SAME port and direction
-    // too (per-port control, never the whole app — that's Apps' job)
+    // the same rows the rule will match: this app, this port and direction,
+    // and — when the row named a peer — that peer
     cascade_flow_rows(app, verdict, |e| {
-        e.exe == exe && e.port == port && e.direction == direction
+        e.exe == exe
+            && e.port == port
+            && e.direction == direction
+            && (host.is_none() || e.peer_name == host)
     });
 }
 
@@ -1717,7 +1733,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("h/l", "pane"),
             ("j/k", "select"),
             ("a", "audit app"),
-            ("y/n", "allow/deny port"),
+            ("y/n", "allow/deny row"),
             ("Y/N", "allow/deny host"),
         ],
         (Focus::Blocking, _) => vec![
@@ -2009,10 +2025,26 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
             // hide the other: a disabled rule still shows what it *would*
             // do, just dimmed with "(off)" appended, instead of a generic
             // "(disabled)" that threw the allow/deny info away
-            let (dot, base_color, mut status) = match &row.rule {
-                Some(r) if r.action == Action::Allow => ("●", theme.allow, "(allow)".to_string()),
-                Some(_) => ("●", theme.deny, "(deny)".to_string()),
-                None => ("●", theme.warn, "(new)".to_string()),
+            // An app with per-port or per-host rules of its own has no single
+            // verdict to report, so it says so rather than showing one of its
+            // rules and a count of the others. The dot keeps the whole-app
+            // default's colour, so what it falls back to is still visible.
+            let (dot, base_color, mut status) = match (&row.rule, row.port_overrides > 0) {
+                (Some(r), true) => (
+                    "●",
+                    if r.action == Action::Allow {
+                        theme.allow
+                    } else {
+                        theme.deny
+                    },
+                    "(custom)".to_string(),
+                ),
+                (None, true) => ("●", theme.warn, "(custom)".to_string()),
+                (Some(r), false) if r.action == Action::Allow => {
+                    ("●", theme.allow, "(allow)".to_string())
+                }
+                (Some(_), false) => ("●", theme.deny, "(deny)".to_string()),
+                (None, false) => ("●", theme.warn, "(new)".to_string()),
             };
             let disabled = matches!(&row.rule, Some(r) if !r.enabled);
             let color = if disabled {
@@ -2040,11 +2072,7 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
                 // ask again on its next connection (config::AppRule::stale)
                 status.push_str(" [changed]");
             }
-            // this default doesn't tell the whole story if some of the app's
-            // ports have their own override — say so instead of looking wrong
-            if row.port_overrides > 0 {
-                status.push_str(&format!(" +{}p", row.port_overrides));
-            }
+
             let style = if missing {
                 Style::new().fg(color).add_modifier(Modifier::CROSSED_OUT)
             } else {
