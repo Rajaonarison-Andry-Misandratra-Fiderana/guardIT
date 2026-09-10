@@ -306,6 +306,14 @@ pane gets a thick border:
 | ↳ left half | **apps** | one row per app and its whole-app verdict — `(custom)` when it has rules of its own for particular ports or hosts, with the dot keeping the default's colour | `j/k` select · `a` this app's audit trail · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely · `/` filter by name (live; `Enter` keeps it, `Esc` clears) |
 | ↳ right half | **flow** | live connection history for whichever app is selected on the left — a row refused by a blocklist or by `require_resolved` says so, and stays red whatever the app's rules allow | `j/k` select · `a` this app's audit trail · `y`/`n` allow/deny **exactly this row** — this app, this port and direction, and the peer it named (a row whose peer has no resolved name falls back to the port, which is all such a row says) · `Y`/`N` allow/deny **this peer's hostname**, any port (needs a resolved name; uses the exact name — `--host '*.foo.com'` on the CLI for a whole domain) |
 
+The first preset under `p` is **Allow everything (pause filtering)** — an unqualified
+`accept` that renders above the queue lines in both chains, so no traffic reaches the
+daemon while it is on: no per-app matching, no prompts, no connection-layer blocking.
+Reach for it when guardit is in the way of something and you need the machine working now.
+Prefer it to `systemctl stop guardit`, which leaves the queues loaded with nothing
+listening on them and so takes the network down instead of opening it. It is an ordinary
+rule, so `space` switches it off again and every other rule is back in force.
+
 `B` opens the blocking tab: the figures, the twelve category switches, and the names most
 recently blocked. `j/k` moves, `space` blocks or unblocks a category — ticking one whose
 lists aren't on disk downloads them there and then, in the background — and `u`

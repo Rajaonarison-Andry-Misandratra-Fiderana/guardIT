@@ -430,8 +430,18 @@ fn flush_app_log() -> std::io::Result<()> {
 }
 
 /// canned rule specs (same format as the freeform `a` add-flow) for users
-/// who don't want to hand-write nft-ish specs — covers the common cases
+/// who don't want to hand-write nft-ish specs — covers the common cases.
+///
+/// The first one is the off switch. An unqualified `accept` renders above the
+/// `queue num` lines (ruleset::render), so it short-circuits both chains
+/// before anything reaches the daemon: no per-app matching, no blocklist at
+/// the connection layer, no prompts. That is the point — it is the thing to
+/// reach for when guardit is in the way of something and you need the
+/// machine working now, rather than `systemctl stop guardit`, which leaves
+/// the queues loaded with nothing listening and takes the network down with
+/// it. Toggle it off (`space`) to have every rule apply again.
 const PRESETS: &[(&str, &str)] = &[
+    ("Allow everything (pause filtering)", "allow any any -"),
     ("Allow LAN (192.168.0.0/16)", "allow any 192.168.0.0/16 -"),
     ("Allow SSH (22)", "allow tcp any 22"),
     ("Allow DNS (53)", "allow any any 53"),
@@ -2974,6 +2984,29 @@ fn draw_conflicts(f: &mut Frame, app: &mut App, area: Rect) {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    /// the Preset pane feeds these straight into `parse_spec(..).expect(..)`,
+    /// so a typo in the table is a panic in front of the user, not an error
+    /// message. Nothing else checks them.
+    #[test]
+    fn every_built_in_preset_parses() {
+        for (name, spec) in PRESETS {
+            assert!(parse_spec(spec).is_ok(), "preset {name:?} ({spec:?}) must parse");
+        }
+    }
+
+    /// the off switch has to be an *unqualified* accept — any proto, any
+    /// source, any port. A preset that quietly narrowed to tcp/443 would
+    /// still read "Allow everything" in the list while leaving udp filtered.
+    #[test]
+    fn the_first_preset_allows_literally_everything() {
+        let (name, spec) = PRESETS[0];
+        let r = parse_spec(spec).expect("parses");
+        assert_eq!(r.action, Action::Allow, "{name}");
+        assert_eq!(r.proto, Proto::Any, "{name}");
+        assert_eq!(r.src, "any", "{name}");
+        assert_eq!(r.port, None, "{name}");
+    }
 
     fn demo_flow(port: u16, ip: &str, name: Option<&str>, exe: &str) -> FlowWire {
         FlowWire {

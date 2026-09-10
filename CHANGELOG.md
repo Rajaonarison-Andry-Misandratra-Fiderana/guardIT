@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **An "Allow everything" preset**, first in the TUI's `p` list: one unqualified `accept`
+  above the queue lines in both chains, so nothing reaches the daemon at all — no per-app
+  matching, no prompts, no connection-layer blocking. The thing to reach for when guardit
+  is in the way of something and you need the machine working *now*, instead of
+  `systemctl stop guardit`, which leaves the queues loaded with nothing listening and
+  takes the network down with it. It is a rule like any other, so `space` toggles it back
+  off and every other rule applies again. `guardit allow` with no arguments is the same
+  thing headless.
+
 - **IP/port rules apply outbound too, and a rule can name its direction.** They only ever
   rendered into the input chain, so `guardit deny --src 1.2.3.4` did not stop anything on
   this machine from reaching 1.2.3.4, and no ip/port rule could short-circuit the per-app
