@@ -628,11 +628,17 @@ fn basename(exe: &str) -> &str {
         .unwrap_or(exe)
 }
 
-/// Add-rule spec: "<allow|deny> <tcp|udp|any> <src|any> <port|->"
+/// Add-rule spec: "<allow|deny> <tcp|udp|any> <peer|any> <port|-> [in|out]"
+///
+/// The trailing direction is optional and omitting it means both, so every
+/// spec that parsed before this field existed still parses and still means
+/// the same thing.
+const SPEC_FORMAT: &str = "format: <allow|deny> <tcp|udp|any> <peer|any> <port|-> [in|out]";
+
 fn parse_spec(line: &str) -> Result<Rule, String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() != 4 {
-        return Err("format: <allow|deny> <tcp|udp|any> <src|any> <port|->".into());
+    if !(4..=5).contains(&parts.len()) {
+        return Err(SPEC_FORMAT.into());
     }
     let action = match parts[0] {
         "allow" => Action::Allow,
@@ -656,12 +662,19 @@ fn parse_spec(line: &str) -> Result<Rule, String> {
                 .map_err(|_| "bad port".to_string())?,
         )
     };
+    let direction = match parts.get(4) {
+        None => None,
+        Some(&"in") => Some(Direction::In),
+        Some(&"out") => Some(Direction::Out),
+        Some(_) => return Err("direction must be in|out, or left off for both".into()),
+    };
     Ok(Rule {
         id: 0,
         action,
         proto,
         src,
         port,
+        direction,
         enabled: true,
     })
 }
@@ -2123,9 +2136,14 @@ fn draw_rules(f: &mut Frame, app: &mut App, area: Rect) {
                             if r.enabled { "" } else { "  (off)" },
                         )),
                         Line::from(format!(
-                            "  {}{}",
+                            "  {}{}{}",
                             r.src,
                             r.port.map(|p| format!(":{p}")).unwrap_or_default(),
+                            // only when it is *not* both: a direction on
+                            // every row would be noise on the common case
+                            r.direction
+                                .map(|d| format!("  {}", d.as_str()))
+                                .unwrap_or_default(),
                         )),
                     ])
                     .style(Style::new().fg(color))
@@ -3007,6 +3025,7 @@ mod tests {
             action: Action::Allow,
             proto: Proto::Tcp,
             src: "192.168.1.0/24".into(),
+            direction: None,
             port: Some(22),
             enabled: true,
         }];

@@ -101,7 +101,9 @@ IP/port rules (nftables level):
 
 ```
 guardit allow --proto tcp --src 192.168.1.0/24 --port 22   # add an IP/port rule
-guardit deny  --port 80                                     # explicit block
+guardit deny  --port 80                                     # explicit block, both directions
+guardit deny  --port 25 --dir out                           # outbound only
+guardit allow                                               # allow everything: pause filtering
 guardit rm <id>                                             # remove a rule
 guardit list                                                # list configured rules
 guardit apply [--dry-run]                                   # load the ruleset into the kernel
@@ -298,7 +300,7 @@ pane gets a thick border:
 
 | Where | Pane | What it shows | Keys |
 |---|---|---|---|
-| left, top | **System rules** | IP/port `Rule`s (nftables-level) | `j/k` move · `space` toggle · `d` delete · `a` add · `p` presets (changes apply immediately) |
+| left, top | **System rules** | IP/port `Rule`s (nftables-level) — both directions unless the rule names one | `j/k` move · `space` toggle · `d` delete · `a` add · `p` presets (changes apply immediately) |
 | middle, top | **Top apps** | bar chart of the apps with the most connection attempts, over the whole audit log (reset by `f` flush), each app's total above its bar | informational |
 | bottom | **Application blocking** — one pane, two halves either side of a vertical rule, because you pick an app on the left and rule on what it is doing on the right. The rule is two columns, reproducing the seam where System rules meets Top apps, so each half runs under the pane it belongs with | | |
 | ↳ left half | **apps** | one row per app and its whole-app verdict — `(custom)` when it has rules of its own for particular ports or hosts, with the dot keeping the default's colour | `j/k` select · `a` this app's audit trail · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely · `/` filter by name (live; `Enter` keeps it, `Esc` clears) |

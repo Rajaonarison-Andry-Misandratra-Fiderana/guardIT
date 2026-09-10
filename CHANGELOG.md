@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **IP/port rules apply outbound too, and a rule can name its direction.** They only ever
+  rendered into the input chain, so `guardit deny --src 1.2.3.4` did not stop anything on
+  this machine from reaching 1.2.3.4, and no ip/port rule could short-circuit the per-app
+  queue on the way out — which is what made an "allow everything" rule impossible to
+  write. `Rule::src` is the peer in both directions now: matched as `ip saddr` in the
+  input chain and `ip daddr` in the output chain, so one rule means the same thing
+  whichever end opens the connection. A rule with no direction covers both, which is what
+  every rule written before this field existed meant; `--dir in` / `--dir out` (or a
+  trailing `in`/`out` in the TUI's add-rule spec) narrows one to a single side.
+
 - **`filter_forwarded`**: guardit can now filter traffic that only passes through this
   machine — containers, bridged VMs. Names and addresses only: your ip/port rules, the
   encrypted-DNS refusals, and the blocklists, fed by the same DNS tap, which now watches

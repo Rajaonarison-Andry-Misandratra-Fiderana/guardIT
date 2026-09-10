@@ -33,16 +33,30 @@ enum ProtoArg {
 struct RuleArgs {
     #[arg(long, default_value = "any")]
     proto: ProtoArg,
+    /// the peer: an ip, an ip/prefix, or "any" (matched as the source of an
+    /// inbound connection and the destination of an outbound one)
     #[arg(long, default_value = "any")]
     src: String,
     #[arg(long)]
     port: Option<u16>,
+    /// one direction only; omit for both
+    #[arg(long)]
+    dir: Option<DirArg>,
 }
 
 #[derive(ValueEnum, Clone, Copy)]
 enum DirArg {
     In,
     Out,
+}
+
+impl From<DirArg> for Direction {
+    fn from(d: DirArg) -> Self {
+        match d {
+            DirArg::In => Direction::In,
+            DirArg::Out => Direction::Out,
+        }
+    }
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -426,10 +440,7 @@ fn wait_app_rules(c: &mut ipc::Client) -> std::io::Result<Vec<config::AppRule>> 
 /// through the daemon when it runs (so it enforces the rule right away),
 /// straight to rules.toml otherwise (picked up when the daemon starts)
 fn set_app_rule(action: RuleAction, args: AppRuleArgs) {
-    let direction = args.dir.map(|d| match d {
-        DirArg::In => Direction::In,
-        DirArg::Out => Direction::Out,
-    });
+    let direction = args.dir.map(Direction::from);
     let expires = args.expires_in.map(|secs| now_ts() + secs);
     if let Some(h) = &args.host
         && let Err(e) = config::validate_host(h)
@@ -869,6 +880,7 @@ fn add_rule(cfg: &mut Config, action: RuleAction, args: RuleArgs) {
         },
         src: args.src,
         port: args.port,
+        direction: args.dir.map(Direction::from),
         enabled: true,
     };
     println!("added rule #{}", rule.id);
@@ -882,17 +894,18 @@ fn print_list(cfg: &Config) {
         return;
     }
     println!(
-        "{:<4}{:<8}{:<6}{:<20}{:<8}{:<4}",
-        "ID", "ACTION", "PROTO", "SRC", "PORT", "ON"
+        "{:<4}{:<8}{:<6}{:<20}{:<8}{:<6}{:<4}",
+        "ID", "ACTION", "PROTO", "PEER", "PORT", "DIR", "ON"
     );
     for r in &cfg.rule {
         println!(
-            "{:<4}{:<8}{:<6}{:<20}{:<8}{:<4}",
+            "{:<4}{:<8}{:<6}{:<20}{:<8}{:<6}{:<4}",
             r.id,
             format!("{:?}", r.action).to_lowercase(),
             format!("{:?}", r.proto).to_lowercase(),
             r.src,
             r.port.map(|p| p.to_string()).unwrap_or_default(),
+            r.direction.map(|d| d.as_str()).unwrap_or("both"),
             if r.enabled { "yes" } else { "no" },
         );
     }

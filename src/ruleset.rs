@@ -1,5 +1,5 @@
 use crate::blocklist;
-use crate::config::{Action, Config, Proto, Rule};
+use crate::config::{Action, Config, Direction, Proto, Rule};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -29,11 +29,31 @@ pub const QUEUE_DNS: u16 = 2;
 /// container runtime on the machine the first time the daemon hiccuped.
 pub const QUEUE_FWD: u16 = 3;
 
-fn rule_line(r: &Rule) -> String {
+/// One nft line for one `Rule`, as seen from `dir`.
+///
+/// `Rule::src` is the peer, so which nft keyword it becomes depends on the
+/// chain: the peer is the source of an inbound packet and the destination of
+/// an outbound one. `port` is the destination port either way — the service
+/// being reached, which is the only port worth writing a rule about (see
+/// `queue_loop`'s `rule_port`).
+/// the enabled rules that have anything to say about `dir` — a rule with no
+/// direction of its own applies to both, which is what every rule written
+/// before `Rule::direction` existed means
+fn rules_for(cfg: &Config, dir: Direction) -> impl Iterator<Item = &Rule> {
+    cfg.rule
+        .iter()
+        .filter(move |r| r.enabled && r.direction.is_none_or(|d| d == dir))
+}
+
+fn rule_line(r: &Rule, dir: Direction) -> String {
     let mut parts = vec![];
     if r.src != "any" {
         let family = if r.src.contains(':') { "ip6" } else { "ip" };
-        parts.push(format!("{family} saddr {}", r.src));
+        let side = match dir {
+            Direction::In => "saddr",
+            Direction::Out => "daddr",
+        };
+        parts.push(format!("{family} {side} {}", r.src));
     }
     match r.proto {
         Proto::Tcp => parts.push("tcp".into()),
@@ -132,8 +152,8 @@ pub fn render(cfg: &Config) -> String {
     out.push_str(&format!("    tcp sport 53 queue num {QUEUE_DNS} bypass\n"));
     out.push_str("    iif lo accept\n");
     out.push_str("    ct state established,related accept\n");
-    for r in cfg.rule.iter().filter(|r| r.enabled) {
-        out.push_str(&rule_line(r));
+    for r in rules_for(cfg, Direction::In) {
+        out.push_str(&rule_line(r, Direction::In));
         out.push('\n');
     }
     // anything not already accepted/dropped by an IP/port rule above falls
@@ -151,6 +171,15 @@ pub fn render(cfg: &Config) -> String {
     // than held open waiting for a per-app decision nobody wants to make
     if block_dns {
         encrypted_dns_chain(&mut out);
+    }
+    // the same ip/port rules as the input chain, matched on the peer as a
+    // destination. Without these, an ip/port rule was inbound-only while
+    // every outbound connection went to the daemon — so "deny 1.2.3.4" did
+    // not stop anything here from reaching 1.2.3.4, and no rule could
+    // short-circuit the per-app queue on the way out.
+    for r in rules_for(cfg, Direction::Out) {
+        out.push_str(&rule_line(r, Direction::Out));
+        out.push('\n');
     }
     // queries, not just the replies the input chain taps: a blocked name is
     // answered from here, so the question never leaves the machine
@@ -186,9 +215,14 @@ fn forward_chain(out: &mut String, cfg: &Config, block_dns: bool) {
     if block_dns {
         encrypted_dns_chain(out);
     }
-    for r in cfg.rule.iter().filter(|r| r.enabled) {
-        out.push_str(&rule_line(r));
-        out.push('\n');
+    // both sides here: a forwarded flow passes through this chain in both
+    // directions, so "deny 1.2.3.4" has to mean "no traffic with 1.2.3.4",
+    // not just "none from it"
+    for dir in [Direction::In, Direction::Out] {
+        for r in rules_for(cfg, dir) {
+            out.push_str(&rule_line(r, dir));
+            out.push('\n');
+        }
     }
     out.push_str(&format!(
         "    ct state new queue num {QUEUE_FWD} bypass\n"
@@ -259,6 +293,7 @@ mod tests {
 
     fn rule(action: Action, proto: Proto, src: &str, port: Option<u16>) -> Rule {
         Rule {
+            direction: None,
             id: 1,
             action,
             proto,
@@ -322,6 +357,7 @@ mod tests {
             proto: Proto::Tcp,
             src: "any".into(),
             port: Some(23),
+            direction: None,
             enabled: true,
         });
         assert!(
@@ -406,6 +442,70 @@ mod tests {
             rule_pos < queue_pos,
             "ip rule must be evaluated before the queue fallback"
         );
+    }
+
+    /// what the TUI's "Allow everything (pause filtering)" preset renders to.
+    /// A bare `accept` with no match expression, above the queue lines in
+    /// both chains — if it ever rendered as `any accept` or landed below the
+    /// queue, the preset would look like an off switch and not be one.
+    #[test]
+    fn an_unqualified_allow_short_circuits_both_chains_before_the_queue() {
+        let cfg = Config {
+            rule: vec![rule(Action::Allow, Proto::Any, "any", None)],
+            ..Config::default()
+        };
+        let out = render(&cfg);
+        let (input_chain, output_chain) = out.split_once("chain output").unwrap();
+        for (name, chain, queue) in [
+            ("input", input_chain, QUEUE_IN),
+            ("output", output_chain, QUEUE_OUT),
+        ] {
+            let accept = chain
+                .find("\n    accept\n")
+                .unwrap_or_else(|| panic!("{name} chain has no unqualified accept:\n{chain}"));
+            let queue_pos = chain.find(&format!("queue num {queue}")).unwrap();
+            assert!(accept < queue_pos, "{name}: accept must precede the queue");
+        }
+    }
+
+    /// `Rule::src` is the peer, so the nft keyword has to flip per chain —
+    /// `ip saddr` inbound, `ip daddr` outbound. Rendering `saddr` in the
+    /// output chain would match this machine's own address and so match
+    /// nothing anyone meant.
+    #[test]
+    fn the_peer_is_a_source_inbound_and_a_destination_outbound() {
+        let cfg = Config {
+            rule: vec![rule(Action::Deny, Proto::Tcp, "1.2.3.4", Some(25))],
+            ..Config::default()
+        };
+        let out = render(&cfg);
+        let (input_chain, output_chain) = out.split_once("chain output").unwrap();
+        assert!(input_chain.contains("ip saddr 1.2.3.4 tcp dport 25 drop"));
+        assert!(output_chain.contains("ip daddr 1.2.3.4 tcp dport 25 drop"));
+    }
+
+    #[test]
+    fn a_directional_rule_only_renders_into_its_own_chain() {
+        for (dir, mine, theirs) in [
+            (Direction::In, "chain input", "chain output"),
+            (Direction::Out, "chain output", "chain input"),
+        ] {
+            let mut r = rule(Action::Allow, Proto::Tcp, "any", Some(22));
+            r.direction = Some(dir);
+            let out = render(&Config {
+                rule: vec![r],
+                ..Config::default()
+            });
+            // the chains are emitted input-then-output, so slice on whichever
+            // marker starts the half we care about
+            let hit = |marker: &str| {
+                let rest = &out[out.find(marker).unwrap() + marker.len()..];
+                let end = rest.find("  chain ").unwrap_or(rest.len());
+                rest[..end].contains("tcp dport 22 accept")
+            };
+            assert!(hit(mine), "{dir:?} rule missing from {mine}");
+            assert!(!hit(theirs), "{dir:?} rule leaked into {theirs}");
+        }
     }
 
     #[test]

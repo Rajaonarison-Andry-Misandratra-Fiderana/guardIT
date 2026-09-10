@@ -23,9 +23,19 @@ pub struct Rule {
     pub id: u32,
     pub action: Action,
     pub proto: Proto,
-    /// "any" or an ip/cidr — see `validate_src`
+    /// "any" or an ip/cidr — see `validate_src`. It is the *peer*'s address
+    /// in both directions: matched as `ip saddr` in the input chain and as
+    /// `ip daddr` in the output chain, so one rule means the same thing
+    /// ("this host, this port") whichever way the connection is opened.
     pub src: String,
     pub port: Option<u16>,
+    /// `None` = both directions, which is what every rule written before
+    /// this field existed means. `Some(In)` is "someone reaching this
+    /// machine", `Some(Out)` is "this machine reaching out" — the escape
+    /// hatch for the asymmetric case ("let people ssh in, but no app here
+    /// may ssh out").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<Direction>,
     pub enabled: bool,
 }
 
