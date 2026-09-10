@@ -855,6 +855,9 @@ fn reset_everything(cfg: &Config, yes: bool) {
         cfg.blocklist.categories.len(),
         cfg.blocklist.sources.len()
     );
+    if let Some(f) = cfg.auto.active() {
+        println!("  auto mode (on, fallback {}) — back to asking", f.as_str());
+    }
     println!(
         "  {} audit entr(ies)   {}",
         lines(daemon::history_log_path()),

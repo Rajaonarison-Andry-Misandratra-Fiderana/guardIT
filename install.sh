@@ -124,3 +124,6 @@ fi
 
 echo
 echo "done. \`sudo guardit\` for the dashboard, \`guardit blocklist categories\` for what else it can block."
+# the one thing nobody discovers on their own, and the one that decides
+# whether this machine spends its day asking questions
+echo "       \`sudo guardit auto on\` if you would rather it decided unruled connections than asked you."

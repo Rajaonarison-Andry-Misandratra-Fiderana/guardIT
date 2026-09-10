@@ -508,6 +508,87 @@ mod tests {
         }
     }
 
+    /// The renderer's output is a string that a *different program* has to
+    /// accept, and every test above this one only checks that our own
+    /// substrings are in it. `nft -c` parses a ruleset without loading it,
+    /// so the whole thing can go to the actual parser — the only thing that
+    /// can say whether a rule shape the preset catalogue now produces is one
+    /// nft understands.
+    ///
+    /// It still opens a netlink socket to build its cache, so unprivileged
+    /// it cannot run at all and this skips. That makes it a check for
+    /// whoever runs the suite as root before a release, which is the moment
+    /// it matters, rather than a test that quietly passes everywhere.
+    #[test]
+    fn nft_itself_accepts_everything_this_renders() {
+        let mut cfg = Config {
+            filter_forwarded: true,
+            ..Config::default()
+        };
+        cfg.blocklist.enabled = true;
+        cfg.blocklist.block_encrypted_dns = true;
+        // one of every shape: bare, address-only, port-only, both, each
+        // family, each direction, both actions
+        let shapes: &[(Action, Proto, &str, Option<u16>, Option<Direction>)] = &[
+            (Action::Allow, Proto::Any, "any", None, None),
+            (Action::Deny, Proto::Any, "any", None, Some(Direction::In)),
+            (Action::Allow, Proto::Any, "192.168.0.0/16", None, None),
+            (Action::Allow, Proto::Tcp, "10.0.0.0/8", Some(22), Some(Direction::In)),
+            (Action::Deny, Proto::Udp, "any", Some(5353), Some(Direction::Out)),
+            (Action::Allow, Proto::Any, "any", Some(53), Some(Direction::Out)),
+            (Action::Deny, Proto::Tcp, "fd00::/8", Some(445), Some(Direction::Out)),
+            (Action::Allow, Proto::Any, "2001:db8::1", None, Some(Direction::In)),
+        ];
+        for (i, (action, proto, src, port, direction)) in shapes.iter().enumerate() {
+            cfg.rule.push(Rule {
+                id: i as u32 + 1,
+                action: *action,
+                proto: *proto,
+                src: (*src).into(),
+                port: *port,
+                direction: *direction,
+                enabled: true,
+            });
+        }
+        let ruleset = render(&cfg);
+
+        let mut child = match Command::new("nft")
+            .args(["-c", "-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            // no nft on this machine (CI container, another distro): the
+            // rest of the suite still says what it says
+            Err(_) => return,
+        };
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(ruleset.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("Operation not permitted") {
+            eprintln!("skipped: `nft -c` needs root for its netlink cache");
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "nft rejected our own ruleset:\n{stderr}\n--- ruleset ---\n{}",
+            // the DoH set is thousands of addresses on one line and never the
+            // thing that broke; the chains are what to read
+            ruleset
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("set "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     #[test]
     fn port_without_explicit_proto_defaults_tcp() {
         let cfg = Config {
