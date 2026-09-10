@@ -190,6 +190,17 @@ The order is not cosmetic: a fact *against* a connection outranks every reason f
 condemned. A port that is an anomaly across the internet is deliberately fine on your own
 network — that is a NAS or a printer, not an exfiltration route.
 
+Two consequences worth knowing before you turn it on:
+
+- **If this machine sends mail on port 25** — a real MTA, not a desktop mail client — auto
+  will refuse it, because from anything else port 25 outbound is a spam bot. Write the rule
+  (`guardit allow --proto tcp --port 25 --dir out`) and your rule wins.
+- **"Your own network" means private, link-local, loopback and CGNAT addresses.** A machine
+  on your LAN reached over a *global* IPv6 address does not look local by that definition,
+  so unsolicited inbound from it is refused like anything else from a routable address. If
+  your LAN is v6-native, allow what you actually serve — the `in` presets do it in one
+  keystroke.
+
 It writes **no rules**. Each connection is judged again on the evidence current at that
 moment, so a binary replaced ten seconds ago, a name that has just landed on a blocklist,
 or a service that stopped listening all change the answer with nothing to clean up
