@@ -22,6 +22,17 @@
   nothing to clean up. Toggling it takes effect within seconds under a running daemon, with
   no restart and no held connection dropped.
 
+- **The preset catalogue: 32 of them, grouped, filterable, multi-rule.** `p` now opens over
+  the whole grid instead of into a quarter-width pane, because seven single-rule specs were
+  never going to cover what people actually want to say. Type to filter, `↑`/`↓` to move,
+  `Enter` to add. Entries are grouped by what you are trying to do — `off` for the escape
+  hatches, `lan` for your own network, `in` for what this machine offers, `out` for what it
+  may reach, `harden` for ports worth shutting on principle, `bundle` for a whole posture
+  (laptop on untrusted wifi, web server, home desktop, paranoid) in one keystroke. One
+  entry can lay down several rules, and rules you already have are skipped, so overlapping
+  picks leave no duplicates. Every entry carries a line saying what it does to your traffic
+  — including the part nobody guesses, that an `allow` preset is a kernel-level accept and
+  so takes per-app control off that traffic entirely.
 - **An "Allow everything" preset**, first in the TUI's `p` list: one unqualified `accept`
   above the queue lines in both chains, so nothing reaches the daemon at all — no per-app
   matching, no prompts, no connection-layer blocking. The thing to reach for when guardit

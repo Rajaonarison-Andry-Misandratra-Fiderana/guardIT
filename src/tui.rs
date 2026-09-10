@@ -15,8 +15,8 @@ use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, List, ListItem, ListState, Padding,
-    Paragraph, Row, Sparkline, Table, TableState,
+    Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState,
+    Padding, Paragraph, Row, Sparkline, Table, TableState,
 };
 use ratatui::{Frame, Terminal};
 use std::cmp::Reverse;
@@ -411,7 +411,14 @@ impl Focus {
 enum Mode {
     Browse,
     Add(String),
-    Preset(usize),
+    /// the preset picker: a selection into `matching_presets(filter)`, and
+    /// the filter itself. Typing narrows the catalogue and the arrows move
+    /// through what is left — with thirty-odd entries, "type three letters"
+    /// is the navigation, and j/k would cost the letters j and k to type
+    Preset {
+        sel: usize,
+        filter: String,
+    },
     /// keystrokes go to the focused pane's filter instead of its own keys.
     /// Which filter that is follows the focus (`filter_buf`); the filter
     /// itself stays applied after leaving this mode
@@ -429,27 +436,361 @@ fn flush_app_log() -> std::io::Result<()> {
     std::fs::write(daemon::history_log_path(), "")
 }
 
-/// canned rule specs (same format as the freeform `a` add-flow) for users
-/// who don't want to hand-write nft-ish specs — covers the common cases.
+/// One entry of the preset catalogue: a named policy, one or more rules.
 ///
-/// The first one is the off switch. An unqualified `accept` renders above the
-/// `queue num` lines (ruleset::render), so it short-circuits both chains
-/// before anything reaches the daemon: no per-app matching, no blocklist at
-/// the connection layer, no prompts. That is the point — it is the thing to
-/// reach for when guardit is in the way of something and you need the
-/// machine working now, rather than `systemctl stop guardit`, which leaves
-/// the queues loaded with nothing listening and takes the network down with
-/// it. Toggle it off (`space`) to have every rule apply again.
-const PRESETS: &[(&str, &str)] = &[
-    ("Allow everything (pause filtering)", "allow any any -"),
-    ("Allow LAN (192.168.0.0/16)", "allow any 192.168.0.0/16 -"),
-    ("Allow SSH (22)", "allow tcp any 22"),
-    ("Allow DNS (53)", "allow any any 53"),
-    ("Allow HTTP (80)", "allow tcp any 80"),
-    ("Allow HTTPS (443)", "allow tcp any 443"),
-    ("Block HTTP (80)", "deny tcp any 80"),
-    ("Block HTTPS (443)", "deny tcp any 443"),
+/// Multi-rule on purpose. "Allow web serving" is two ports, "allow the LAN"
+/// is three ranges, and a preset that made you pick them off a list one at a
+/// time would be a list of specs with extra steps.
+struct Preset {
+    /// what the picker filters and groups on, so a catalogue this size stays
+    /// something you can find your way around by typing three letters
+    group: &'static str,
+    name: &'static str,
+    /// what it actually does to your traffic, including the part you would
+    /// not have guessed. An `allow` here is a kernel-level accept: it means
+    /// the daemon never sees that traffic, so per-app rules stop applying to
+    /// it. That is the whole point when you want the asking to stop, and a
+    /// nasty surprise when you did not — so every such preset says so.
+    note: &'static str,
+    specs: &'static [&'static str],
+}
+
+const fn p(
+    group: &'static str,
+    name: &'static str,
+    note: &'static str,
+    specs: &'static [&'static str],
+) -> Preset {
+    Preset {
+        group,
+        name,
+        note,
+        specs,
+    }
+}
+
+/// The catalogue, in the same spec format as the freeform `a` add-flow.
+///
+/// Grouped by what you are trying to do rather than by protocol: `off` when
+/// guardit is in the way, `lan` for your own network, `in` for what this
+/// machine offers, `out` for what it may reach, `harden` for the ports worth
+/// shutting on principle, and `bundle` for whole postures in one keystroke.
+const PRESETS: &[Preset] = &[
+    // ---- off: the escape hatches ----
+    p(
+        "off",
+        "Allow everything (pause filtering)",
+        "one unqualified accept above both queues — no per-app matching, no prompts, no blocking",
+        &["allow any any -"],
+    ),
+    p(
+        "off",
+        "Pause outbound filtering only",
+        "stops the asking about outgoing connections; inbound stays fully filtered",
+        &["allow any any - out"],
+    ),
+    // ---- lan: your own network ----
+    p(
+        "lan",
+        "Allow my LAN (all private ranges)",
+        "192.168/16, 10/8 and 172.16/12, both ways — printers, NAS, phones, other machines you own",
+        &[
+            "allow any 192.168.0.0/16 -",
+            "allow any 10.0.0.0/8 -",
+            "allow any 172.16.0.0/12 -",
+        ],
+    ),
+    p(
+        "lan",
+        "Allow my LAN (192.168.0.0/16)",
+        "the home-router range only",
+        &["allow any 192.168.0.0/16 -"],
+    ),
+    p(
+        "lan",
+        "Allow my LAN (10.0.0.0/8)",
+        "the corporate/VPN range only",
+        &["allow any 10.0.0.0/8 -"],
+    ),
+    p(
+        "lan",
+        "Allow link-local (169.254.0.0/16)",
+        "self-assigned addresses: a directly cabled machine, a camera, a printer with no DHCP",
+        &["allow any 169.254.0.0/16 -"],
+    ),
+    p(
+        "lan",
+        "Allow local service discovery",
+        "mDNS/Bonjour and SSDP — how printers, casts and NAS boxes announce themselves",
+        &["allow udp any 5353", "allow udp any 1900"],
+    ),
+    p(
+        "lan",
+        "Block everything outside my LAN",
+        "adds nothing: inbound already defaults to drop. Here to say so out loud",
+        &["deny any any - in"],
+    ),
+    // ---- in: what this machine offers ----
+    p(
+        "in",
+        "Allow SSH in (22)",
+        "from anywhere. Pair it with fail2ban or keys-only if this machine faces the internet",
+        &["allow tcp any 22 in"],
+    ),
+    p(
+        "in",
+        "Allow SSH in from my LAN only (22)",
+        "the same, but nothing off your own network can reach it",
+        &[
+            "allow tcp 192.168.0.0/16 22 in",
+            "allow tcp 10.0.0.0/8 22 in",
+        ],
+    ),
+    p(
+        "in",
+        "Allow web serving in (80, 443)",
+        "this machine answering HTTP and HTTPS from anywhere",
+        &["allow tcp any 80 in", "allow tcp any 443 in"],
+    ),
+    p(
+        "in",
+        "Allow a dev server from my LAN (3000, 5173, 8000, 8080)",
+        "the usual node/vite/python/tomcat ports, reachable from your own network only",
+        &[
+            "allow tcp 192.168.0.0/16 3000 in",
+            "allow tcp 192.168.0.0/16 5173 in",
+            "allow tcp 192.168.0.0/16 8000 in",
+            "allow tcp 192.168.0.0/16 8080 in",
+        ],
+    ),
+    p(
+        "in",
+        "Allow file sharing from my LAN (SMB 139, 445)",
+        "Windows/Samba shares — from your own network only, which is the only place SMB belongs",
+        &[
+            "allow tcp 192.168.0.0/16 445 in",
+            "allow tcp 192.168.0.0/16 139 in",
+        ],
+    ),
+    p(
+        "in",
+        "Allow printing in (631)",
+        "CUPS/IPP, so other machines can print to this one",
+        &["allow tcp any 631 in"],
+    ),
+    p(
+        "in",
+        "Allow remote desktop from my LAN (VNC 5900, RDP 3389)",
+        "screen sharing from your own network. Never open these to the internet",
+        &[
+            "allow tcp 192.168.0.0/16 5900 in",
+            "allow tcp 192.168.0.0/16 3389 in",
+        ],
+    ),
+    p(
+        "in",
+        "Allow Syncthing in (22000)",
+        "peer-to-peer sync, which needs to be reachable to work at all",
+        &["allow tcp any 22000 in", "allow udp any 22000 in"],
+    ),
+    p(
+        "in",
+        "Allow BitTorrent in (6881)",
+        "incoming peers. Expect a lot of them",
+        &["allow tcp any 6881 in", "allow udp any 6881 in"],
+    ),
+    p(
+        "in",
+        "Allow WireGuard in (51820)",
+        "so a VPN client elsewhere can reach this machine",
+        &["allow udp any 51820 in"],
+    ),
+    // ---- out: what this machine may reach ----
+    p(
+        "out",
+        "Stop asking about DNS and NTP (53, 123)",
+        "the two every program needs. Kernel-level accept, so per-app rules no longer apply to them",
+        &["allow any any 53 out", "allow udp any 123 out"],
+    ),
+    p(
+        "out",
+        "Stop asking about the web (80, 443)",
+        "quietest single change there is — and it takes per-app control off ALL web traffic",
+        &["allow tcp any 80 out", "allow tcp any 443 out"],
+    ),
+    p(
+        "out",
+        "Stop asking about mail (465, 587, 993, 995)",
+        "submission and IMAP/POP over TLS; per-app control stops applying to them",
+        &[
+            "allow tcp any 465 out",
+            "allow tcp any 587 out",
+            "allow tcp any 993 out",
+            "allow tcp any 995 out",
+        ],
+    ),
+    p(
+        "out",
+        "Stop asking about SSH and git (22, 9418)",
+        "for a machine you push from all day",
+        &["allow tcp any 22 out", "allow tcp any 9418 out"],
+    ),
+    p(
+        "out",
+        "Block plain HTTP out (80)",
+        "HTTPS only. Breaks captive portals and a few updaters, and says so loudly when it does",
+        &["deny tcp any 80 out"],
+    ),
+    p(
+        "out",
+        "Block SMTP out (25)",
+        "port 25 from a machine like this one is a spam bot; real mail submits on 465 or 587",
+        &["deny tcp any 25 out"],
+    ),
+    // ---- harden: shut on principle ----
+    p(
+        "harden",
+        "Block remote-control ports out (telnet, SMB, RDP, VNC)",
+        "23, 139, 445, 3389, 5900 outbound — plaintext or LAN-only protocols with no business leaving",
+        &[
+            "deny tcp any 23 out",
+            "deny tcp any 139 out",
+            "deny tcp any 445 out",
+            "deny tcp any 3389 out",
+            "deny tcp any 5900 out",
+        ],
+    ),
+    p(
+        "harden",
+        "Block known implant ports out (4444, 5555, 6667)",
+        "metasploit's default, adb over the network, and IRC — a shortlist, not a shield",
+        &[
+            "deny tcp any 4444 out",
+            "deny tcp any 5555 out",
+            "deny tcp any 6667 out",
+        ],
+    ),
+    p(
+        "harden",
+        "Block encrypted DNS out (853)",
+        "DoT/DoQ, so name lookups stay where the blocklists can see them. The blocklist setting covers DoH too",
+        &["deny tcp any 853 out", "deny udp any 853 out"],
+    ),
+    p(
+        "harden",
+        "Block NetBIOS and mDNS leaving the LAN (137, 138, 5353)",
+        "chatty discovery protocols that leak machine and user names",
+        &[
+            "deny udp any 137 out",
+            "deny udp any 138 out",
+            "deny udp any 5353 out",
+        ],
+    ),
+    // ---- bundle: a whole posture in one keystroke ----
+    p(
+        "bundle",
+        "Laptop on untrusted wifi",
+        "nothing in, the essentials out, no LAN trust: DNS/NTP/web out, everything inbound dropped",
+        &[
+            "deny any any - in",
+            "allow any any 53 out",
+            "allow udp any 123 out",
+            "allow tcp any 80 out",
+            "allow tcp any 443 out",
+        ],
+    ),
+    p(
+        "bundle",
+        "Web server",
+        "80, 443 and SSH in; DNS, NTP and web out for updates. Per-app control stays on everything else",
+        &[
+            "allow tcp any 80 in",
+            "allow tcp any 443 in",
+            "allow tcp any 22 in",
+            "allow any any 53 out",
+            "allow udp any 123 out",
+            "allow tcp any 80 out",
+            "allow tcp any 443 out",
+        ],
+    ),
+    p(
+        "bundle",
+        "Home desktop",
+        "the whole LAN trusted both ways, DNS/NTP/web out, and the remote-control ports shut outbound",
+        &[
+            "allow any 192.168.0.0/16 -",
+            "allow any 10.0.0.0/8 -",
+            "allow any any 53 out",
+            "allow udp any 123 out",
+            "allow tcp any 80 out",
+            "allow tcp any 443 out",
+            "deny tcp any 23 out",
+            "deny tcp any 445 out",
+            "deny tcp any 3389 out",
+        ],
+    ),
+    p(
+        "bundle",
+        "Paranoid",
+        "no LAN trust, no kernel-level allows at all — every single connection goes to the daemon and its rules",
+        &[
+            "deny any any - in",
+            "deny tcp any 23 out",
+            "deny tcp any 25 out",
+            "deny tcp any 139 out",
+            "deny tcp any 445 out",
+            "deny tcp any 3389 out",
+            "deny tcp any 5900 out",
+            "deny tcp any 853 out",
+            "deny udp any 853 out",
+        ],
+    ),
 ];
+
+/// the presets whose group or name contains `filter`, case-insensitively —
+/// the whole navigation model for a catalogue this long is "type three
+/// letters", so the match has to cover the group tag as well as the words
+fn matching_presets(filter: &str) -> Vec<&'static Preset> {
+    let f = filter.trim().to_ascii_lowercase();
+    PRESETS
+        .iter()
+        .filter(|p| {
+            f.is_empty()
+                || p.group.contains(&f)
+                || p.name.to_ascii_lowercase().contains(&f)
+                || p.note.to_ascii_lowercase().contains(&f)
+        })
+        .collect()
+}
+
+/// Adds a preset's rules, skipping any this config already has.
+///
+/// Without the skip, picking the same preset twice — or two presets that
+/// overlap, which the bundles deliberately do — leaves duplicate rules that
+/// each have to be deleted by hand. Returns how many were actually added.
+fn apply_preset(app: &mut App, preset: &Preset) -> usize {
+    let mut added = 0;
+    for spec in preset.specs {
+        let mut r = parse_spec(spec).expect("built-in preset spec must parse");
+        let dup = app.cfg.rule.iter().any(|e| {
+            e.action == r.action
+                && e.proto == r.proto
+                && e.src == r.src
+                && e.port == r.port
+                && e.direction == r.direction
+        });
+        if dup {
+            continue;
+        }
+        r.id = app.cfg.next_id();
+        app.cfg.rule.push(r);
+        added += 1;
+    }
+    if added > 0 {
+        save_rules(app);
+    }
+    added
+}
 
 /// client side of the daemon's IPC socket (see src/daemon.rs) — non-blocking,
 /// polled once per tick. `None` means the daemon isn't reachable (not
@@ -800,7 +1141,7 @@ pub fn run(cfg: Config) {
             if let Some(step) = move_focus
                 && !matches!(
                     app.mode,
-                    Mode::Add(_) | Mode::Preset(_) | Mode::Filter
+                    Mode::Add(_) | Mode::Preset { .. } | Mode::Filter
                 )
                 // a confirmation is answered before anything else moves
                 && !app.app_log_confirm_flush
@@ -861,25 +1202,41 @@ pub fn run(cfg: Config) {
                         KeyCode::Char(' ') => toggle_selected(&mut app),
                         KeyCode::Char('d') => delete_selected(&mut app),
                         KeyCode::Char('a') => app.mode = Mode::Add(String::new()),
-                        KeyCode::Char('p') => app.mode = Mode::Preset(0),
-                        _ => {}
-                    },
-                    Mode::Preset(sel) => match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Browse,
-                        KeyCode::Char('j') | KeyCode::Down => *sel = (*sel + 1) % PRESETS.len(),
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            *sel = (*sel + PRESETS.len() - 1) % PRESETS.len()
-                        }
-                        KeyCode::Enter => {
-                            let (_, spec) = PRESETS[*sel];
-                            let mut r = parse_spec(spec).expect("built-in preset spec must parse");
-                            r.id = app.cfg.next_id();
-                            app.cfg.rule.push(r);
-                            save_rules(&mut app);
-                            app.mode = Mode::Browse;
+                        KeyCode::Char('p') => {
+                            app.mode = Mode::Preset {
+                                sel: 0,
+                                filter: String::new(),
+                            }
                         }
                         _ => {}
                     },
+                    Mode::Preset { sel, filter } => {
+                        let len = matching_presets(filter).len();
+                        match key.code {
+                            KeyCode::Esc => app.mode = Mode::Browse,
+                            KeyCode::Down => *sel = if len == 0 { 0 } else { (*sel + 1) % len },
+                            KeyCode::Up => {
+                                *sel = if len == 0 { 0 } else { (*sel + len - 1) % len }
+                            }
+                            KeyCode::Backspace => {
+                                filter.pop();
+                                *sel = 0;
+                            }
+                            // every other printable key narrows the list, so
+                            // there is no second mode to enter first
+                            KeyCode::Char(c) => {
+                                filter.push(c);
+                                *sel = 0;
+                            }
+                            KeyCode::Enter => {
+                                if let Some(preset) = matching_presets(filter).get(*sel).copied() {
+                                    apply_preset(&mut app, preset);
+                                }
+                                app.mode = Mode::Browse;
+                            }
+                            _ => {}
+                        }
+                    }
                     // only ever set from the Apps pane / the log tab, and Tab
                     // can't leave either — but if one got here, Browse is the
                     // safe read
@@ -1771,6 +2128,14 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_app_control(f, app, bottom, rules.right().saturating_sub(1));
     }
 
+    // over the grid rather than inside the rules pane: the catalogue is
+    // thirty-odd two-line entries and that pane is a quarter of one row.
+    // Nothing else in this UI is modal, and this is the exception that earns
+    // it — you are picking one thing and then going back
+    if matches!(app.mode, Mode::Preset { .. }) {
+        draw_presets(f, app, centered(outer[1], 92, 94));
+    }
+
     draw_footer(f, app, outer[2]);
 }
 
@@ -1906,9 +2271,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("/", "filter"),
             ("f", "flush"),
         ],
-        (Focus::Rules, Mode::Preset(_)) => {
-            vec![("j/k", "move"), ("Enter", "add"), ("Esc", "cancel")]
-        }
+        (Focus::Rules, Mode::Preset { .. }) => vec![
+            ("type", "filter"),
+            ("↑/↓", "move"),
+            ("Enter", "add"),
+            ("Esc", "cancel"),
+        ],
         (Focus::Rules, _) => vec![
             ("h/l", "pane"),
             ("j/k", "move"),
@@ -2123,75 +2491,113 @@ fn draw_confirm_flush(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(text, popup);
 }
 
+/// a rect `pct_w` x `pct_h` percent of `area`, centered — the one modal in
+/// this UI (the preset catalogue) and nothing else needs it yet
+fn centered(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
+    let [row] = Layout::vertical([Constraint::Percentage(pct_h)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [cell] = Layout::horizontal([Constraint::Percentage(pct_w)])
+        .flex(Flex::Center)
+        .areas(row);
+    cell
+}
+
+/// The preset catalogue, as a modal over the grid.
+fn draw_presets(f: &mut Frame, app: &App, area: Rect) {
+    let theme = THEMES[app.theme_idx];
+    let Mode::Preset { sel, filter } = &app.mode else {
+        return;
+    };
+    f.render_widget(Clear, area);
+    let hits = matching_presets(filter);
+    let dim = Style::new().fg(theme.border_idle);
+    let items: Vec<ListItem> = hits
+        .iter()
+        .map(|p| {
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("{:<8}", format!("[{}]", p.group)), dim),
+                    Span::styled(p.name, Style::new().fg(theme.fg)),
+                    Span::styled(
+                        match p.specs.len() {
+                            1 => String::new(),
+                            n => format!("  ({n} rules)"),
+                        },
+                        dim,
+                    ),
+                ]),
+                // the note is the half that decides whether you want this
+                // preset, so it is always on screen — dimmed, never hidden
+                // behind a second keystroke
+                Line::styled(format!("        {}", p.note), dim),
+            ])
+        })
+        .collect();
+    let title = if filter.is_empty() {
+        format!("presets — {} of them, type to filter", PRESETS.len())
+    } else if hits.is_empty() {
+        format!("presets — nothing matches {filter:?}")
+    } else {
+        format!("presets — {filter:?}: {} of {}", hits.len(), PRESETS.len())
+    };
+    let mut state = ListState::default().with_selected(Some(*sel));
+    let list = List::new(items)
+        .style(theme.base())
+        .highlight_style(Style::new().bg(theme.border_idle).add_modifier(Modifier::BOLD))
+        // a background alone is easy to lose in a light theme, and this is
+        // the one list where picking the wrong row writes rules
+        .highlight_symbol("\u{203a} ")
+        .block(theme.pane(title, true));
+    f.render_stateful_widget(list, area, &mut state);
+}
+
 fn draw_rules(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = THEMES[app.theme_idx];
     let focused = app.focus == Focus::Rules;
-    match &mut app.mode {
-        Mode::Preset(sel) => {
-            let items: Vec<ListItem> = PRESETS
-                .iter()
-                .enumerate()
-                .map(|(i, (label, spec))| {
-                    let text = format!("{label}   [{spec}]");
-                    let style = if i == *sel {
-                        Style::new().fg(Color::Black).bg(theme.chart)
-                    } else {
-                        Style::new().fg(theme.fg)
-                    };
-                    ListItem::new(text).style(style)
-                })
-                .collect();
-            let list = List::new(items)
-                .style(theme.base())
-                .block(theme.pane("pick a preset".into(), focused));
-            f.render_widget(list, area);
-        }
-        _ => {
-            let items: Vec<ListItem> = app
-                .cfg
-                .rule
-                .iter()
-                .map(|r| {
-                    let color = if !r.enabled {
-                        theme.border_idle
-                    } else if r.action == Action::Allow {
-                        theme.allow
-                    } else {
-                        theme.deny
-                    };
-                    // two lines, not one: the source is the identifying half
-                    // of a rule and this pane is the narrow column, so a
-                    // single line would truncate exactly the part you read.
-                    // Height is what the column has to spare
-                    ListItem::new(vec![
-                        Line::from(format!(
-                            "#{:<3} {:<6} {}{}",
-                            r.id,
-                            format!("{:?}", r.action).to_uppercase(),
-                            format!("{:?}", r.proto).to_lowercase(),
-                            if r.enabled { "" } else { "  (off)" },
-                        )),
-                        Line::from(format!(
-                            "  {}{}{}",
-                            r.src,
-                            r.port.map(|p| format!(":{p}")).unwrap_or_default(),
-                            // only when it is *not* both: a direction on
-                            // every row would be noise on the common case
-                            r.direction
-                                .map(|d| format!("  {}", d.as_str()))
-                                .unwrap_or_default(),
-                        )),
-                    ])
-                    .style(Style::new().fg(color))
-                })
-                .collect();
-            let list = List::new(items)
-                .style(theme.base())
-                .highlight_style(Style::new().bg(theme.border_idle))
-                .block(theme.pane("system rules".into(), focused));
-            f.render_stateful_widget(list, area, &mut app.state);
-        }
-    }
+    let items: Vec<ListItem> = app
+        .cfg
+        .rule
+        .iter()
+        .map(|r| {
+            let color = if !r.enabled {
+                theme.border_idle
+            } else if r.action == Action::Allow {
+                theme.allow
+            } else {
+                theme.deny
+            };
+            // two lines, not one: the source is the identifying half of a
+            // rule and this pane is the narrow column, so a single line
+            // would truncate exactly the part you read. Height is what the
+            // column has to spare
+            ListItem::new(vec![
+                Line::from(format!(
+                    "#{:<3} {:<6} {}{}",
+                    r.id,
+                    format!("{:?}", r.action).to_uppercase(),
+                    format!("{:?}", r.proto).to_lowercase(),
+                    if r.enabled { "" } else { "  (off)" },
+                )),
+                Line::from(format!(
+                    "  {}{}{}",
+                    r.src,
+                    r.port.map(|p| format!(":{p}")).unwrap_or_default(),
+                    // only when it is *not* both: a direction on every row
+                    // would be noise on the common case
+                    r.direction
+                        .map(|d| format!("  {}", d.as_str()))
+                        .unwrap_or_default(),
+                )),
+            ])
+            .style(Style::new().fg(color))
+        })
+        .collect();
+    let list = List::new(items)
+        .style(theme.base())
+        .highlight_style(Style::new().bg(theme.border_idle))
+        .block(theme.pane("system rules".into(), focused));
+    f.render_stateful_widget(list, area, &mut app.state);
 }
 
 fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
@@ -3015,13 +3421,21 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
-    /// the Preset pane feeds these straight into `parse_spec(..).expect(..)`,
-    /// so a typo in the table is a panic in front of the user, not an error
-    /// message. Nothing else checks them.
+    /// the picker feeds these straight into `parse_spec(..).expect(..)`, so a
+    /// typo anywhere in the catalogue is a panic in front of the user rather
+    /// than an error message. Nothing else checks them.
     #[test]
     fn every_built_in_preset_parses() {
-        for (name, spec) in PRESETS {
-            assert!(parse_spec(spec).is_ok(), "preset {name:?} ({spec:?}) must parse");
+        for p in PRESETS {
+            assert!(!p.specs.is_empty(), "preset {:?} does nothing", p.name);
+            for spec in p.specs {
+                assert!(
+                    parse_spec(spec).is_ok(),
+                    "preset {:?} spec {spec:?}: {:?}",
+                    p.name,
+                    parse_spec(spec).unwrap_err()
+                );
+            }
         }
     }
 
@@ -3030,12 +3444,83 @@ mod tests {
     /// still read "Allow everything" in the list while leaving udp filtered.
     #[test]
     fn the_first_preset_allows_literally_everything() {
-        let (name, spec) = PRESETS[0];
-        let r = parse_spec(spec).expect("parses");
-        assert_eq!(r.action, Action::Allow, "{name}");
-        assert_eq!(r.proto, Proto::Any, "{name}");
-        assert_eq!(r.src, "any", "{name}");
-        assert_eq!(r.port, None, "{name}");
+        let p = &PRESETS[0];
+        assert_eq!(p.specs.len(), 1, "{}", p.name);
+        let r = parse_spec(p.specs[0]).expect("parses");
+        assert_eq!(r.action, Action::Allow, "{}", p.name);
+        assert_eq!(r.proto, Proto::Any, "{}", p.name);
+        assert_eq!(r.src, "any", "{}", p.name);
+        assert_eq!(r.port, None, "{}", p.name);
+        assert_eq!(r.direction, None, "{}", p.name);
+    }
+
+    /// the catalogue is only navigable by typing, so a group tag that is not
+    /// one of the documented handful is a preset nobody will find
+    #[test]
+    fn every_preset_is_findable_by_its_own_group_and_name() {
+        for p in PRESETS {
+            assert!(
+                ["off", "lan", "in", "out", "harden", "bundle"].contains(&p.group),
+                "unknown group {:?} on {:?}",
+                p.group,
+                p.name
+            );
+            assert!(
+                matching_presets(p.group).iter().any(|m| m.name == p.name),
+                "{:?} is not reachable by typing its group",
+                p.name
+            );
+            let word = p.name.split_whitespace().next().unwrap();
+            assert!(
+                matching_presets(word).iter().any(|m| m.name == p.name),
+                "{:?} is not reachable by typing {word:?}",
+                p.name
+            );
+        }
+    }
+
+    #[test]
+    fn filtering_is_case_insensitive_and_matches_the_note_too() {
+        assert!(!matching_presets("SSH").is_empty());
+        assert!(!matching_presets("ssh").is_empty());
+        assert!(!matching_presets("spam").is_empty(), "a word only the notes use");
+        assert!(matching_presets("zzzz").is_empty());
+        assert_eq!(matching_presets("").len(), PRESETS.len(), "no filter, no narrowing");
+    }
+
+    /// picking a bundle twice, or two bundles that overlap, must not leave a
+    /// pile of identical rules to delete by hand
+    #[test]
+    fn a_preset_adds_only_the_rules_that_are_not_already_there() {
+        let mut app = new_app(Config::default());
+        let bundle = PRESETS
+            .iter()
+            .find(|p| p.specs.len() > 2)
+            .expect("the catalogue has multi-rule presets");
+        // apply_preset saves to /etc, which a test must not do — so exercise
+        // the deduplication through the same comparison it uses
+        for spec in bundle.specs {
+            let mut r = parse_spec(spec).unwrap();
+            r.id = app.cfg.next_id();
+            app.cfg.rule.push(r);
+        }
+        let before = app.cfg.rule.len();
+        assert_eq!(before, bundle.specs.len());
+        let dups = bundle
+            .specs
+            .iter()
+            .map(|s| parse_spec(s).unwrap())
+            .filter(|r| {
+                app.cfg.rule.iter().any(|e| {
+                    e.action == r.action
+                        && e.proto == r.proto
+                        && e.src == r.src
+                        && e.port == r.port
+                        && e.direction == r.direction
+                })
+            })
+            .count();
+        assert_eq!(dups, bundle.specs.len(), "every rule reads as already present");
     }
 
     fn demo_flow(port: u16, ip: &str, name: Option<&str>, exe: &str) -> FlowWire {
@@ -3266,6 +3751,21 @@ mod tests {
     /// inner area — and getting that wrong is a panic in ratatui, not a
     /// cosmetic problem. Small sizes are the point: that is where a
     /// saturating_sub that should have been one is found.
+    /// eyeball the catalogue: `cargo test presets_look_right -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prints the preset modal for a human to look at"]
+    fn presets_look_right() {
+        let mut app = demo_app();
+        app.focus = Focus::Rules;
+        app.mode = Mode::Preset {
+            sel: 2,
+            filter: String::new(),
+        };
+        let mut term = Terminal::new(TestBackend::new(120, 44)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        println!("{}", term.backend());
+    }
+
     #[test]
     fn every_screen_renders_at_any_terminal_size() {
         for (w, h) in [(200, 60), (120, 40), (80, 24), (60, 20), (40, 12), (20, 8)] {
@@ -3293,6 +3793,26 @@ mod tests {
                 term.draw(|f| draw(f, &mut app))
                     .unwrap_or_else(|e| panic!("{focus:?} at {w}x{h}: {e}"));
             }
+            // the preset catalogue draws over the grid, at whatever size the
+            // grid happens to be — including sizes where its own modal rect
+            // rounds down to nothing
+            app.focus = Focus::Rules;
+            for filter in ["", "ssh", "zzzz"] {
+                app.mode = Mode::Preset {
+                    sel: 0,
+                    filter: filter.into(),
+                };
+                term.draw(|f| draw(f, &mut app))
+                    .unwrap_or_else(|e| panic!("presets {filter:?} at {w}x{h}: {e}"));
+            }
+            // a selection past the end of a narrowed list must not panic
+            app.mode = Mode::Preset {
+                sel: PRESETS.len() + 5,
+                filter: "ssh".into(),
+            };
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            app.mode = Mode::Browse;
+
             // and the modal-ish states, which replace the footer
             app.focus = Focus::Apps;
             app.mode = Mode::Filter;

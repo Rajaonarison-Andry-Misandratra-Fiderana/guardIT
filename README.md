@@ -365,13 +365,33 @@ pane gets a thick border:
 | ↳ left half | **apps** | one row per app and its whole-app verdict — `(custom)` when it has rules of its own for particular ports or hosts, with the dot keeping the default's colour | `j/k` select · `a` this app's audit trail · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely · `/` filter by name (live; `Enter` keeps it, `Esc` clears) |
 | ↳ right half | **flow** | live connection history for whichever app is selected on the left — a row refused by a blocklist or by `require_resolved` says so, and stays red whatever the app's rules allow | `j/k` select · `a` this app's audit trail · `y`/`n` allow/deny **exactly this row** — this app, this port and direction, and the peer it named (a row whose peer has no resolved name falls back to the port, which is all such a row says) · `Y`/`N` allow/deny **this peer's hostname**, any port (needs a resolved name; uses the exact name — `--host '*.foo.com'` on the CLI for a whole domain) |
 
-The first preset under `p` is **Allow everything (pause filtering)** — an unqualified
-`accept` that renders above the queue lines in both chains, so no traffic reaches the
-daemon while it is on: no per-app matching, no prompts, no connection-layer blocking.
-Reach for it when guardit is in the way of something and you need the machine working now.
-Prefer it to `systemctl stop guardit`, which leaves the queues loaded with nothing
-listening on them and so takes the network down instead of opening it. It is an ordinary
-rule, so `space` switches it off again and every other rule is back in force.
+### Presets
+
+`p` opens the catalogue over the whole grid. Type to filter, `↑`/`↓` to move, `Enter` to
+add, `Esc` to leave. Each entry says in one line what it actually does to your traffic,
+and one entry can lay down several rules at once — rules you already have are skipped, so
+picking two overlapping presets never leaves duplicates to clean up.
+
+| Group | What is in it |
+|---|---|
+| `off` | the escape hatches — **Allow everything (pause filtering)**, and pausing outbound only |
+| `lan` | your own network: the private ranges, link-local, mDNS/SSDP discovery |
+| `in` | what this machine offers — SSH, web serving, dev servers, SMB, printing, screen sharing, Syncthing, WireGuard, each scoped to the LAN where that is the only place it belongs |
+| `out` | what it may reach — stop being asked about DNS/NTP, the web, mail, SSH and git |
+| `harden` | ports worth shutting on principle: remote control, known implant ports, DoT, discovery leaks |
+| `bundle` | a whole posture in one keystroke: laptop on untrusted wifi, web server, home desktop, paranoid |
+
+Two things worth knowing before picking one. **Allow everything (pause filtering)** is an
+unqualified `accept` above the queue lines in both chains, so nothing reaches the daemon
+while it is on: no per-app matching, no prompts, no connection-layer blocking. Reach for it
+when guardit is in the way of something and you need the machine working now — it is
+better than `systemctl stop guardit`, which leaves the queues loaded with nothing listening
+on them and so takes the network down instead of opening it. And every other `allow`
+preset is the same mechanism in miniature: a kernel-level accept means the daemon never
+sees that traffic, so **per-app rules stop applying to it**. That is the point of "stop
+asking about the web" and a nasty surprise if you did not want it, which is why each
+preset says so in its own line. Presets are ordinary rules, so `space` switches any of
+them off again.
 
 `B` opens the blocking tab: the figures, the twelve category switches, and the names most
 recently blocked. `j/k` moves, `space` blocks or unblocks a category — ticking one whose
