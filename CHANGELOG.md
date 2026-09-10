@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **The config is written atomically.** `fs::write` truncates the file and then writes into
+  it, so a crash, a full disk or a power cut between the two left an empty or half-written
+  `/etc/guardit/rules.toml` — every rule on the machine gone, and the daemon reloading that
+  into a firewall which now permits whatever the defaults permit. It now writes a sibling
+  temp file, flushes it to the disk itself, and renames over the original, so a reader sees
+  either the whole old file or the whole new one. A config someone tightened to 0600 keeps
+  its permissions across the write.
+- **history.jsonl is capped, and read without loading it.** It grew forever by design, and
+  `read_history` read the whole thing into memory to hand back the last hundred lines — on
+  daemon startup, on every `guardit log-app`, and every time the TUI opened its log tab. On
+  a desktop that gets reinstalled eventually this was fine; on a machine that stays up it
+  is hundreds of megabytes a year, read in full, several times a day. The file is now
+  trimmed to its newer half past 32 MB (the same treatment blocked.jsonl already got) and
+  the readers stream it, holding only the entries they are going to return.
+
 - **Auto mode: unruled connections decided here, not asked about.** `guardit auto on`, `m`
   in the TUI, or `[auto] enabled = true`. Holding the packet and asking is the right shape
   for a desktop somebody is sitting in front of and the wrong one for everything else — a

@@ -55,12 +55,23 @@ fn resolve_history(history: &History, req_id: u32, status: FlowStatus) -> Option
 /// alongside `rules.toml` — an append-only record of every *final* flow
 /// entry (matched connections and resolved asks, never the transient
 /// Pending state) so history survives a daemon restart, not just a TUI
-/// reconnect. No rotation/truncation: grows forever. Fine for how small
-/// each line is and how long a desktop box actually stays up between
-/// reinstalls; add rotation if that stops being true.
+/// reconnect.
 pub fn history_log_path() -> std::path::PathBuf {
     config_path().with_file_name("history.jsonl")
 }
+
+/// This one used to grow forever, on the reasoning that the lines are small
+/// and a desktop gets reinstalled eventually. Neither half holds on a
+/// machine that stays up: one line per new connection on a busy host is
+/// hundreds of megabytes a year, and until it was capped `read_history` read
+/// the whole thing into memory to hand back the last hundred lines — on
+/// daemon startup, on every `guardit log-app`, and every time the TUI opened
+/// its log tab. 32 MB is still hundreds of thousands of connections.
+const HISTORY_LOG_CAP: u64 = 32 * 1024 * 1024;
+/// appends between size checks — the same bargain as the blocked log, one
+/// stat per this many writes instead of one per write
+const HISTORY_LOG_CHECK_EVERY: u64 = 500;
+static HISTORY_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 fn append_history_line(entry: &FlowWire) {
     use std::io::Write as _;
@@ -72,22 +83,51 @@ fn append_history_line(entry: &FlowWire) {
     {
         let _ = writeln!(f, "{line}");
     }
+    if HISTORY_TOTAL
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(HISTORY_LOG_CHECK_EVERY)
+    {
+        trim_log(&history_log_path(), HISTORY_LOG_CAP);
+    }
 }
 
 /// the last `limit` entries of history.jsonl, oldest first, optionally only
 /// those whose exe contains `filter` — one reader shared by the daemon's
-/// startup reload, `guardit log-app`, and the TUI's log tab
+/// startup reload, `guardit log-app`, and the TUI's log tab.
+///
+/// Streamed, and holding at most `limit` entries: the file is capped but
+/// still tens of megabytes, and every one of those callers wants a hundred
+/// lines off the end of it.
 pub fn read_history(limit: usize, filter: Option<&str>) -> Vec<FlowWire> {
-    let Ok(text) = fs::read_to_string(history_log_path()) else {
+    let Ok(f) = fs::File::open(history_log_path()) else {
         return Vec::new();
     };
-    let mut entries: Vec<FlowWire> = text
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .filter(|e: &FlowWire| filter.is_none_or(|f| e.exe.contains(f)))
-        .collect();
-    let start = entries.len().saturating_sub(limit);
-    entries.split_off(start)
+    tail_entries(BufReader::new(f), limit, filter)
+}
+
+/// the last `limit` entries a jsonl stream yields, oldest first, keeping at
+/// most that many in memory at once. Unparseable lines are skipped rather
+/// than fatal: the last line of a log a daemon was killed mid-write is a
+/// normal thing to find, and losing a hundred lines of history to it would
+/// be a worse outcome than ignoring it.
+fn tail_entries(r: impl std::io::BufRead, limit: usize, filter: Option<&str>) -> Vec<FlowWire> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut keep: VecDeque<FlowWire> = VecDeque::with_capacity(limit.min(1024));
+    for line in r.lines().map_while(Result::ok) {
+        let Ok(e) = serde_json::from_str::<FlowWire>(&line) else {
+            continue;
+        };
+        if !filter.is_none_or(|f| e.exe.contains(f)) {
+            continue;
+        }
+        if keep.len() == limit {
+            keep.pop_front();
+        }
+        keep.push_back(e);
+    }
+    keep.into()
 }
 
 /// connection attempts per app over the whole audit trail, streamed so a
@@ -990,22 +1030,21 @@ fn append_blocked_line(entry: &ipc::Blocked) {
         .load(Ordering::Relaxed)
         .is_multiple_of(BLOCKED_LOG_CHECK_EVERY)
     {
-        trim_blocked_log();
+        trim_log(&blocked_log_path(), BLOCKED_LOG_CAP);
     }
 }
 
-/// keeps the newer half when the log outgrows its cap. Read-and-rewrite
-/// rather than rotate: one file is one thing to reason about, and half of
-/// 8 MB is still tens of thousands of lines of history.
-fn trim_blocked_log() {
-    let path = blocked_log_path();
-    if fs::metadata(&path).is_ok_and(|m| m.len() <= BLOCKED_LOG_CAP) {
+/// keeps the newer half when a log outgrows its cap. Read-and-rewrite rather
+/// than rotate: one file is one thing to reason about, and half of a cap
+/// this size is still tens of thousands of lines of history.
+fn trim_log(path: &std::path::Path, cap: u64) {
+    if fs::metadata(path).is_ok_and(|m| m.len() <= cap) {
         return;
     }
-    let Ok(text) = fs::read_to_string(&path) else {
+    let Ok(text) = fs::read_to_string(path) else {
         return;
     };
-    let _ = fs::write(&path, newer_half(&text));
+    let _ = fs::write(path, newer_half(&text));
 }
 
 /// the newer half of a jsonl file, still one whole line per entry and still
@@ -2455,6 +2494,62 @@ fn handle_client_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn history_lines(exes: &[&str]) -> String {
+        exes.iter()
+            .map(|exe| {
+                serde_json::to_string(&FlowWire {
+                    req_id: None,
+                    exe: (*exe).into(),
+                    direction: Direction::Out,
+                    proto: "tcp".into(),
+                    port: Some(443),
+                    peer_ip: "1.1.1.1".into(),
+                    peer_name: None,
+                    status: FlowStatus::Allowed,
+                    denied_by: None,
+                    why: None,
+                    ts: 0,
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// the tail is what every caller wants — the daemon's startup reload,
+    /// `guardit log-app`, the TUI's log tab — and the file it reads is tens
+    /// of megabytes. Off-by-one here shows up as history that silently
+    /// starts one connection late.
+    #[test]
+    fn the_tail_of_a_log_is_its_newest_entries_oldest_first() {
+        let text = history_lines(&["/a", "/b", "/c", "/d"]);
+        let got = tail_entries(text.as_bytes(), 2, None);
+        assert_eq!(
+            got.iter().map(|e| e.exe.as_str()).collect::<Vec<_>>(),
+            ["/c", "/d"],
+        );
+        assert_eq!(tail_entries(text.as_bytes(), 99, None).len(), 4, "fewer than asked for");
+        assert!(tail_entries(text.as_bytes(), 0, None).is_empty());
+    }
+
+    #[test]
+    fn a_filter_narrows_before_the_limit_does() {
+        let text = history_lines(&["/usr/bin/curl", "/usr/bin/ssh", "/usr/bin/curl"]);
+        let got = tail_entries(text.as_bytes(), 2, Some("curl"));
+        assert_eq!(got.len(), 2, "both curls, not the last two lines");
+        assert!(got.iter().all(|e| e.exe.contains("curl")));
+    }
+
+    /// a daemon killed mid-write leaves a half-written last line. Losing the
+    /// hundred good lines before it to that would be the worse outcome.
+    #[test]
+    fn a_truncated_last_line_costs_only_itself() {
+        let mut text = history_lines(&["/a", "/b"]);
+        text.push_str("\n{\"exe\": \"/c\", \"dir");
+        let got = tail_entries(text.as_bytes(), 10, None);
+        assert_eq!(got.iter().map(|e| e.exe.as_str()).collect::<Vec<_>>(), ["/a", "/b"]);
+    }
 
     /// The fast path guesses which process to check first; it must never
     /// guess an *answer*. Every candidate is confirmed against /proc before

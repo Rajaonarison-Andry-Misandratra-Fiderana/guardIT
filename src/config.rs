@@ -384,6 +384,37 @@ impl Default for Config {
     }
 }
 
+/// Replace a file's contents so that no reader ever sees a partial write.
+///
+/// Write into a sibling temp file, flush it to the disk itself, then rename
+/// over the original. `fs::write` truncates the target and then writes into
+/// it, so a crash, a full disk or a power cut between the two leaves an
+/// empty or half-written `/etc/guardit/rules.toml` — every rule on the
+/// machine gone, and a daemon reloading that into a firewall which now
+/// permits whatever the defaults permit. A rename is the one operation that
+/// makes a reader see either the whole old file or the whole new one; the
+/// fsync before it is what makes that survive a power cut rather than only
+/// a crash.
+///
+/// The temp file goes beside the target rather than in /tmp, because rename
+/// is only atomic within a single filesystem. The target's permissions are
+/// carried over, so a config someone tightened to 0600 does not silently go
+/// back to 0644 on the next write.
+fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = path.with_extension("toml.new");
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    if let Ok(existing) = fs::metadata(path) {
+        let mode = existing.permissions().mode();
+        let _ = f.set_permissions(fs::Permissions::from_mode(mode));
+    }
+    drop(f);
+    fs::rename(&tmp, path)
+}
+
 /// fixed system-wide path: the daemon runs as root under systemd/cron and the
 /// TUI/CLI run under sudo, so a `$HOME`-relative path would silently point
 /// each of them at a different file depending on how sudo sets HOME
@@ -411,13 +442,28 @@ impl Config {
         }
     }
 
+    /// Writes the config, atomically.
+    ///
+    /// Not `fs::write`: that truncates the file and then writes into it, so
+    /// a crash, a full disk or a power cut between the two leaves an empty
+    /// or half-written `/etc/guardit/rules.toml` — every rule on the machine
+    /// gone, and the daemon reloading it into a firewall that now permits
+    /// whatever the defaults permit. A rename over the original is the one
+    /// way to make a reader see either the whole old file or the whole new
+    /// one and never anything in between, and the fsync before it is what
+    /// makes that true after a power cut rather than only after a crash.
+    ///
+    /// Still panics on a failure to write at all: every caller is either the
+    /// CLI acting on an instruction, where there is nothing sensible to do
+    /// but stop, or the daemon persisting a decision it has already made,
+    /// where carrying on as if it had been saved would be worse.
     pub fn save(&self) {
         let path = config_path();
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).expect("create config dir");
         }
-        let s = toml::to_string_pretty(self).expect("serialize config");
-        fs::write(&path, s).expect("write config");
+        let text = toml::to_string_pretty(self).expect("serialize config");
+        write_atomic(&path, &text).expect("write config");
     }
 
     pub fn next_id(&self) -> u32 {
@@ -459,6 +505,38 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The property the whole thing exists for: a reader concurrent with a
+    /// write sees one complete version, never a truncated one. Checked the
+    /// only way a single-process test can — by looking at what is at the
+    /// path at every point where `fs::write` would have left a hole.
+    #[test]
+    fn an_atomic_write_never_leaves_a_partial_file() {
+        let dir = std::env::temp_dir().join(format!("guardit-atomic-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rules.toml");
+
+        write_atomic(&path, "first = 1\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first = 1\n");
+
+        // a second write of a *shorter* body: with truncate-then-write this
+        // is where a reader could see the tail of the old file
+        write_atomic(&path, "x\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "x\n");
+        assert!(
+            !path.with_extension("toml.new").exists(),
+            "the temp file must not survive a successful write"
+        );
+
+        // and the mode the file was given is still the mode it has
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomic(&path, "later = true\n").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a tightened config must stay tightened");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// `active()` is what every consumer reads, so the two ways of being off
     /// (never enabled, or enabled with a fallback that still asks) have to
