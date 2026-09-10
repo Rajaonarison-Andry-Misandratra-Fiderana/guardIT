@@ -176,6 +176,7 @@ what it did and tell at a glance whether it was right:
 |---|---|---|
 | the binary is gone from disk, or `/proc` says `(deleted)` | deny | `gone from disk` |
 | it runs from `/tmp`, `/dev/shm`, `~/.cache`, `~/Downloads`… | deny | `volatile path` |
+| (flatpaks and snaps are ruled by app id, not by path, so neither of those two applies to them) | | |
 | SMB, RDP, telnet, NetBIOS, RPC, port 25, 4444/5555/6667 — **to the internet** | deny | `smb`, `rdp`, … |
 | unsolicited inbound from outside your network | deny | `inbound from internet` |
 | inbound from your own network, nothing serving that port | deny | `nothing listening` |

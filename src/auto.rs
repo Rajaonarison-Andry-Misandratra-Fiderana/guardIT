@@ -102,8 +102,28 @@ pub struct Facts<'a> {
 /// while running keeps its /proc entry, with " (deleted)" appended to the
 /// path — so both halves of the check are needed, and neither is a fact
 /// `decide` can work out from the string alone.
+///
+/// A sandboxed app is not a path (see `sandboxed`) and there is nothing on
+/// the host to stat, so it is reported as present: absent would read as
+/// "this binary vanished", which is a serious accusation and the wrong one.
 pub fn on_disk(exe: &str) -> bool {
+    if sandboxed(exe) {
+        return true;
+    }
     !exe.ends_with(" (deleted)") && Path::new(exe).exists()
+}
+
+/// A flatpak or snap, which the daemon rules by app id rather than by path:
+/// their `/proc/<pid>/exe` points inside their own mount namespace, is
+/// meaningless on the host, and is the same for every flatpak. So `exe` here
+/// is `flatpak:org.mozilla.firefox` or `snap:firefox.firefox` — an
+/// identity, not a filename.
+///
+/// Every path-shaped rule below has to know that, or it reads the identity
+/// as a path, fails to find it, and refuses every sandboxed app on the
+/// machine as a binary that vanished.
+fn sandboxed(exe: &str) -> bool {
+    exe.starts_with("flatpak:") || exe.starts_with("snap:")
 }
 
 /// Directories whose contents anybody can write and nobody packages. A
@@ -198,8 +218,12 @@ pub fn decide(f: &Facts) -> Option<Decision> {
         return deny("gone from disk");
     }
 
-    // 2. running out of a directory anyone can write to
-    if under(f.exe, &VOLATILE) || VOLATILE_ANYWHERE.iter().any(|d| f.exe.contains(d)) {
+    // 2. running out of a directory anyone can write to. Not a question that
+    //    means anything for a sandboxed app: the id is not a path, and the
+    //    place the store put its files is not a place anyone can write to
+    if !sandboxed(f.exe)
+        && (under(f.exe, &VOLATILE) || VOLATILE_ANYWHERE.iter().any(|d| f.exe.contains(d)))
+    {
         return deny("volatile path");
     }
 
@@ -234,7 +258,7 @@ pub fn decide(f: &Facts) -> Option<Decision> {
             // 6. a packaged binary on a port packaged binaries use, with no
             //    name to show for it — a cached lookup, or an address in its
             //    configuration
-            if under(f.exe, &PACKAGED) && ORDINARY.contains(&f.port) {
+            if (sandboxed(f.exe) || under(f.exe, &PACKAGED)) && ORDINARY.contains(&f.port) {
                 return allow("packaged program");
             }
             None
@@ -433,6 +457,33 @@ mod tests {
             Some(Action::Deny),
             "a port nothing serves, swept from the lan"
         );
+    }
+
+    /// A flatpak or snap arrives as an app id, not a path. Reading that as a
+    /// filename finds nothing, and "the binary is gone from disk" would then
+    /// refuse every sandboxed app on the machine — which on a desktop is the
+    /// browser, the chat client and the music player.
+    #[test]
+    fn a_sandboxed_app_is_an_identity_and_not_a_missing_binary() {
+        for id in ["flatpak:org.mozilla.firefox", "snap:firefox.firefox"] {
+            assert!(on_disk(id), "{id} has no host path to be missing from");
+            assert_eq!(
+                act(out(id, 443, "93.184.216.34", Some("mozilla.org"))),
+                Some(Action::Allow),
+                "{id}"
+            );
+            assert_eq!(
+                act(out(id, 443, "93.184.216.34", None)),
+                Some(Action::Allow),
+                "{id} counts as packaged with no name to show"
+            );
+            // and the facts that are still facts still apply
+            assert_eq!(
+                act(out(id, 445, "93.184.216.34", None)),
+                Some(Action::Deny),
+                "{id} reaching smb across the internet"
+            );
+        }
     }
 
     #[test]
