@@ -130,8 +130,8 @@ pub fn print_log_app(exe_filter: Option<&str>, n: usize) {
     }
     let now = now_ts();
     println!(
-        "{:<8}{:<6}{:<20}{:<6}{:<6}{:<8}EXE",
-        "AGO", "DIR", "PEER", "PROTO", "PORT", "STATUS"
+        "{:<8}{:<6}{:<20}{:<6}{:<6}{:<8}{:<22}EXE",
+        "AGO", "DIR", "PEER", "PROTO", "PORT", "STATUS", "WHY"
     );
     for e in entries {
         let status = match e.status {
@@ -139,14 +139,23 @@ pub fn print_log_app(exe_filter: Option<&str>, n: usize) {
             FlowStatus::Denied => "deny",
             FlowStatus::Pending => "pending",
         };
+        // what decided it, when it was not a rule of the user's: auto mode's
+        // own reason if it has one, otherwise the policy that refused it.
+        // Blank means a rule did it, and the rule is what to go and read
+        let why = e
+            .why
+            .clone()
+            .or_else(|| e.denied_by.map(|b| b.as_str().to_string()))
+            .unwrap_or_default();
         println!(
-            "{:<8}{:<6}{:<20}{:<6}{:<6}{:<8}{}",
+            "{:<8}{:<6}{:<20}{:<6}{:<6}{:<8}{:<22}{}",
             ago(now.saturating_sub(e.ts)),
             e.direction.as_str(),
             e.peer(),
             e.proto,
             e.port.map(|p| p.to_string()).unwrap_or_default(),
             status,
+            why,
             e.exe,
         );
     }
@@ -1462,9 +1471,10 @@ fn reload_if_edited(
     *last_mtime = mtime;
     let fresh = match Config::try_load() {
         Ok(cfg) => {
-            // the same file carries the blocklist section, and a hand edit
-            // there has to take effect as surely as one to a rule
+            // the same file carries the blocklist and auto sections, and a
+            // hand edit there has to take effect as surely as one to a rule
             reload_blocklist_if_changed(&cfg);
+            reload_auto_if_changed(&cfg);
             cfg.app_rule
         }
         Err(e) => {
@@ -1540,6 +1550,14 @@ fn blocklist_update_loop() {
             }
         }
         reload_blocklist(&cfg);
+    reload_auto(&cfg);
+    if let Some(f) = cfg.auto.active() {
+        eprintln!(
+            "guardit daemon: auto mode on — unruled connections are decided here, \
+             fallback {}",
+            f.as_str()
+        );
+    }
         // the DoH addresses are compiled into the nft ruleset, not read at
         // match time, so a new set of them only takes effect on a reload
         if doh_ips_changed && let Err(e) = crate::ruleset::apply(&cfg) {
@@ -1554,34 +1572,7 @@ fn blocklist_update_loop() {
 /// resolved perfectly legitimately just before we started watching.
 const REQUIRE_RESOLVED_GRACE: Duration = Duration::from_secs(60);
 
-/// Addresses this policy never applies to: the machine itself, the local
-/// network, and everything that is not a routable unicast destination.
-/// A lookup is how you find a *remote* service by name; nobody resolves a
-/// name to reach their own router's admin page, and denying that would make
-/// the policy unusable rather than strict.
-fn is_local_address(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_unspecified()
-                // 100.64/10, carrier-grade NAT — the address of a router, not
-                // of anything anyone looked up
-                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_multicast()
-                || v6.is_unspecified()
-                // fc00::/7 unique-local and fe80::/10 link-local
-                || (v6.segments()[0] & 0xFE00) == 0xFC00
-                || (v6.segments()[0] & 0xFFC0) == 0xFE80
-        }
-    }
-}
+use crate::auto::is_local_address;
 
 /// Ports the policy covers.
 ///
@@ -1744,6 +1735,7 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
     let mut threads = Vec::new();
     for (dir, queue_num) in [(Direction::In, QUEUE_IN), (Direction::Out, QUEUE_OUT)] {
         let app_rules = app_rules.clone();
+        let listening = listening.clone();
         let history = history.clone();
         let throttle = throttle.clone();
         let pending_registry = pending_registry.clone();
@@ -1759,6 +1751,7 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
                 pending_registry,
                 next_req_id,
                 event_tx,
+                listening,
                 timeout,
                 default_verdict,
                 require_resolved,
@@ -1848,6 +1841,64 @@ pub fn run(cfg: Config, debug: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Every final verdict, written the two places verdicts go.
+///
+/// history.jsonl (disk) gets all of them, unthrottled — it is the actual
+/// audit trail, `guardit log-app` reads it back. The live in-memory history
+/// and the TUI broadcast are throttled: a chatty app (a resolver, a syncing
+/// client) would otherwise put an identical line on the dashboard every few
+/// seconds. That declutter only ever applies to what you *see* live, never
+/// to what is kept.
+fn record_verdict(
+    history: &History,
+    throttle: &Throttle,
+    event_tx: &Sender<ServerMsg>,
+    proto: u8,
+    wire: FlowWire,
+) {
+    append_history_line(&wire);
+    let key = (
+        wire.exe.clone(),
+        proto,
+        wire.port.unwrap_or(0),
+        wire.direction == Direction::Out,
+    );
+    if should_log_matched(throttle, key) {
+        push_history(history, wire.clone());
+        let _ = event_tx.send(ServerMsg::FlowNew(wire));
+    }
+}
+
+/// The fallback in force right now, or `None` when auto mode is off.
+///
+/// A global rather than a queue_loop argument because it has to be
+/// changeable while the daemon runs: `guardit auto on` writes the config and
+/// the scan loop picks it up within seconds (`reload_auto_if_changed`).
+/// Restarting the daemon to change it would mean dropping every connection
+/// held open at that moment, which is a strange price for turning a mode on.
+static AUTO: LazyLock<RwLock<Option<crate::auto::Fallback>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+pub fn reload_auto(cfg: &Config) {
+    *AUTO.write().unwrap() = cfg.auto.active();
+}
+
+fn reload_auto_if_changed(cfg: &Config) {
+    let fresh = cfg.auto.active();
+    let mut cur = AUTO.write().unwrap();
+    if *cur == fresh {
+        return;
+    }
+    eprintln!(
+        "guardit daemon: auto mode {}",
+        match fresh {
+            Some(f) => format!("on, fallback {}", f.as_str()),
+            None => "off — unruled connections are asked about again".into(),
+        }
+    );
+    *cur = fresh;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn queue_loop(
     dir: Direction,
@@ -1858,6 +1909,7 @@ fn queue_loop(
     pending_registry: PendingRegistry,
     next_req_id: Arc<AtomicU32>,
     event_tx: Sender<ServerMsg>,
+    listening: ListeningState,
     timeout: Duration,
     default_verdict: Action,
     require_resolved: bool,
@@ -1936,24 +1988,25 @@ fn queue_loop(
             && BLOCKLIST.read().unwrap().blocked(name)
         {
             note_blocked_peer(&exe, name);
-            let wire = FlowWire {
-                req_id: None,
-                exe: exe.clone(),
-                direction: dir,
-                proto: proto_name(pkt.proto).to_string(),
-                port: Some(rule_port),
-                peer_ip: peer_ip.clone(),
-                peer_name: peer_name.clone(),
-                status: FlowStatus::Denied,
-                denied_by: Some(ipc::DeniedBy::Blocklist),
-                ts: now_ts(),
-            };
-            append_history_line(&wire);
-            let throttle_key = (exe.clone(), pkt.proto, rule_port, dir == Direction::Out);
-            if should_log_matched(&throttle, throttle_key) {
-                push_history(&history, wire.clone());
-                let _ = event_tx.send(ServerMsg::FlowNew(wire));
-            }
+            record_verdict(
+                &history,
+                &throttle,
+                &event_tx,
+                pkt.proto,
+                FlowWire {
+                    req_id: None,
+                    exe: exe.clone(),
+                    direction: dir,
+                    proto: proto_name(pkt.proto).to_string(),
+                    port: Some(rule_port),
+                    peer_ip: peer_ip.clone(),
+                    peer_name: peer_name.clone(),
+                    status: FlowStatus::Denied,
+                    denied_by: Some(ipc::DeniedBy::Blocklist),
+                    why: None,
+                    ts: now_ts(),
+                },
+            );
             msg.set_verdict(Verdict::Drop);
             queue.verdict(msg)?;
             continue;
@@ -1976,59 +2029,116 @@ fn queue_loop(
             && unresolved_destination(started, &peer_addr, rule_port, dir, peer_name.as_deref())
         {
             note_unresolved(&exe, &peer_ip, rule_port);
-            let wire = FlowWire {
-                req_id: None,
-                exe: exe.clone(),
-                direction: dir,
-                proto: proto_name(pkt.proto).to_string(),
-                port: Some(rule_port),
-                peer_ip: peer_ip.clone(),
-                peer_name: None,
-                status: FlowStatus::Denied,
-                denied_by: Some(ipc::DeniedBy::Unresolved),
-                ts: now_ts(),
-            };
-            append_history_line(&wire);
-            let throttle_key = (exe.clone(), pkt.proto, rule_port, true);
-            if should_log_matched(&throttle, throttle_key) {
-                push_history(&history, wire.clone());
-                let _ = event_tx.send(ServerMsg::FlowNew(wire));
-            }
-            msg.set_verdict(Verdict::Drop);
-            queue.verdict(msg)?;
-            continue;
-        }
-
-        let verdict = match matched {
-            Some(action) => {
-                // already ruled — verdict immediately. history.jsonl (disk)
-                // gets EVERY one of these, unthrottled — it's the actual audit
-                // trail, `guardit log-app` reads it back. The live in-memory
-                // history / TUI broadcast is throttled separately — a chatty
-                // app (DNS resolver etc.) would otherwise spam the dashboard
-                // with an identical line every few seconds; that declutter
-                // only applies to what you *see* live, never to what's kept.
-                let wire = FlowWire {
+            record_verdict(
+                &history,
+                &throttle,
+                &event_tx,
+                pkt.proto,
+                FlowWire {
                     req_id: None,
                     exe: exe.clone(),
                     direction: dir,
                     proto: proto_name(pkt.proto).to_string(),
                     port: Some(rule_port),
                     peer_ip: peer_ip.clone(),
-                    peer_name: peer_name.clone(),
-                    status: action.into(),
-                    denied_by: None,
+                    peer_name: None,
+                    status: FlowStatus::Denied,
+                    denied_by: Some(ipc::DeniedBy::Unresolved),
+                    why: None,
                     ts: now_ts(),
+                },
+            );
+            msg.set_verdict(Verdict::Drop);
+            queue.verdict(msg)?;
+            continue;
+        }
+
+        // auto mode, for a connection no rule of the user's covers: decide it
+        // here from the evidence at hand instead of holding the packet open
+        // for someone to answer. It sits *after* the blocklist and
+        // require_resolved checks above on purpose — those are already
+        // decisions, and re-deciding them would be a way to widen them.
+        let automatic = matched.is_none().then(|| {
+            let fallback = *AUTO.read().unwrap();
+            fallback.and_then(|fallback| {
+                let facts = crate::auto::Facts {
+                    exe: &exe,
+                    dir,
+                    port: rule_port,
+                    peer: peer_addr,
+                    peer_name: peer_name.as_deref(),
+                    listening: listening
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|e| e.port == rule_port),
+                    on_disk: crate::auto::on_disk(&exe),
                 };
-                append_history_line(&wire);
-                let throttle_key = (exe.clone(), pkt.proto, rule_port, dir == Direction::Out);
-                if should_log_matched(&throttle, throttle_key) {
-                    push_history(&history, wire.clone());
-                    let _ = event_tx.send(ServerMsg::FlowNew(wire));
+                match crate::auto::decide(&facts) {
+                    Some(d) => Some((d.action, d.why)),
+                    // nothing to judge it on. `Ask` is the one fallback that
+                    // is not a verdict: it hands the connection back to the
+                    // prompt below, so auto mode has only ever saved you the
+                    // questions it could answer itself
+                    None => match fallback {
+                        crate::auto::Fallback::Ask => None,
+                        crate::auto::Fallback::Allow => Some((Action::Allow, "no evidence")),
+                        crate::auto::Fallback::Deny => Some((Action::Deny, "no evidence")),
+                    },
                 }
+            })
+        }).flatten();
+
+        let verdict = match (matched, automatic) {
+            (_, Some((action, why))) => {
+                record_verdict(
+                    &history,
+                    &throttle,
+                    &event_tx,
+                    pkt.proto,
+                    FlowWire {
+                        req_id: None,
+                        exe: exe.clone(),
+                        direction: dir,
+                        proto: proto_name(pkt.proto).to_string(),
+                        port: Some(rule_port),
+                        peer_ip: peer_ip.clone(),
+                        peer_name: peer_name.clone(),
+                        status: action.into(),
+                        // only on a denial: it is what keeps the row red in a
+                        // UI that otherwise recomputes a verdict from the
+                        // rules, and there is no rule behind this one
+                        denied_by: (action == Action::Deny).then_some(ipc::DeniedBy::Auto),
+                        why: Some(why.to_string()),
+                        ts: now_ts(),
+                    },
+                );
                 action
             }
-            None => {
+            (Some(action), None) => {
+                // already ruled — verdict immediately
+                record_verdict(
+                    &history,
+                    &throttle,
+                    &event_tx,
+                    pkt.proto,
+                    FlowWire {
+                        req_id: None,
+                        exe: exe.clone(),
+                        direction: dir,
+                        proto: proto_name(pkt.proto).to_string(),
+                        port: Some(rule_port),
+                        peer_ip: peer_ip.clone(),
+                        peer_name: peer_name.clone(),
+                        status: action.into(),
+                        denied_by: None,
+                        why: None,
+                        ts: now_ts(),
+                    },
+                );
+                action
+            }
+            (None, None) => {
                 let req_id = next_req_id.fetch_add(1, Ordering::Relaxed);
                 let (tx, rx) = mpsc::channel();
                 pending_registry.lock().unwrap().insert(req_id, tx);
@@ -2042,6 +2152,7 @@ fn queue_loop(
                     peer_name: peer_name.clone(),
                     status: FlowStatus::Pending,
                     denied_by: None,
+                    why: None,
                     ts: now_ts(),
                 };
                 push_history(&history, wire.clone());

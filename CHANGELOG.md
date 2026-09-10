@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Auto mode: unruled connections decided here, not asked about.** `guardit auto on`, `m`
+  in the TUI, or `[auto] enabled = true`. Holding the packet and asking is the right shape
+  for a desktop somebody is sitting in front of and the wrong one for everything else — a
+  server, a machine you are ssh'd into, a laptop whose owner is tired of answering. Every
+  decision rests on one fact about the connection that a person would reach the same
+  conclusion from, and the fact is written next to the verdict in the flow pane, the audit
+  tab and `guardit log-app`: a binary gone from disk or running out of `/tmp` is refused;
+  SMB, RDP, telnet or port 25 *across the internet* is refused, while the same port on your
+  own network is fine; unsolicited inbound from outside is refused, and from your own
+  network it follows whether anything is actually serving that port; a name this machine
+  resolved and then reached is allowed, as is a packaged binary on a port packaged binaries
+  use. Anything it has no such fact about it declines to judge, and `--fallback
+  allow|deny|ask` decides those — `allow` by default, because the heuristics are written to
+  catch what is wrong rather than to recognise everything that is right, and `ask` keeps
+  the prompt so auto only ever saves you the questions it could answer itself. No rule is
+  written for any of it: each connection is judged again on the evidence current at that
+  moment, so a replaced binary or a service that stopped listening changes the answer with
+  nothing to clean up. Toggling it takes effect within seconds under a running daemon, with
+  no restart and no held connection dropped.
+
 - **An "Allow everything" preset**, first in the TUI's `p` list: one unqualified `accept`
   above the queue lines in both chains, so nothing reaches the daemon at all — no per-app
   matching, no prompts, no connection-layer blocking. The thing to reach for when guardit

@@ -55,6 +55,11 @@ pub enum DeniedBy {
     Blocklist,
     /// `require_resolved`: no lookup ever named that address
     Unresolved,
+    /// auto mode reached this on its own (see src/auto.rs). The fact it
+    /// used is in `FlowWire::why` — this variant only says "no rule of
+    /// yours did this", which is what stops the UI recomputing the row back
+    /// to whatever the rules say
+    Auto,
 }
 
 impl DeniedBy {
@@ -62,6 +67,7 @@ impl DeniedBy {
         match self {
             DeniedBy::Blocklist => "blocklist",
             DeniedBy::Unresolved => "unresolved",
+            DeniedBy::Auto => "auto",
         }
     }
 }
@@ -84,6 +90,11 @@ pub struct FlowWire {
     /// set when a policy refused this, not a rule — see `DeniedBy`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denied_by: Option<DeniedBy>,
+    /// the fact auto mode decided on (`auto::Decision::why`), for allows as
+    /// well as denials — a verdict nobody can see the reason for is not one
+    /// anybody can check
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
     /// unix epoch seconds when this was logged — `#[serde(default)]` so
     /// history.jsonl lines written before this field existed still parse
     #[serde(default)]

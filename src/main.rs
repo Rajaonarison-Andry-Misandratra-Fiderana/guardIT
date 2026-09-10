@@ -1,3 +1,4 @@
+mod auto;
 mod blocklist;
 mod config;
 mod daemon;
@@ -94,6 +95,37 @@ struct AppRuleArgs {
     expires_in: Option<u64>,
 }
 
+/// `guardit auto` with no argument prints what the mode is doing right now.
+#[derive(clap::Args)]
+struct AutoArgs {
+    /// on, or off
+    #[arg(value_parser = ["on", "off"])]
+    state: Option<String>,
+    /// what to do with a connection the heuristics found no fact about:
+    /// allow it (default — they are written to catch what is wrong), deny it
+    /// (strict, and it will break things), or ask as usual (auto then only
+    /// answers the questions it can answer itself)
+    #[arg(long, value_enum, default_value = "allow")]
+    fallback: FallbackArg,
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+enum FallbackArg {
+    Ask,
+    Allow,
+    Deny,
+}
+
+impl From<FallbackArg> for auto::Fallback {
+    fn from(f: FallbackArg) -> Self {
+        match f {
+            FallbackArg::Ask => auto::Fallback::Ask,
+            FallbackArg::Allow => auto::Fallback::Allow,
+            FallbackArg::Deny => auto::Fallback::Deny,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum AppCmd {
     /// list per-app rules
@@ -154,6 +186,8 @@ enum Cmd {
     /// per-application rules (what the daemon enforces)
     #[command(subcommand)]
     App(AppCmd),
+    /// decide unruled connections automatically instead of asking (see `auto --help`)
+    Auto(AutoArgs),
     /// print the whole config (IP/port rules, app rules, settings) as TOML
     Export,
     /// replace the whole config with a TOML file (`-` for stdin), then reload
@@ -222,6 +256,7 @@ fn main() {
             | Cmd::LogApp { .. }
             | Cmd::Apply { dry_run: true }
             | Cmd::App(AppCmd::List)
+            | Cmd::Auto(AutoArgs { state: None, .. })
             | Cmd::Completions { .. }
             | Cmd::Man
             | Cmd::Blocklist(
@@ -279,6 +314,7 @@ fn main() {
         Cmd::LogApp { n, exe } => daemon::print_log_app(exe.as_deref(), n),
         Cmd::Reset { yes } => reset_everything(&cfg, yes),
         Cmd::Blocklist(sub) => blocklist_cmd(cfg, sub),
+        Cmd::Auto(args) => auto_cmd(args),
         Cmd::App(AppCmd::List) => print_app_list(&cfg),
         Cmd::App(AppCmd::Allow(args)) => set_app_rule(RuleAction::Allow, args),
         Cmd::App(AppCmd::Deny(args)) => set_app_rule(RuleAction::Deny, args),
@@ -384,6 +420,36 @@ fn main() {
             .unwrap_or_else(|e| fail(&format!("daemon: {e}")));
             println!("#{req_id}: {}", format!("{verdict:?}").to_lowercase());
         }
+    }
+}
+
+/// Writes the `[auto]` section and says what changed. Nothing else to do:
+/// the daemon watches rules.toml and picks the new setting up within its
+/// scan interval, so the mode goes on and off under a running daemon
+/// without dropping a single held connection.
+fn auto_cmd(args: AutoArgs) {
+    let Some(state) = args.state.as_deref() else {
+        let cfg = Config::load();
+        match cfg.auto.active() {
+            Some(f) => println!(
+                "auto mode is on — unruled connections are decided here, \
+                 fallback {} for the ones with no evidence either way",
+                f.as_str()
+            ),
+            None => println!("auto mode is off — unruled connections are asked about"),
+        }
+        return;
+    };
+    let cfg = Config::update(|cfg| {
+        cfg.auto.enabled = state == "on";
+        cfg.auto.fallback = args.fallback.into();
+    });
+    match cfg.auto.active() {
+        Some(f) => println!(
+            "auto mode on, fallback {} — takes effect within seconds, no restart",
+            f.as_str()
+        ),
+        None => println!("auto mode off — unruled connections are asked about again"),
     }
 }
 

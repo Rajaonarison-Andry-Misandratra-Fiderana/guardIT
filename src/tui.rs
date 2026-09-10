@@ -829,6 +829,17 @@ pub fn run(cfg: Config) {
                 }
                 continue;
             }
+            // auto mode is a property of the whole daemon, not of any pane,
+            // so it toggles from anywhere. Only on and off: which fallback
+            // it uses is a decision to make once in the config, not one to
+            // cycle past by accident on the way to turning it off
+            if key.code == KeyCode::Char('m')
+                && !matches!(app.mode, Mode::Add(_) | Mode::Filter)
+            {
+                let enabled = !app.cfg.auto.enabled;
+                app.cfg = Config::update(|c| c.auto.enabled = enabled);
+                continue;
+            }
             // jumpable to from anywhere, same idea as `t` — the audit tab is
             // its own tab, not nested under any pane's local keys
             if key.code == KeyCode::Char('A')
@@ -1967,8 +1978,15 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             app.blocklist.blocked as f64 / app.blocklist.queries as f64 * 100.0
         )
     };
+    // what the daemon does with a connection no rule covers — the single
+    // most consequential setting there is, and the one you most need to see
+    // before wondering why nothing is asking you anything
+    let auto = match app.cfg.auto.active() {
+        Some(f) => format!("on/{} (m)", f.as_str()),
+        None => "off (m)".to_string(),
+    };
     let status = format!(
-        "guardit  |  if: {ifaces}  |  daemon: {daemon}  |  blocking: {blocking}  |  theme: {} (t)",
+        "guardit  |  if: {ifaces}  |  daemon: {daemon}  |  auto: {auto}  |  blocking: {blocking}  |  theme: {} (t)",
         theme.name
     );
     f.render_widget(
@@ -2018,6 +2036,12 @@ fn draw_app_log(f: &mut Frame, app: &mut App, area: Rect) {
                 FlowStatus::Denied => ("deny", theme.deny),
                 FlowStatus::Pending => ("pending", theme.warn),
             };
+            // the audit tab is where you go to ask why, so the reason rides
+            // in the verdict's own column rather than costing an eighth one
+            let status = match e.why.as_deref().or(e.denied_by.map(|b| b.as_str())) {
+                Some(why) => format!("{status} · {why}"),
+                None => status.to_string(),
+            };
             Row::new(vec![
                 Cell::from(ago),
                 Cell::from(e.direction.as_str()),
@@ -2025,7 +2049,7 @@ fn draw_app_log(f: &mut Frame, app: &mut App, area: Rect) {
                 Cell::from(e.proto.clone()),
                 Cell::from(e.port.map(|p| p.to_string()).unwrap_or_default()),
                 Cell::from(e.peer()),
-                Cell::from(status),
+                Cell::from(status.clone()),
             ])
             .style(Style::new().fg(color))
         })
@@ -2039,7 +2063,9 @@ fn draw_app_log(f: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(6),
             Constraint::Length(7),
             Constraint::Length(18),
-            Constraint::Length(8),
+            // wide enough for the verdict and the reason auto mode gives for
+            // it — the last column, and this tab is full-screen
+            Constraint::Length(28),
         ],
     )
     .header(
@@ -2871,10 +2897,14 @@ fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
             // the reason gets its columns reserved before the peer is laid
             // out: a truncated "· unres" reads as a bug, and the peer is the
             // field with room to give
-            let reason = e
-                .denied_by
-                .map(|why| format!("  · {}", why.as_str()))
-                .unwrap_or_default();
+            let reason = match (e.why.as_deref(), e.denied_by) {
+                // auto mode's own words — "smb", "volatile path" — say more
+                // than the name of the mechanism that produced them, and are
+                // the only thing on the row that explains an *allow*
+                (Some(why), _) => format!("  · {why}"),
+                (None, Some(by)) => format!("  · {}", by.as_str()),
+                (None, None) => String::new(),
+            };
             let head = format!(
                 "{tag}  {:<4}/{:<4}  port {:<6}  ",
                 e.proto,
@@ -3019,6 +3049,7 @@ mod tests {
             peer_name: name.map(|n| n.into()),
             status: FlowStatus::Allowed,
             denied_by: None,
+            why: None,
             ts: 0,
         }
     }

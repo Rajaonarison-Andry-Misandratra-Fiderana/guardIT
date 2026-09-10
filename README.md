@@ -137,6 +137,8 @@ guardit log-app [--n 100] [--exe <substr>]                  # full per-app audit
 guardit daemon [--debug]                                    # per-app enforcement (needs root)
 guardit reset [--yes]                                       # wipe every rule, log and list
 guardit completions fish|bash|zsh                           # shell completion script
+guardit auto on [--fallback allow|deny|ask]                  # decide unruled connections here
+guardit auto off                                            # go back to asking
 guardit man                                                 # man page (roff)
 guardit tui   (or just guardit)                             # the dashboard (default with no args)
 ```
@@ -146,6 +148,57 @@ When a new app asks and the TUI isn't open, the daemon pops a desktop notificati
 command. `notify = false` in `/etc/guardit/rules.toml` turns it off. Peers show as
 `github.com (140.82.121.4)` when the daemon saw the DNS answer (plain DNS only — DoH/DoT
 stay invisible). A hand edit of `rules.toml` is picked up within 5 seconds.
+
+## Auto mode — decide instead of asking
+
+Holding the packet and asking is the right shape for a desktop somebody is sitting in
+front of. It is the wrong one for a server, a machine you are ssh'd into, or a laptop
+whose owner has stopped reading the prompts. Auto mode answers the unruled connections
+itself:
+
+```
+guardit auto on                          # decide; allow what there is no evidence against
+guardit auto on --fallback deny          # decide; refuse what there is no evidence for
+guardit auto on --fallback ask           # decide what it can, still ask about the rest
+guardit auto off
+guardit auto                             # what it is doing right now
+```
+
+`m` toggles it in the TUI and the header says which mode is in force. It takes effect
+within seconds under a running daemon — no restart, no held connection dropped.
+
+Every decision rests on **one fact about the connection**, and that fact is printed next
+to the verdict in the flow pane, the audit tab and `guardit log-app`, so you can read back
+what it did and tell at a glance whether it was right:
+
+| Fact | Verdict | Reason shown |
+|---|---|---|
+| the binary is gone from disk, or `/proc` says `(deleted)` | deny | `gone from disk` |
+| it runs from `/tmp`, `/dev/shm`, `~/.cache`, `~/Downloads`… | deny | `volatile path` |
+| SMB, RDP, telnet, NetBIOS, RPC, port 25, 4444/5555/6667 — **to the internet** | deny | `smb`, `rdp`, … |
+| unsolicited inbound from outside your network | deny | `inbound from internet` |
+| inbound from your own network, nothing serving that port | deny | `nothing listening` |
+| anything within your own network, either way, to a live port | allow | `local network` |
+| this machine resolved the name, then reached the address that answered | allow | `resolved name` |
+| a packaged binary (`/usr/bin`, `/nix/store`, flatpak…) on a port packaged binaries use | allow | `packaged program` |
+| none of the above | `--fallback` | `no evidence` |
+
+The order is not cosmetic: a fact *against* a connection outranks every reason for it, so
+"it is in `/usr/bin`" never rescues what "it is port 445 to the internet" already
+condemned. A port that is an anomaly across the internet is deliberately fine on your own
+network — that is a NAS or a printer, not an exfiltration route.
+
+It writes **no rules**. Each connection is judged again on the evidence current at that
+moment, so a binary replaced ten seconds ago, a name that has just landed on a blocklist,
+or a service that stopped listening all change the answer with nothing to clean up
+afterwards. Your own rules always win: auto only ever looks at connections no rule of
+yours covers, and it runs after the blocklist and `require_resolved` have had their say,
+never before.
+
+`--fallback allow` is the default because the heuristics are written to catch what is
+wrong rather than to recognise everything that is right; on a real machine most of what is
+left over is some program talking to a name it resolved a moment ago. `--fallback deny` is
+the strict reading, and it will break things you then have to allow by hand.
 
 ### Rules by domain
 
@@ -274,7 +327,13 @@ update_hours = 24            # 0 to never auto-update
 ```
 
 Edited by hand or by `guardit blocklist`; either way the daemon picks it up within
-seconds.
+seconds. Auto mode lives in the same file:
+
+```toml
+[auto]
+enabled = false
+fallback = "allow"           # allow | deny | ask, for connections with no evidence either way
+```
 
 ### What it does not cover
 

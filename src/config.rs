@@ -289,6 +289,45 @@ impl Default for BlocklistConfig {
     }
 }
 
+/// Automatic verdicts (see src/auto.rs). Off until someone turns it on: it
+/// answers questions that would otherwise be put to a person, and an install
+/// deciding on its own that it may do that would be the wrong default even
+/// when every decision it made was right.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// what happens to a connection `auto::decide` found no fact about
+    #[serde(default = "default_fallback")]
+    pub fallback: crate::auto::Fallback,
+    /// see `Config::extra`
+    #[serde(flatten)]
+    pub extra: toml::Table,
+}
+
+fn default_fallback() -> crate::auto::Fallback {
+    crate::auto::Fallback::Allow
+}
+
+impl Default for AutoConfig {
+    fn default() -> Self {
+        AutoConfig {
+            enabled: false,
+            fallback: default_fallback(),
+            extra: toml::Table::new(),
+        }
+    }
+}
+
+impl AutoConfig {
+    /// the fallback in force, or `None` when auto mode is off — the one
+    /// value the daemon's queue loops need, so they never have to ask twice
+    /// whether the mode is on before reading what it does
+    pub fn active(&self) -> Option<crate::auto::Fallback> {
+        self.enabled.then_some(self.fallback)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -315,6 +354,8 @@ pub struct Config {
     pub filter_forwarded: bool,
     #[serde(default)]
     pub blocklist: BlocklistConfig,
+    #[serde(default)]
+    pub auto: AutoConfig,
     /// Settings this build does not know about, carried through untouched.
     ///
     /// Every write of this file is a read-modify-write, so without this a
@@ -337,6 +378,7 @@ impl Default for Config {
             notify: true,
             filter_forwarded: false,
             blocklist: BlocklistConfig::default(),
+            auto: AutoConfig::default(),
             extra: toml::Table::new(),
         }
     }
@@ -417,6 +459,33 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `active()` is what every consumer reads, so the two ways of being off
+    /// (never enabled, or enabled with a fallback that still asks) have to
+    /// stay distinguishable: `Ask` is auto mode *on*, answering what it can.
+    #[test]
+    fn auto_is_only_active_when_enabled() {
+        let mut a = AutoConfig::default();
+        assert_eq!(a.active(), None, "off by default");
+        a.enabled = true;
+        assert_eq!(a.active(), Some(crate::auto::Fallback::Allow));
+        a.fallback = crate::auto::Fallback::Ask;
+        assert_eq!(a.active(), Some(crate::auto::Fallback::Ask), "on, still asking");
+    }
+
+    /// a config written before `[auto]` existed has to keep meaning what it
+    /// said, and a half-written one has to take the safe half
+    #[test]
+    fn an_older_config_reads_back_with_auto_off() {
+        let cfg: Config = toml::from_str("pending_timeout_secs = 10").unwrap();
+        assert_eq!(cfg.auto.active(), None);
+        let cfg: Config = toml::from_str("[auto]\nenabled = true").unwrap();
+        assert_eq!(
+            cfg.auto.active(),
+            Some(crate::auto::Fallback::Allow),
+            "an unstated fallback is the documented default, not a parse error"
+        );
+    }
 
     fn rule(exe: &str, port: Option<u16>, action: Action) -> AppRule {
         AppRule {
