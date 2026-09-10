@@ -105,6 +105,7 @@ guardit deny  --port 80                                     # explicit block, bo
 guardit deny  --port 25 --dir out                           # outbound only
 guardit allow                                               # allow everything: pause filtering
 guardit rm <id>                                             # remove a rule
+                                                            # (both reload the kernel if guardit is already running)
 guardit list                                                # list configured rules
 guardit apply [--dry-run]                                   # load the ruleset into the kernel
 guardit status                                              # show what's loaded

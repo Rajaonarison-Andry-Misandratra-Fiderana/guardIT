@@ -284,7 +284,7 @@ fn main() {
                 std::process::exit(1);
             }
             cfg.save();
-            println!("removed rule #{id}");
+            println!("removed rule #{id}{}", reload_kernel(&cfg));
         }
         Cmd::List => print_list(&cfg),
         Cmd::Apply { dry_run } => {
@@ -949,9 +949,29 @@ fn add_rule(cfg: &mut Config, action: RuleAction, args: RuleArgs) {
         direction: args.dir.map(Direction::from),
         enabled: true,
     };
-    println!("added rule #{}", rule.id);
+    let id = rule.id;
     cfg.rule.push(rule);
     cfg.save();
+    println!("added rule #{id}{}", reload_kernel(cfg));
+}
+
+/// Push the ruleset into the kernel, if guardit is actually running.
+///
+/// A saved rule that does nothing until you remember a second command is a
+/// rule you will believe is in force when it is not — the TUI has always
+/// applied on the spot for exactly that reason, and the CLI writing to the
+/// same file should not be the half that quietly waits. Only when the table
+/// is already loaded, though: `guardit allow` on a machine where nobody has
+/// run `guardit apply` yet must not be the thing that switches the firewall
+/// on, since that also stands up the queues and needs the daemon running.
+fn reload_kernel(cfg: &Config) -> String {
+    if !ruleset::is_loaded() {
+        return " (run `guardit apply` to load it)".into();
+    }
+    match ruleset::apply(cfg) {
+        Ok(()) => " — applied".into(),
+        Err(e) => format!(" — but the kernel refused the ruleset: {e}"),
+    }
 }
 
 fn print_list(cfg: &Config) {

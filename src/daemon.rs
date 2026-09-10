@@ -2106,11 +2106,14 @@ fn queue_loop(
                     port: rule_port,
                     peer: peer_addr,
                     peer_name: peer_name.as_deref(),
+                    // proto as well as port: a UDP service bound to 5353
+                    // says nothing about whether a TCP connection to 5353
+                    // has anywhere to land
                     listening: listening
                         .lock()
                         .unwrap()
                         .iter()
-                        .any(|e| e.port == rule_port),
+                        .any(|e| e.port == rule_port && e.proto == proto_name(pkt.proto)),
                     on_disk: crate::auto::on_disk(&exe),
                 };
                 match crate::auto::decide(&facts) {

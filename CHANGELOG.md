@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **`guardit allow` / `deny` / `rm` reload the kernel themselves**, when guardit is already
+  running. A saved rule that does nothing until you remember a second command is a rule you
+  will believe is in force when it is not — the TUI has always applied on the spot for that
+  reason, and the CLI writing to the same file should not be the half that quietly waits.
+  It stays a no-op where the table is not loaded at all: `guardit allow` must not be the
+  thing that switches the firewall on, since that also stands up the queues.
+
 - **The config is written atomically.** `fs::write` truncates the file and then writes into
   it, so a crash, a full disk or a power cut between the two left an empty or half-written
   `/etc/guardit/rules.toml` — every rule on the machine gone, and the daemon reloading that
