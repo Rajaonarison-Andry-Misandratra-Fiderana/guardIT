@@ -529,7 +529,7 @@ mod tests {
         cfg.blocklist.block_encrypted_dns = true;
         // one of every shape: bare, address-only, port-only, both, each
         // family, each direction, both actions
-        let shapes: &[(Action, Proto, &str, Option<u16>, Option<Direction>)] = &[
+        let shapes = [
             (Action::Allow, Proto::Any, "any", None, None),
             (Action::Deny, Proto::Any, "any", None, Some(Direction::In)),
             (Action::Allow, Proto::Any, "192.168.0.0/16", None, None),
@@ -539,14 +539,14 @@ mod tests {
             (Action::Deny, Proto::Tcp, "fd00::/8", Some(445), Some(Direction::Out)),
             (Action::Allow, Proto::Any, "2001:db8::1", None, Some(Direction::In)),
         ];
-        for (i, (action, proto, src, port, direction)) in shapes.iter().enumerate() {
+        for (i, (action, proto, src, port, direction)) in shapes.into_iter().enumerate() {
             cfg.rule.push(Rule {
                 id: i as u32 + 1,
-                action: *action,
-                proto: *proto,
-                src: (*src).into(),
-                port: *port,
-                direction: *direction,
+                action,
+                proto,
+                src: src.into(),
+                port,
+                direction,
                 enabled: true,
             });
         }
