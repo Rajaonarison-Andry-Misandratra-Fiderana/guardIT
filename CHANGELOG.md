@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Recently blocked names are a list you can act on.** In the blocking tab `h`/`l` (or
+  `Tab`) moves from the categories to the names most recently refused; `j/k` walks them,
+  newest first, and `y` on one adds it to the allowlist — the entry `guardit blocklist
+  allow` writes — so a false positive is fixed where it shows up. The selection stays on
+  its name as new blocks arrive above it, so `y` never lands on a name you did not look
+  at. On a narrow terminal the names take the categories' place while they have the focus.
+
 - **Which lists a category uses is yours to choose.** `[blocklist.category_sources]` in
   rules.toml has one line per category — `phishing = ["hagezi:tif.medium"]` — written out
   with the catalogue's choice the first time guardit saves the file, so what a category

@@ -423,7 +423,9 @@ recently blocked. `j/k` moves, `space` blocks or unblocks a category — ticking
 lists aren't on disk downloads them there and then, in the background — and `u`
 re-downloads the lot. Each category shows its lists beside it, and `s` switches the selected
 one to the next list filed under it, the catalogue's choice first — the same line you would
-edit by hand. `q`/`B` goes back.
+edit by hand. `h`/`l` (or `Tab`) moves over to the names recently blocked: newest first,
+`j/k` through them, and `y` on one never blocks it again, nor anything under it — the
+same allowlist entry `guardit blocklist allow` writes. `q`/`B` goes back.
 
 `A` opens the audit tab, holding the two "what has already happened" views side by side —
 `Tab` switches between them, `q`/`A` goes back. A pane's own `a` opens it scoped to the

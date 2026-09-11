@@ -334,6 +334,10 @@ enum Focus {
     /// and jumpable to from anywhere via the global `A` key, same idea as
     /// `t` for theme
     AppLog,
+    /// the names most recently blocked — the other half of the blocking
+    /// tab, `h`/`l` away from the categories, where a false positive shows
+    /// up and gets allowed
+    BlockedNames,
 }
 
 /// the log tab: the audit trail and the listening ports, Tab switching
@@ -344,7 +348,12 @@ fn in_log_tab(focus: Focus) -> bool {
 
 /// Anything drawn over the whole grid rather than inside it.
 fn in_tab(focus: Focus) -> bool {
-    in_log_tab(focus) || focus == Focus::Blocking
+    in_log_tab(focus) || in_blocking_tab(focus)
+}
+
+/// the blocking tab: the category switches and the names recently blocked
+fn in_blocking_tab(focus: Focus) -> bool {
+    matches!(focus, Focus::Blocking | Focus::BlockedNames)
 }
 
 // Two rings over the same panes.
@@ -363,11 +372,11 @@ impl Focus {
         match self {
             Focus::Rules => Focus::Apps,
             Focus::Apps | Focus::Flow => Focus::Rules,
-            // inside the log tab, Tab toggles its two halves; the blocking
-            // tab holds one thing, so there is nowhere for Tab to go
+            // inside a tab, Tab toggles its two halves
             Focus::AppLog => Focus::Conflicts,
             Focus::Conflicts => Focus::AppLog,
-            Focus::Blocking => Focus::Blocking,
+            Focus::Blocking => Focus::BlockedNames,
+            Focus::BlockedNames => Focus::Blocking,
         }
     }
 
@@ -378,7 +387,8 @@ impl Focus {
             Focus::Flow => Focus::Apps,
             Focus::AppLog => Focus::Conflicts,
             Focus::Conflicts => Focus::AppLog,
-            Focus::Blocking => Focus::Blocking,
+            Focus::Blocking => Focus::BlockedNames,
+            Focus::BlockedNames => Focus::Blocking,
         }
     }
 
@@ -391,7 +401,8 @@ impl Focus {
             Focus::Flow => Focus::Rules,
             Focus::AppLog => Focus::Conflicts,
             Focus::Conflicts => Focus::AppLog,
-            Focus::Blocking => Focus::Blocking,
+            Focus::Blocking => Focus::BlockedNames,
+            Focus::BlockedNames => Focus::Blocking,
         }
     }
 
@@ -403,7 +414,8 @@ impl Focus {
             Focus::Flow => Focus::Apps,
             Focus::AppLog => Focus::Conflicts,
             Focus::Conflicts => Focus::AppLog,
-            Focus::Blocking => Focus::Blocking,
+            Focus::Blocking => Focus::BlockedNames,
+            Focus::BlockedNames => Focus::Blocking,
         }
     }
 }
@@ -915,6 +927,9 @@ struct App {
     blocklist: ipc::BlocklistStats,
     /// which row of the category list is selected
     blocking_state: ListState,
+    /// which recently blocked name is selected, counted newest first as the
+    /// list is drawn; kept on its name as new ones arrive (set_blocklist_stats)
+    blocked_state: ListState,
     /// the one slow thing that may be running: a list download, or a
     /// ruleset reload. Both are seconds-to-minutes and both used to happen
     /// inside the draw loop, where they read as a freeze
@@ -1069,6 +1084,7 @@ fn new_app(cfg: Config) -> App {
         listening_filter: String::new(),
         blocklist: ipc::BlocklistStats::default(),
         blocking_state: ListState::default().with_selected(Some(0)),
+        blocked_state: ListState::default().with_selected(Some(0)),
         busy: None,
         cfg_mtime: config_mtime(),
     };
@@ -1168,7 +1184,7 @@ pub fn run(cfg: Config) {
             if key.code == KeyCode::Char('B')
                 && !matches!(app.mode, Mode::Add(_) | Mode::Filter)
             {
-                if app.focus == Focus::Blocking {
+                if in_blocking_tab(app.focus) {
                     leave_tab(&mut app);
                 } else {
                     enter_tab(&mut app, Focus::Blocking);
@@ -1322,6 +1338,21 @@ pub fn run(cfg: Config) {
                     }
                     _ => {}
                 },
+                Focus::BlockedNames => match key.code {
+                    KeyCode::Char('q') => leave_tab(&mut app),
+                    KeyCode::Char('j') | KeyCode::Down => app.blocked_state.select(step(
+                        app.blocked_state.selected(),
+                        app.blocklist.recent.len(),
+                        false,
+                    )),
+                    KeyCode::Char('k') | KeyCode::Up => app.blocked_state.select(step(
+                        app.blocked_state.selected(),
+                        app.blocklist.recent.len(),
+                        true,
+                    )),
+                    KeyCode::Char('y') => allow_blocked_name(&mut app),
+                    _ => {}
+                },
                 Focus::Blocking => match key.code {
                     KeyCode::Char('q') => leave_tab(&mut app),
                     KeyCode::Char('j') | KeyCode::Down => app.blocking_state.select(step(
@@ -1450,7 +1481,7 @@ fn drain_ipc(app: &mut App) {
                 app.blocklist = blocklist;
                 apply_listening_filter(app);
             }
-            ServerMsg::Blocklist(stats) => app.blocklist = stats,
+            ServerMsg::Blocklist(stats) => set_blocklist_stats(app, stats),
             ServerMsg::FlowNew(w) => {
                 *app.counts.entry(w.exe.clone()).or_default() += 1;
                 app.flow.push(w);
@@ -2097,7 +2128,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     .split(area);
 
     draw_header(f, app, outer[0]);
-    if app.focus == Focus::Blocking {
+    if in_blocking_tab(app.focus) {
         draw_blocking(f, app, outer[1]);
     } else if in_log_tab(app.focus) {
         // its own tab over the whole grid area: the audit trail and the
@@ -2152,7 +2183,7 @@ fn focus_accent(focus: Focus, theme: Theme) -> Color {
         Focus::Apps => theme.accents[1],
         Focus::Conflicts => theme.accents[2],
         Focus::Flow => theme.accents[4],
-        Focus::Blocking => theme.accents[3],
+        Focus::Blocking | Focus::BlockedNames => theme.accents[3],
         Focus::AppLog => theme.chart,
     }
 }
@@ -2235,7 +2266,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Focus::Apps => "APPS",
         Focus::Conflicts => "LISTEN",
         Focus::Flow => "FLOW",
-        Focus::Blocking => "BLOCK",
+        Focus::Blocking | Focus::BlockedNames => "BLOCK",
         Focus::AppLog => "AUDIT",
     };
     let focus_color = focus_accent(app.focus, theme);
@@ -2257,10 +2288,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("Y/N", "allow/deny host"),
         ],
         (Focus::Blocking, _) => vec![
+            ("h/l", "names"),
             ("j/k", "category"),
             ("space", "block/unblock"),
             ("s", "switch list"),
             ("u", "update lists"),
+        ],
+        (Focus::BlockedNames, _) => vec![
+            ("h/l", "categories"),
+            ("j/k", "name"),
+            ("y", "never block it"),
         ],
         (Focus::Conflicts, _) => vec![
             ("h/l", "audit"),
@@ -3169,7 +3206,11 @@ fn draw_categories(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         .collect();
     let list = List::new(items)
         .style(theme.base())
-        .highlight_style(Style::new().bg(theme.border_idle));
+        .highlight_style(if focused {
+            Style::new().bg(theme.border_idle)
+        } else {
+            Style::new()
+        });
     f.render_stateful_widget(list, body, &mut app.blocking_state);
 }
 
@@ -3256,7 +3297,7 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
             .style(theme.base()),
             stats_area,
         );
-        draw_categories(f, app, cats_area, true);
+        draw_halves(f, app, cats_area, recent_area);
         return;
     }
 
@@ -3361,41 +3402,134 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(Paragraph::new(lines).style(theme.base()), area);
     }
 
-    draw_categories(f, app, cats_area, true);
+    draw_halves(f, app, cats_area, recent_area);
+}
 
-    // stacked and short: the switches took what was left, and the names are
-    // the part you can also get from `guardit blocklist log`
-    let Some(recent_area) = recent_area else {
-        return;
-    };
-    if recent_area.height < 2 {
+/// The blocking tab's two halves: side by side when the layout has a
+/// column for the names, else whichever one has the focus — stacked, the
+/// figures take the top and one list gets all the room below them.
+fn draw_halves(f: &mut Frame, app: &mut App, cats_area: Rect, recent_area: Option<Rect>) {
+    let names = app.focus == Focus::BlockedNames;
+    match recent_area {
+        Some(recent_area) => {
+            draw_categories(f, app, cats_area, !names);
+            draw_blocked_names(f, app, recent_area, names);
+        }
+        None if names => draw_blocked_names(f, app, cats_area, true),
+        None => draw_categories(f, app, cats_area, true),
+    }
+}
+
+/// The names most recently refused, newest first. A false positive shows up
+/// here the moment a page breaks, so it is a list to move through and `y` a
+/// name on, not only a readout.
+fn draw_blocked_names(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+    let theme = THEMES[app.theme_idx];
+    let dim = Style::new().fg(theme.border_idle);
+    if area.height < 2 {
         return;
     }
-    let mut recent = vec![Line::from(Span::styled("recently blocked", dim))];
-    if b.recent.is_empty() {
-        recent.push(Line::from(Span::styled("nothing yet", dim)));
-    } else {
-        let rows = recent_area.height.saturating_sub(1) as usize;
-        for entry in b.recent.iter().rev().take(rows) {
+    let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "recently blocked",
+            half_heading(theme, focused),
+        )))
+        .style(theme.base()),
+        head,
+    );
+    if app.blocklist.recent.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("nothing yet", dim))).style(theme.base()),
+            body,
+        );
+        return;
+    }
+    let width = body.width as usize;
+    let items: Vec<ListItem> = app
+        .blocklist
+        .recent
+        .iter()
+        .rev()
+        .map(|entry| {
             // who asked, when we know it — more use than how long ago
             let tail = match &entry.exe {
                 Some(exe) => basename(exe).to_string(),
                 None => ago(now_ts().saturating_sub(entry.ts)),
             };
-            let width = recent_area.width as usize;
             let room = width.saturating_sub(tail.chars().count() + 2);
             let name = if entry.name.chars().count() > room && room > 1 {
                 format!("{}…", entry.name.chars().take(room - 1).collect::<String>())
             } else {
                 entry.name.clone()
             };
-            recent.push(Line::from(vec![
+            ListItem::new(Line::from(vec![
                 Span::styled(name, Style::new().fg(theme.deny)),
                 Span::styled(format!(" {tail}"), dim),
-            ]));
-        }
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .style(theme.base())
+        .highlight_style(if focused {
+            Style::new().bg(theme.border_idle)
+        } else {
+            Style::new()
+        });
+    f.render_stateful_widget(list, body, &mut app.blocked_state);
+}
+
+/// New figures from the daemon. The recent names are drawn newest first, so
+/// every new block pushes the rest down a row; the selection follows the
+/// name it was on, or `y` could allow a name nobody looked at.
+fn set_blocklist_stats(app: &mut App, stats: ipc::BlocklistStats) {
+    let picked = app
+        .blocked_state
+        .selected()
+        .and_then(|i| app.blocklist.recent.iter().rev().nth(i))
+        .map(|e| (e.ts, e.name.clone()));
+    app.blocklist = stats;
+    if let Some((ts, name)) = picked
+        && let Some(i) = app
+            .blocklist
+            .recent
+            .iter()
+            .rev()
+            .position(|e| e.ts == ts && e.name == name)
+    {
+        app.blocked_state.select(Some(i));
     }
-    f.render_widget(Paragraph::new(recent).style(theme.base()), recent_area);
+}
+
+/// `y` on a recently blocked name: never block it again, nor anything under
+/// it — the allowlist entry `guardit blocklist allow` writes, and like the
+/// category switches it goes to rules.toml for the daemon to pick up.
+fn allow_blocked_name(app: &mut App) {
+    let Some(entry) = app
+        .blocked_state
+        .selected()
+        .and_then(|i| app.blocklist.recent.iter().rev().nth(i))
+    else {
+        return;
+    };
+    let name = entry.name.trim_end_matches('.').to_ascii_lowercase();
+    if let Err(e) = config::validate_host(&name) {
+        app.msg = e;
+        return;
+    }
+    if app.cfg.blocklist.allow.contains(&name) {
+        app.msg = format!("{name} is already allowed");
+        return;
+    }
+    app.cfg = Config::update(|cfg| {
+        if !cfg.blocklist.allow.contains(&name) {
+            cfg.blocklist.allow.push(name.clone());
+        }
+    });
+    if let Some(ipc) = &mut app.ipc {
+        ipc.send(&ClientMsg::Reload);
+    }
+    app.msg = format!("{name} will never be blocked, nor anything under it");
 }
 
 fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
@@ -3767,6 +3901,34 @@ mod tests {
     }
 
     #[test]
+    fn a_new_block_does_not_move_the_selection_off_its_name() {
+        let mut app = demo_app();
+        app.blocked_state.select(Some(1));
+        let picked = app
+            .blocklist
+            .recent
+            .iter()
+            .rev()
+            .nth(1)
+            .unwrap()
+            .name
+            .clone();
+        let mut stats = app.blocklist.clone();
+        stats.recent.push(ipc::Blocked {
+            ts: now_ts(),
+            name: "new.example.com".into(),
+            exe: None,
+        });
+        set_blocklist_stats(&mut app, stats);
+        let i = app.blocked_state.selected().unwrap();
+        assert_eq!(i, 2, "one row further down, where its name went");
+        assert_eq!(
+            app.blocklist.recent.iter().rev().nth(i).unwrap().name,
+            picked
+        );
+    }
+
+    #[test]
     fn a_policy_refusal_is_never_recomputed_back_to_allowed() {
         let allow_whole_app = AppRule {
             id: 1,
@@ -3913,6 +4075,7 @@ mod tests {
                 Focus::Apps,
                 Focus::Flow,
                 Focus::Blocking,
+                Focus::BlockedNames,
                 Focus::AppLog,
                 Focus::Conflicts,
             ] {
