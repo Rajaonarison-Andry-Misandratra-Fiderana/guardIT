@@ -49,6 +49,13 @@ pub struct Category {
     pub sources: &'static [&'static str],
 }
 
+impl Category {
+    /// the catalogue's own choice, before rules.toml has a say
+    pub fn default_sources(&self) -> Vec<String> {
+        self.sources.iter().map(|s| s.to_string()).collect()
+    }
+}
+
 /// The catalogue the TUI and `guardit blocklist sources` show.
 ///
 /// Every hagezi entry is a `wildcard/*-onlydomains.txt`: a plain domain per
@@ -569,14 +576,56 @@ pub fn effective_sources(cfg: &BlocklistConfig) -> Vec<String> {
         }
     };
     for name in &cfg.categories {
-        if let Some(cat) = category(name) {
-            for key in cat.sources {
-                push(key);
-            }
+        for key in category_sources(cfg, name) {
+            push(&key);
         }
     }
     for key in &cfg.sources {
         push(key);
+    }
+    out
+}
+
+/// The lists category `cat` turns on: its line in
+/// `[blocklist.category_sources]`, or the catalogue's choice for a config
+/// that has no line for it.
+pub fn category_sources(cfg: &BlocklistConfig, cat: &str) -> Vec<String> {
+    match cfg.category_sources.get(cat) {
+        Some(keys) => keys.clone(),
+        None => category(cat)
+            .map(Category::default_sources)
+            .unwrap_or_default(),
+    }
+}
+
+/// Spells out every category's lists in the config, from the catalogue,
+/// wherever it does not already say — so rules.toml shows what each
+/// category means, a line deleted by hand comes back as the default, and a
+/// line edited by hand is kept exactly as written.
+///
+/// A name that is not a list is kept too, not refused: this runs on every
+/// load, the daemon's included, and a typo in one list name should cost
+/// that list, not the whole config. It surfaces as a failed download
+/// (`update_all`) instead.
+pub fn fill_category_sources(cfg: &mut BlocklistConfig) {
+    for c in CATEGORIES {
+        cfg.category_sources
+            .entry(c.key.to_string())
+            .or_insert_with(|| c.default_sources());
+    }
+}
+
+/// What a category can be switched to, in the order `s` in the TUI steps
+/// through them: the catalogue's choice first, then every other list filed
+/// under the category, one at a time.
+pub fn source_choices(cat: &Category) -> Vec<Vec<String>> {
+    let default = cat.default_sources();
+    let mut out = vec![default.clone()];
+    for s in SOURCES.iter().filter(|s| s.category == cat.key) {
+        let one = vec![s.key()];
+        if one != default {
+            out.push(one);
+        }
     }
     out
 }
@@ -1153,5 +1202,63 @@ mod tests {
         assert!(got.contains(&"hagezi:pro".to_string()));
         assert!(got.contains(&"hagezi:tif".to_string()));
         assert!(got.contains(&"oisd:small".to_string()));
+    }
+
+    #[test]
+    fn a_category_uses_the_lists_rules_toml_names_for_it() {
+        let mut cfg: crate::config::Config = toml::from_str(
+            r#"
+            [blocklist]
+            categories = ["phishing", "ads"]
+            filter_forwarded = true
+            [blocklist.category_sources]
+            phishing = ["hagezi:tif.medium"]
+            "#,
+        )
+        .unwrap();
+        fill_category_sources(&mut cfg.blocklist);
+        let b = &cfg.blocklist;
+        // the edited line is kept, and every other category is spelled out
+        assert_eq!(b.category_sources["phishing"], ["hagezi:tif.medium"]);
+        assert_eq!(b.category_sources["ads"], ["hagezi:pro"]);
+        assert_eq!(b.category_sources.len(), CATEGORIES.len());
+        let got = effective_sources(b);
+        assert!(got.contains(&"hagezi:tif.medium".to_string()), "{got:?}");
+        assert!(!got.contains(&"hagezi:tif".to_string()), "{got:?}");
+
+        // and it survives the trip through the file, next to a key only
+        // `extra` knows about
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: crate::config::Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.blocklist, cfg.blocklist, "{text}");
+    }
+
+    #[test]
+    fn every_category_can_be_switched_to_each_list_filed_under_it() {
+        for c in CATEGORIES {
+            let choices = source_choices(c);
+            assert_eq!(
+                choices[0],
+                c.default_sources(),
+                "{} starts at its default",
+                c.key
+            );
+            let mut seen = HashSet::new();
+            for choice in &choices {
+                assert!(
+                    seen.insert(choice.clone()),
+                    "{} offers {choice:?} twice",
+                    c.key
+                );
+            }
+            for s in SOURCES.iter().filter(|s| s.category == c.key) {
+                assert!(
+                    choices.iter().any(|choice| choice.contains(&s.key())),
+                    "{} never offers {}",
+                    c.key,
+                    s.key()
+                );
+            }
+        }
     }
 }

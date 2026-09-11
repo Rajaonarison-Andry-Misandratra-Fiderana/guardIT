@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Which lists a category uses is yours to choose.** `[blocklist.category_sources]` in
+  rules.toml has one line per category — `phishing = ["hagezi:tif.medium"]` — written out
+  with the catalogue's choice the first time guardit saves the file, so what a category
+  means lives in the file rather than in the binary. The blocking tab shows each
+  category's lists beside it and `s` steps it through every list filed under it; a hand
+  edit shows up in an open TUI within half a second, and a list it names that is not on
+  disk yet is fetched. The reason to want it: with nine categories on, `hagezi:tif` alone
+  is 2.3 million of the 3 million domains the daemon holds in memory.
+- **A category's lists come due on schedule.** The updater decided whether anything was
+  due from the hand-added lists alone, which predate categories: a newly enabled category
+  waited for the DoH ip list to go stale — up to a day — before it downloaded, and with
+  `block_encrypted_dns` off a config built from categories alone never refreshed at all.
+
 - **`guardit allow` / `deny` / `rm` reload the kernel themselves**, when guardit is already
   running. A saved rule that does nothing until you remember a second command is a rule you
   will believe is in force when it is not — the TUI has always applied on the spot for that

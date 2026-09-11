@@ -285,7 +285,8 @@ sudo guardit blocklist off
 In the TUI, the ads & tracking column carries the same switches: `Tab` to it, `j/k` to a
 category, `space` to block or unblock it. Ticking a category whose lists aren't on disk
 downloads them in the background and the numbers move as soon as they land; `u`
-re-downloads everything.
+re-downloads everything. Each category shows the lists it uses beside it, and `s` switches
+it to the next list filed under it — the same as editing its line in `rules.toml` (below).
 
 Behind the categories are 61 lists from HaGeZi, StevenBlack, OISD, AdGuard, The Blocklist
 Project, Peter Lowe, AdAway, Frogeye, Phishing Army, abuse.ch URLhaus, Sinfonietta and Dan
@@ -337,10 +338,21 @@ allow = ["cdn.example.com"]
 block_encrypted_dns = true
 require_resolved = false     # refuse :443/:853 to addresses no lookup named
 update_hours = 24            # 0 to never auto-update
+
+[blocklist.category_sources] # which lists each category means, one line each
+ads = ["hagezi:pro"]
+phishing = ["hagezi:tif.medium"]   # instead of the 2.3M-domain hagezi:tif
+tracking = ["frogeye:multiparty", "frogeye:firstparty"]
+# … every category is written out, with the catalogue's choice, the first time
+# guardit saves the file
 ```
 
-Edited by hand or by `guardit blocklist`; either way the daemon picks it up within
-seconds. Auto mode lives in the same file:
+Edited by hand, by `guardit blocklist` or from the TUI; the daemon picks it up within
+seconds and an open TUI redraws from it. Delete a category's line and it comes back as the
+default. A list named there that is not on disk yet is fetched by the daemon within ten
+minutes, or at once if the TUI is open; a name that is not a list at all shows up as a
+failed download rather than stopping the file from loading. Auto mode lives in the same
+file:
 
 ```toml
 [auto]
@@ -409,7 +421,9 @@ them off again.
 `B` opens the blocking tab: the figures, the twelve category switches, and the names most
 recently blocked. `j/k` moves, `space` blocks or unblocks a category — ticking one whose
 lists aren't on disk downloads them there and then, in the background — and `u`
-re-downloads the lot. `q`/`B` goes back.
+re-downloads the lot. Each category shows its lists beside it, and `s` switches the selected
+one to the next list filed under it, the catalogue's choice first — the same line you would
+edit by hand. `q`/`B` goes back.
 
 `A` opens the audit tab, holding the two "what has already happened" views side by side —
 `Tab` switches between them, `q`/`A` goes back. A pane's own `a` opens it scoped to the

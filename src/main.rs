@@ -576,19 +576,21 @@ fn save_blocklist(mut cfg: Config, mutate: impl FnOnce(&mut config::BlocklistCon
 fn blocklist_cmd(cfg: Config, sub: BlocklistCmd) {
     match sub {
         BlocklistCmd::Categories => {
-            println!("{:<14}{:<8}COVERS", "CATEGORY", "LISTS");
+            println!("{:<14}{:<58}LISTS", "CATEGORY", "COVERS");
             for c in blocklist::CATEGORIES {
                 let on = cfg.blocklist.categories.iter().any(|k| k == c.key);
                 println!(
-                    "{} {:<12}{:<8}{}",
+                    "{} {:<12}{:<58}{}",
                     if on { "*" } else { " " },
                     c.key,
-                    c.sources.len(),
-                    c.about
+                    c.about,
+                    blocklist::category_sources(&cfg.blocklist, c.key).join(", ")
                 );
             }
+            println!("\n* = blocked. `guardit blocklist enable <category>`, several at a time.");
             println!(
-                "\n* = blocked. `guardit blocklist enable <category>`, several at a time."
+                "A category's lists are its line under [blocklist.category_sources] in {}.",
+                config::config_path().display()
             );
         }
         BlocklistCmd::Sources => {

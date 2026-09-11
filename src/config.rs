@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -269,6 +270,12 @@ pub struct BlocklistConfig {
     /// how often the daemon refetches the enabled lists; 0 = never
     #[serde(default = "default_update_hours")]
     pub update_hours: u32,
+    /// which lists each category turns on, `category = ["id:level", …]`.
+    /// Filled in from the catalogue on every load (blocklist::
+    /// fill_category_sources), so the file always says what a category
+    /// means and switching its list is an edit to one line
+    #[serde(default)]
+    pub category_sources: BTreeMap<String, Vec<String>>,
     /// see `Config::extra`
     #[serde(flatten)]
     pub extra: toml::Table,
@@ -284,6 +291,7 @@ impl Default for BlocklistConfig {
             block_encrypted_dns: true,
             require_resolved: false,
             update_hours: default_update_hours(),
+            category_sources: BTreeMap::new(),
             extra: toml::Table::new(),
         }
     }
@@ -436,10 +444,16 @@ impl Config {
     /// hot-reload keeps its current rules rather than dying on a typo)
     pub fn try_load() -> Result<Self, String> {
         let path = config_path();
-        match fs::read_to_string(&path) {
-            Ok(s) => toml::from_str(&s).map_err(|e| format!("bad config {}: {e}", path.display())),
-            Err(_) => Ok(Config::default()),
-        }
+        let mut cfg: Config = match fs::read_to_string(&path) {
+            Ok(s) => {
+                toml::from_str(&s).map_err(|e| format!("bad config {}: {e}", path.display()))?
+            }
+            Err(_) => Config::default(),
+        };
+        // every reader sees each category's lists spelled out, so the next
+        // save writes them into the file for someone to edit
+        crate::blocklist::fill_category_sources(&mut cfg.blocklist);
+        Ok(cfg)
     }
 
     /// Writes the config, atomically.

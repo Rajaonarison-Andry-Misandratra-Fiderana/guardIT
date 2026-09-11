@@ -919,6 +919,9 @@ struct App {
     /// ruleset reload. Both are seconds-to-minutes and both used to happen
     /// inside the draw loop, where they read as a freeze
     busy: Option<Busy>,
+    /// rules.toml's mtime when `cfg` was last read from it, so a hand edit
+    /// shows up here as it does in the daemon (reload_cfg_if_edited)
+    cfg_mtime: Option<std::time::SystemTime>,
 }
 
 /// A job running off the draw loop. It reports one line back and hangs up;
@@ -1067,6 +1070,7 @@ fn new_app(cfg: Config) -> App {
         blocklist: ipc::BlocklistStats::default(),
         blocking_state: ListState::default().with_selected(Some(0)),
         busy: None,
+        cfg_mtime: config_mtime(),
     };
     if !app.cfg.rule.is_empty() {
         app.state.select(Some(0));
@@ -1101,6 +1105,7 @@ pub fn run(cfg: Config) {
             }
             drain_ipc(&mut app);
             drain_busy(&mut app);
+            reload_cfg_if_edited(&mut app);
             let now = Instant::now();
             let elapsed = now.duration_since(app.net_prev_at).as_secs_f64();
             if elapsed > 0.05 {
@@ -1330,6 +1335,7 @@ pub fn run(cfg: Config) {
                         true,
                     )),
                     KeyCode::Char(' ') => toggle_category(&mut app),
+                    KeyCode::Char('s') => cycle_source(&mut app),
                     KeyCode::Char('u') => update_blocklists(&mut app),
                     _ => {}
                 },
@@ -2253,6 +2259,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         (Focus::Blocking, _) => vec![
             ("j/k", "category"),
             ("space", "block/unblock"),
+            ("s", "switch list"),
             ("u", "update lists"),
         ],
         (Focus::Conflicts, _) => vec![
@@ -2935,14 +2942,87 @@ fn toggle_category(app: &mut App) {
     // a category whose lists are not on disk yet blocks nothing, so ticking
     // it has to fetch them — otherwise the box is ticked, the numbers do not
     // move, and nothing is actually blocked until someone presses u
-    let missing = blocklist::effective_sources(&app.cfg.blocklist)
+    app.msg = if fetch_missing(app) {
+        format!("blocking {} — downloading its lists", cat.key)
+    } else {
+        format!("blocking {}", cat.key)
+    };
+}
+
+/// Switches the selected category to its next list (blocklist::
+/// source_choices), wrapping round to the catalogue's choice.
+///
+/// The same write as editing its line under `[blocklist.category_sources]`
+/// by hand, and like `toggle_category` it goes to rules.toml rather than
+/// over IPC. A set of lists put together by hand is not one of the choices,
+/// so `s` steps off it to the default rather than guessing where it sits.
+fn cycle_source(app: &mut App) {
+    let Some(cat) = app
+        .blocking_state
+        .selected()
+        .and_then(|i| blocklist::CATEGORIES.get(i))
+    else {
+        return;
+    };
+    let choices = blocklist::source_choices(cat);
+    let now = blocklist::category_sources(&app.cfg.blocklist, cat.key);
+    let next = choices
         .iter()
-        .any(|k| blocklist::cached_at(k).is_none());
+        .position(|c| *c == now)
+        .map_or(0, |i| (i + 1) % choices.len());
+    let pick = choices[next].clone();
+    let key = cat.key.to_string();
+    app.cfg = Config::update(|cfg| {
+        cfg.blocklist.category_sources.insert(key, pick.clone());
+    });
+    if let Some(ipc) = &mut app.ipc {
+        ipc.send(&ClientMsg::Reload);
+    }
+    app.msg = format!("{} now uses {}", cat.key, pick.join(", "));
+    if fetch_missing(app) {
+        app.msg.push_str(" — downloading");
+    }
+}
+
+/// Downloads the enabled lists when any of them is not on disk yet: a list
+/// that is not there blocks nothing, so whatever switched it on has to
+/// fetch it. True when that started a download.
+fn fetch_missing(app: &mut App) -> bool {
+    let missing = app.cfg.blocklist.enabled
+        && blocklist::effective_sources(&app.cfg.blocklist)
+            .iter()
+            .any(|k| blocklist::cached_at(k).is_none());
     if missing {
         update_blocklists(app);
-        app.msg = format!("blocking {} — downloading its lists", cat.key);
-    } else {
-        app.msg = format!("blocking {}", cat.key);
+    }
+    missing
+}
+
+fn config_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(config_path())
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// Picks up a hand edit of rules.toml — a category's lists, a rule, auto
+/// mode — so the screen says what the file says, as the daemon does. A list
+/// the edit switched on is fetched, same as ticking it here would. A file
+/// that no longer parses keeps what is on screen and says why, once.
+fn reload_cfg_if_edited(app: &mut App) {
+    let mtime = config_mtime();
+    if mtime == app.cfg_mtime {
+        return;
+    }
+    app.cfg_mtime = mtime;
+    match Config::try_load() {
+        Ok(cfg) => {
+            let blocklist_changed = cfg.blocklist != app.cfg.blocklist;
+            app.cfg = cfg;
+            if blocklist_changed {
+                fetch_missing(app);
+            }
+        }
+        Err(e) => app.msg = e,
     }
 }
 
@@ -3047,34 +3127,70 @@ fn take_rows(rest: &mut Rect, n: u16) -> Option<Rect> {
 fn draw_categories(f: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let theme = THEMES[app.theme_idx];
     let dim = Style::new().fg(theme.border_idle);
-    let on = app.cfg.blocklist.categories.clone();
+    let cfg = &app.cfg.blocklist;
     let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("block ", half_heading(theme, focused)),
             // app.msg is wiped by the next keypress, so the one long-running
             // thing this pane does says so here instead
-            Span::styled(format!("({} on)", on.len()), dim),
+            Span::styled(format!("({} on)", cfg.categories.len()), dim),
         ]))
         .style(theme.base()),
         head,
     );
+    let key_width = blocklist::CATEGORIES
+        .iter()
+        .map(|c| c.key.len())
+        .max()
+        .unwrap_or(0);
+    // what is left of the row after "[x] ", the name, and two spaces
+    let room = (body.width as usize).saturating_sub(4 + key_width + 2);
     let items: Vec<ListItem> = blocklist::CATEGORIES
         .iter()
         .map(|c| {
-            let ticked = on.iter().any(|k| k == c.key);
+            let ticked = cfg.categories.iter().any(|k| k == c.key);
             let (mark, color) = if ticked {
                 ("[x]", theme.deny)
             } else {
                 ("[ ]", theme.border_idle)
             };
-            ListItem::new(format!("{mark} {}", c.key)).style(Style::new().fg(color))
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{mark} {:<key_width$}  ", c.key),
+                    Style::new().fg(color),
+                ),
+                Span::styled(
+                    lists_label(&blocklist::category_sources(cfg, c.key), room),
+                    dim,
+                ),
+            ]))
         })
         .collect();
     let list = List::new(items)
         .style(theme.base())
         .highlight_style(Style::new().bg(theme.border_idle));
     f.render_stateful_widget(list, body, &mut app.blocking_state);
+}
+
+/// A category's lists in `room` columns: all of them when they fit, else
+/// the first and how many more — cut off mid-name, a list key reads as a
+/// different list.
+fn lists_label(keys: &[String], room: usize) -> String {
+    let all = keys.join(", ");
+    let label = match keys {
+        [] => "no list".into(),
+        [first, rest @ ..] if !rest.is_empty() && all.chars().count() > room => {
+            format!("{first} +{}", rest.len())
+        }
+        _ => all,
+    };
+    if label.chars().count() <= room {
+        return label;
+    }
+    let mut cut: String = label.chars().take(room.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 /// The blocking tab: what is blocked, how well it is going, and the
@@ -3110,8 +3226,8 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
     let columns = if inner.width >= 90 { 3 } else { 1 };
     let (stats_area, cats_area, recent_area) = if columns == 3 {
         let [a, b, c] = Layout::horizontal([
-            Constraint::Percentage(30),
-            Constraint::Percentage(30),
+            Constraint::Percentage(25),
+            Constraint::Percentage(35),
             Constraint::Percentage(40),
         ])
         // columns that touch read as one run-on line
@@ -3637,6 +3753,17 @@ mod tests {
         app.prev_focus = Focus::AppLog;
         leave_tab(&mut app);
         assert!(!in_tab(app.focus));
+    }
+
+    #[test]
+    fn lists_that_do_not_fit_shorten_to_the_first_and_a_count() {
+        let keys: Vec<String> = vec!["a:one".into(), "b:two".into(), "c:three".into()];
+        assert_eq!(lists_label(&keys, 80), "a:one, b:two, c:three");
+        assert_eq!(lists_label(&keys, 10), "a:one +2");
+        // and cut, visibly, when even that does not fit
+        assert_eq!(lists_label(&keys, 5), "a:on…");
+        assert_eq!(lists_label(&keys[..1], 4), "a:o…");
+        assert_eq!(lists_label(&[], 10), "no list");
     }
 
     #[test]
