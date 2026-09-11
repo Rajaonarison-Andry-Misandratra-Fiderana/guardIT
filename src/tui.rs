@@ -1160,12 +1160,9 @@ pub fn run(cfg: Config) {
                 _ => None,
             };
             if let Some(step) = move_focus
-                && !matches!(
-                    app.mode,
-                    Mode::Add(_) | Mode::Preset { .. } | Mode::Filter
-                )
-                // a confirmation is answered before anything else moves
-                && !app.app_log_confirm_flush
+                // a modal open in this pane — text being typed, a confirmation
+                // to answer — takes the keys; nothing else ever holds them
+                && !modal_here(&app)
             {
                 app.focus = step(app.focus);
                 if app.apps_state.selected().is_none() && !app.apps.is_empty() {
@@ -1716,6 +1713,7 @@ fn enter_tab(app: &mut App, tab: Focus) {
         app.prev_focus = app.focus;
     }
     app.focus = tab;
+    drop_modal(app);
 }
 
 /// Back to the grid, from any tab. Clamped rather than trusted: a
@@ -1727,6 +1725,30 @@ fn leave_tab(app: &mut App) {
     } else {
         app.prev_focus
     };
+    drop_modal(app);
+}
+
+/// Closes whatever picker or confirmation is open. It belongs to the pane
+/// that showed it: carried into another tab it cannot be seen there, and
+/// would still hold the keys — B out of the preset picker used to land in
+/// the blocking tab with the picker drawn over it and h/l dead.
+fn drop_modal(app: &mut App) {
+    app.mode = Mode::Browse;
+    app.app_log_confirm_flush = false;
+}
+
+/// Whether a modal is open in the pane that has the focus — the one case
+/// where h/l/Tab belong to it (typing into it, answering it) rather than to
+/// moving. One anywhere else never counts: it is not on screen, so it must
+/// not hold anything.
+fn modal_here(app: &App) -> bool {
+    let typing = match app.mode {
+        Mode::Browse => false,
+        Mode::Add(_) | Mode::Preset { .. } => app.focus == Focus::Rules,
+        // the panes filter_buf types into
+        Mode::Filter => matches!(app.focus, Focus::Apps | Focus::AppLog | Focus::Conflicts),
+    };
+    typing || (app.app_log_confirm_flush && app.focus == Focus::AppLog)
 }
 
 fn open_app_log(app: &mut App, filter: Option<String>) {
@@ -3941,6 +3963,68 @@ mod tests {
             app.blocklist.recent.iter().rev().nth(i).unwrap().name,
             picked
         );
+    }
+
+    #[test]
+    fn a_modal_never_follows_you_into_another_pane() {
+        let mut app = new_app(Config::default());
+        app.focus = Focus::Rules;
+        app.mode = Mode::Preset {
+            sel: 0,
+            filter: String::new(),
+        };
+        assert!(
+            modal_here(&app),
+            "the picker takes the keys where it is open"
+        );
+        enter_tab(&mut app, Focus::Blocking);
+        assert!(
+            matches!(app.mode, Mode::Browse),
+            "B leaves the picker behind"
+        );
+
+        app.focus = Focus::AppLog;
+        app.app_log_confirm_flush = true;
+        assert!(modal_here(&app), "a flush confirmation is answered first");
+        enter_tab(&mut app, Focus::Blocking);
+        assert!(!app.app_log_confirm_flush, "and B drops it");
+
+        // whatever survives, only the pane showing it may be held by it
+        app.mode = Mode::Preset {
+            sel: 0,
+            filter: String::new(),
+        };
+        app.app_log_confirm_flush = true;
+        for focus in [
+            Focus::Apps,
+            Focus::Flow,
+            Focus::Blocking,
+            Focus::BlockedNames,
+            Focus::Conflicts,
+        ] {
+            app.focus = focus;
+            assert!(
+                !modal_here(&app),
+                "{focus:?} held by a modal it does not show"
+            );
+        }
+    }
+
+    #[test]
+    fn h_and_l_always_move_and_undo_each_other() {
+        for focus in [
+            Focus::Rules,
+            Focus::Apps,
+            Focus::Flow,
+            Focus::Blocking,
+            Focus::BlockedNames,
+            Focus::AppLog,
+            Focus::Conflicts,
+        ] {
+            assert_ne!(focus.right(), focus, "l goes nowhere from {focus:?}");
+            assert_eq!(focus.right().left(), focus, "h does not undo l from {focus:?}");
+            assert_eq!(in_tab(focus.right()), in_tab(focus), "l leaves {focus:?}'s tab");
+        }
     }
 
     #[test]

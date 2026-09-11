@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Moving between panes is never held by a modal you cannot see.** A preset picker or an
+  audit-log flush confirmation survived `B` into the blocking tab, where it could not be
+  seen and still swallowed `h`/`l`/`Tab` — the tab's own keys worked, moving did not.
+  Changing tab now closes them, and only a modal open in the focused pane can hold the
+  keys that move.
+
 - **A selected row never hides its dimmed half.** The selection's background is the same
   colour as dimmed text, so a disabled rule, a category's lists or a flow row's reason
   vanished exactly when it was selected. Such text is now redrawn in the normal text
