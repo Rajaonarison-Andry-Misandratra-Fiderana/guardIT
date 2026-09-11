@@ -2174,6 +2174,21 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 
     draw_footer(f, app, outer[2]);
+    lift_invisible_text(f, theme);
+}
+
+/// Text drawn in the colour it sits on, made readable again. A selected
+/// row's background is `border_idle`, which is also the colour of every
+/// dimmed span — a disabled rule, a category's lists, a flow row's reason —
+/// so the quiet half of a row vanished exactly when it was selected. One
+/// pass over the frame rather than a fix in every list: a list added later
+/// is covered too, and the rest of the row keeps its colours.
+fn lift_invisible_text(f: &mut Frame, theme: Theme) {
+    for cell in f.buffer_mut().content.iter_mut() {
+        if cell.bg == theme.border_idle && cell.fg == theme.border_idle {
+            cell.set_fg(theme.fg);
+        }
+    }
 }
 
 /// per-pane identity color, in the same order as Theme.accents
@@ -3926,6 +3941,42 @@ mod tests {
             app.blocklist.recent.iter().rev().nth(i).unwrap().name,
             picked
         );
+    }
+
+    #[test]
+    fn selected_rows_stay_readable_in_every_theme() {
+        for (theme_idx, theme) in THEMES.iter().enumerate() {
+            let mut app = demo_app();
+            app.theme_idx = theme_idx;
+            // the dimmed rows: a disabled rule, a category's lists
+            if let Some(r) = app.cfg.rule.first_mut() {
+                r.enabled = false;
+            }
+            app.state.select(Some(0));
+            let mut term = Terminal::new(TestBackend::new(130, 40)).unwrap();
+            for focus in [
+                Focus::Rules,
+                Focus::Apps,
+                Focus::Flow,
+                Focus::Blocking,
+                Focus::BlockedNames,
+                Focus::AppLog,
+                Focus::Conflicts,
+            ] {
+                app.focus = focus;
+                term.draw(|f| draw(f, &mut app)).unwrap();
+                for cell in &term.backend().buffer().content {
+                    assert!(
+                        cell.symbol() == " "
+                            || cell.bg != theme.border_idle
+                            || cell.fg != theme.border_idle,
+                        "{} in {focus:?}: {:?} drawn on its own colour",
+                        theme.name,
+                        cell.symbol()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

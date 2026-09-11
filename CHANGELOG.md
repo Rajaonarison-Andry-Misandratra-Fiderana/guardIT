@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A selected row never hides its dimmed half.** The selection's background is the same
+  colour as dimmed text, so a disabled rule, a category's lists or a flow row's reason
+  vanished exactly when it was selected. Such text is now redrawn in the normal text
+  colour — in every theme and every list, the rest of the row keeping its colours.
+
 - **Recently blocked names are a list you can act on.** In the blocking tab `h`/`l` (or
   `Tab`) moves from the categories to the names most recently refused; `j/k` walks them,
   newest first, and `y` on one adds it to the allowlist — the entry `guardit blocklist
