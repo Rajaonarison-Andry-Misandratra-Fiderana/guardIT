@@ -150,298 +150,127 @@ command. `notify = false` in `/etc/guardit/rules.toml` turns it off. Peers show 
 `github.com (140.82.121.4)` when the daemon saw the DNS answer (plain DNS only — DoH/DoT
 stay invisible). A hand edit of `rules.toml` is picked up within 5 seconds.
 
-## Auto mode — decide instead of asking
+## Auto mode
 
-Holding the packet and asking is the right shape for a desktop somebody is sitting in
-front of. It is the wrong one for a server, a machine you are ssh'd into, or a laptop
-whose owner has stopped reading the prompts. Auto mode answers the unruled connections
-itself:
+For machines nobody is watching — a server, an ssh session, a laptop whose owner has
+stopped reading the prompts — guardit can decide instead of asking.
 
 ```
-guardit auto on                          # decide; allow what there is no evidence against
-guardit auto on --fallback deny          # decide; refuse what there is no evidence for
-guardit auto on --fallback ask           # decide what it can, still ask about the rest
+guardit auto on                   # decide; allow what there is no evidence against
+guardit auto on --fallback deny   # decide; refuse what there is no evidence for
+guardit auto on --fallback ask    # decide what it can, ask about the rest
 guardit auto off
-guardit auto                             # what it is doing right now
 ```
 
-`m` toggles it in the TUI and the header says which mode is in force. It takes effect
-within seconds under a running daemon — no restart, no held connection dropped.
+`m` toggles it in the TUI. Every verdict rests on **one fact**, printed next to it in the
+flow pane, the audit tab and `guardit log-app`:
 
-Every decision rests on **one fact about the connection**, and that fact is printed next
-to the verdict in the flow pane, the audit tab and `guardit log-app`, so you can read back
-what it did and tell at a glance whether it was right:
+| Fact about the connection | Verdict |
+|---|---|
+| binary gone from disk, or running from `/tmp`, `/dev/shm`, `~/Downloads`… | deny |
+| SMB, RDP, telnet, RPC, port 25… **to the internet** | deny |
+| unsolicited inbound from outside, or to a port nothing listens on | deny |
+| anything else inside your own network | allow |
+| an address this machine has just resolved | allow |
+| a packaged binary (`/usr/bin`, `/nix/store`, flatpak…) on a usual port | allow |
+| none of the above | `--fallback` |
 
-| Fact | Verdict | Reason shown |
-|---|---|---|
-| the binary is gone from disk, or `/proc` says `(deleted)` | deny | `gone from disk` |
-| it runs from `/tmp`, `/dev/shm`, `~/.cache`, `~/Downloads`… | deny | `volatile path` |
-| (flatpaks and snaps are ruled by app id, not by path, so neither of those two applies to them) | | |
-| SMB, RDP, telnet, NetBIOS, RPC, port 25, 4444/5555/6667 — **to the internet** | deny | `smb`, `rdp`, … |
-| unsolicited inbound from outside your network | deny | `inbound from internet` |
-| inbound from your own network, nothing serving that port | deny | `nothing listening` |
-| anything within your own network, either way, to a live port | allow | `local network` |
-| this machine resolved the name, then reached the address that answered | allow | `resolved name` |
-| a packaged binary (`/usr/bin`, `/nix/store`, flatpak…) on a port packaged binaries use | allow | `packaged program` |
-| none of the above | `--fallback` | `no evidence` |
+A fact against a connection always outranks a fact for it. Auto writes no rules and never
+overrides yours: it only judges connections none of your rules cover.
 
-The order is not cosmetic: a fact *against* a connection outranks every reason for it, so
-"it is in `/usr/bin`" never rescues what "it is port 445 to the internet" already
-condemned. A port that is an anomaly across the internet is deliberately fine on your own
-network — that is a NAS or a printer, not an exfiltration route.
-
-Two consequences worth knowing before you turn it on:
-
-- **If this machine sends mail on port 25** — a real MTA, not a desktop mail client — auto
-  will refuse it, because from anything else port 25 outbound is a spam bot. Write the rule
-  (`guardit allow --proto tcp --port 25 --dir out`) and your rule wins.
-- **"Your own network" means private, link-local, loopback and CGNAT addresses.** A machine
-  on your LAN reached over a *global* IPv6 address does not look local by that definition,
-  so unsolicited inbound from it is refused like anything else from a routable address. If
-  your LAN is v6-native, allow what you actually serve — the `in` presets do it in one
-  keystroke.
-
-It writes **no rules**. Each connection is judged again on the evidence current at that
-moment, so a binary replaced ten seconds ago, a name that has just landed on a blocklist,
-or a service that stopped listening all change the answer with nothing to clean up
-afterwards. Your own rules always win: auto only ever looks at connections no rule of
-yours covers, and it runs after the blocklist and `require_resolved` have had their say,
-never before.
-
-`--fallback allow` is the default because the heuristics are written to catch what is
-wrong rather than to recognise everything that is right; on a real machine most of what is
-left over is some program talking to a name it resolved a moment ago. `--fallback deny` is
-the strict reading, and it will break things you then have to allow by hand.
+> [!WARNING]
+> **Mail server?** Outbound port 25 is refused — `guardit allow --proto tcp --port 25 --dir out` fixes it.
+>
+> **IPv6-native LAN?** A neighbour reached over a *global* v6 address counts as internet —
+> allow what you serve (the `in` presets do it in one key).
 
 ### Rules by domain
-
-`--host` restricts a rule to peers the daemon resolved to a given name —
-`example.com` exactly, or `*.example.com` for the domain and everything under it:
 
 ```
 guardit app deny /usr/bin/firefox --host '*.doubleclick.net'
 ```
 
-A host rule is the **most specific** kind, so it beats a per-port rule, which beats the
-app's whole-app default. `allow firefox --port 443` plus `deny firefox --host
-'*.doubleclick.net'` means exactly what it reads: HTTPS everywhere except that domain.
-
-A blocked name is answered **here**, not upstream: the query is refused before it leaves
-the machine, so it costs no round trip and the name is never asked out loud. That needs a
-raw socket to put the answer on the wire as the resolver would have; where one is not
-available, or for an IPv6 query, it falls back to rewriting the reply — same verdict, one
-round trip later.
-
-Blocking happens twice, at both layers. A blocked name's DNS answer is rewritten to
-NXDOMAIN, so nothing connects. And if a connection reaches a blocked name anyway — the app
-had the address cached, or resolved it somewhere unreadable — it is refused at the
-connection too, using the name the tap had already attached to that address. An app rule
-naming the host beats it, and so does the blocklist's own allowlist.
-
-It rides on the same passive DNS tap that puts names in the dashboard, so it inherits its
-limits: a peer whose lookup the daemon never saw has no name, and a rule with `--host`
-can't match it — the connection falls through to the app's port and whole-app rules. An
-app doing DoH/DoT, or answering from its own cache, is invisible to the tap and therefore
-to host rules. Treat them as a convenience over named destinations, not a containment
-boundary — for that, deny the app and allow the ports you mean.
+The most specific kind of rule: **host › port › whole app**. Next to `allow firefox --port
+443`, it means HTTPS everywhere except that domain. It matches names the daemon saw
+resolved, so DoH, DoT or an app's own cache slip past it — a convenience, not a wall.
 
 ## Ads and tracking blocking
 
-Curated domain blocklists, matched against every DNS lookup the daemon sees. A blocked
-name's answer is rewritten to NXDOMAIN, so the app never learns an address and never opens
-the connection.
+Pick **what** to block, guardit picks the lists. A blocked name is answered NXDOMAIN on the
+spot, and a connection to it is refused even if the app had the address cached.
 
-You choose **what** to block, not which list to install. Twelve categories, any number of
-them at once:
-
-| Category | Covers |
-|---|---|
-| `ads` | advertising |
-| `tracking` | trackers and analytics, including CNAME-cloaked first-party ones |
-| `phishing` | malware, phishing, scam, ransomware |
-| `fake` | fake shops, fake streaming, fake support |
-| `crypto` | cryptojacking and mining |
-| `dns-bypass` | DoH, VPN and proxy endpoints that route around filtering |
-| `telemetry` | device and OS telemetry (Windows/Office, Apple, Samsung, Xiaomi, Amazon, TikTok…) |
-| `social` | social networks |
-| `gambling` | gambling and betting |
-| `porn` | pornography |
-| `piracy` | piracy and torrents |
-| `drugs` | drug and vaping shops |
+**Categories:** `ads` · `tracking` · `phishing` · `fake` · `crypto` · `dns-bypass` ·
+`telemetry` · `social` · `gambling` · `porn` · `piracy` · `drugs`
 
 ```
-sudo guardit blocklist on                    # on, covering ads + phishing
-sudo guardit blocklist enable tracking telemetry   # several at a time
-sudo guardit blocklist disable porn gambling
-sudo guardit blocklist update                # download now (the daemon also does it daily)
-guardit blocklist categories                 # the twelve, * = blocked
-guardit blocklist status                     # what's on, domains loaded, how stale
-guardit blocklist check ads.example.com      # blocked? by which list, via which entry
-guardit blocklist log [--n 100] [--filter x] # what has actually been blocked, and for whom
-sudo guardit blocklist allow cdn.example.com # never block this name, nor anything under it
-sudo guardit blocklist off
+sudo guardit blocklist on                          # starts with ads + phishing
+sudo guardit blocklist enable tracking telemetry
+sudo guardit blocklist disable porn
+sudo guardit blocklist allow cdn.example.com       # never block it, nor anything under it
+guardit blocklist categories                       # what each one covers
+guardit blocklist status                           # what's on, domains loaded, how fresh
+guardit blocklist check ads.example.com            # blocked? by which list?
+guardit blocklist log                              # what was blocked, and for whom
 ```
 
-In the TUI, the ads & tracking column carries the same switches: `Tab` to it, `j/k` to a
-category, `space` to block or unblock it. Ticking a category whose lists aren't on disk
-downloads them in the background and the numbers move as soon as they land; `u`
-re-downloads everything. Each category shows the lists it uses beside it, and `s` switches
-it to the next list filed under it — the same as editing its line in `rules.toml` (below).
-
-Behind the categories are 61 lists from HaGeZi, StevenBlack, OISD, AdGuard, The Blocklist
-Project, Peter Lowe, AdAway, Frogeye, Phishing Army, abuse.ch URLhaus, Sinfonietta and Dan
-Pollock. A category turns on one or two well-chosen ones rather than every list that
-touches the subject — the catalogue overlaps heavily, and merging five lists covering the
-same domains costs the memory five times for the coverage once. `guardit blocklist sources`
-lists all 61 grouped by category, and `guardit blocklist enable <list>` adds any of them on
-top of your categories. Downloads live in `/var/lib/guardit/blocklists/`.
-
-A listed name covers everything under it, and an allowlist entry beats the lists and
-rescues its own subtree — so `allow good.example.com` still works with `example.com`
-blocked.
+Behind the categories sit 61 lists — HaGeZi, OISD, StevenBlack, AdGuard, Frogeye,
+URLhaus… — one or two per category (`guardit blocklist sources` shows them all). Swap a
+category's list with `s` in the TUI or in `rules.toml`: a smaller list is less memory, and
+`hagezi:tif` alone is 2.3 million domains.
 
 ### Encrypted DNS
 
-Name-based blocking only reaches lookups the daemon can read. An app doing DNS-over-HTTPS
-or DNS-over-TLS resolves names guardit never sees, and ignores blocking entirely — which
-is most browsers, by default, in some regions.
+Blocking only sees the DNS it can read. So by default guardit refuses DoT/DoQ and the
+known DoH resolvers, and tells Firefox to turn its own DoH off — apps fall back to plain
+DNS. `require_resolved = true` goes further: :443/:853 to a public address no lookup ever
+named is refused. That catches unknown DoH endpoints, and also apps with a hard-coded IP —
+a per-port rule for the app lets it through.
 
-So `block_encrypted_dns` is on by default. It refuses DoT/DoQ (port 853) and port 443 to
-the maintained list of DoH resolver addresses, and returns NXDOMAIN for the DoH bootstrap
-names and for Mozilla's `use-application-dns.net` canary, which is the documented signal
-for Firefox to turn its own DoH off. `reject`, not `drop`, so a client falls back to plain
-DNS immediately instead of hanging. Turn it off with `block_encrypted_dns = false` if you
-run your own encrypted resolver on purpose.
+> [!NOTE]
+> Name-based blocking is an ad and tracker blocker, not a containment boundary. To
+> contain an app, deny it and allow only the ports you mean.
 
-That closes the DoH endpoints anyone has a list of. `require_resolved = true` closes the
-ones nobody does: the daemon already records every address it saw a DNS answer produce, so
-an app connecting to a public address on port 443 or 853 that **no lookup ever named** did
-not learn it from any resolver guardit can read. That is what talking DoH to an unlisted
-endpoint looks like, without needing to know who provides it.
+## Configuration
 
-It is off by default, because an app with an address compiled in is refused on the same
-evidence. A rule naming that exact port beats the policy — `guardit app allow /usr/bin/foo
---port 443` is you saying "yes, this one" — while a whole-app allow does not, since that
-means "may use the network", not "by any means it likes". The daemon says which app it
-refused, once per app, in its log. Local, private, link-local and CGNAT addresses are never
-subject to it, and neither is anything in the first minute after the daemon starts, when
-its name map is empty and every app's own DNS cache is not.
-
-### Configuration
+Everything lives in `/etc/guardit/rules.toml`. Edit it by hand, with the CLI or from the
+TUI — the daemon and an open TUI pick changes up within seconds.
 
 ```toml
 [blocklist]
 enabled = true
 categories = ["ads", "phishing", "telemetry"]
-sources = ["oisd:small"]     # extra lists on top of the categories
+sources = ["oisd:small"]           # extra lists on top of the categories
 allow = ["cdn.example.com"]
 block_encrypted_dns = true
-require_resolved = false     # refuse :443/:853 to addresses no lookup named
-update_hours = 24            # 0 to never auto-update
+require_resolved = false
+update_hours = 24                  # 0 = never
 
-[blocklist.category_sources] # which lists each category means, one line each
-ads = ["hagezi:pro"]
-phishing = ["hagezi:tif.medium"]   # instead of the 2.3M-domain hagezi:tif
-tracking = ["frogeye:multiparty", "frogeye:firstparty"]
-# … every category is written out, with the catalogue's choice, the first time
-# guardit saves the file
-```
+[blocklist.category_sources]       # one line per category, written out on first save
+phishing = ["hagezi:tif.medium"]   # delete a line to get the default back
 
-Edited by hand, by `guardit blocklist` or from the TUI; the daemon picks it up within
-seconds and an open TUI redraws from it. Delete a category's line and it comes back as the
-default. A list named there that is not on disk yet is fetched by the daemon within ten
-minutes, or at once if the TUI is open; a name that is not a list at all shows up as a
-failed download rather than stopping the file from loading. Auto mode lives in the same
-file:
-
-```toml
 [auto]
 enabled = false
-fallback = "allow"           # allow | deny | ask, for connections with no evidence either way
+fallback = "allow"                 # allow | deny | ask
 ```
-
-### What it does not cover
-
-The DNS tap sees plain DNS, over UDP and over TCP. What it cannot see is a channel it
-cannot read: DoH, DoT, or a name an app already had cached — though a connection to a
-blocked name is now refused at the connection too, whichever way the app learnt the
-address. A connection made straight to a hardcoded ip with no lookup at all is only reached
-by `require_resolved`. Blocking works on names, so treat it as an ad and
-tracker blocker, which is what it is, rather than as a containment boundary; for that,
-deny the app and allow the ports you mean.
 
 ## The TUI
 
-Three panes, all about the same thing: the rules the kernel holds, what the machine has
-been doing, and the pane you decide in — whose two halves line up with the two above them.
-The blocklists live in their own tab on `B`, with a headline in the status line so you can
-see at a glance whether they are on.
+`Tab` or `h`/`l` moves between panes, `j`/`k` within one.
 
-`Tab` / `Shift+Tab` moves between the three panes; `h` / `l` moves the same way but counts
-the two halves of Application blocking separately, so `l` out of the app list lands on its
-flow and `l` again leaves the pane. `j` / `k` moves within whatever is focused. The focused
-pane gets a thick border:
-
-| Where | Pane | What it shows | Keys |
-|---|---|---|---|
-| left, top | **System rules** | IP/port `Rule`s (nftables-level) — both directions unless the rule names one | `j/k` move · `space` toggle · `d` delete · `a` add · `p` presets (changes apply immediately) |
-| middle, top | **Top apps** | bar chart of the apps with the most connection attempts, over the whole audit log (reset by `f` flush), each app's total above its bar | informational |
-| bottom | **Application blocking** — one pane, two halves either side of a vertical rule, because you pick an app on the left and rule on what it is doing on the right. The rule is two columns, reproducing the seam where System rules meets Top apps, so each half runs under the pane it belongs with | | |
-| ↳ left half | **apps** | one row per app and its whole-app verdict — `(custom)` when it has rules of its own for particular ports or hosts, with the dot keeping the default's colour | `j/k` select · `a` this app's audit trail · `y`/`n` allow/deny (whole app) · `space` enable/disable · `d` forget this app entirely · `/` filter by name (live; `Enter` keeps it, `Esc` clears) |
-| ↳ right half | **flow** | live connection history for whichever app is selected on the left — a row refused by a blocklist or by `require_resolved` says so, and stays red whatever the app's rules allow | `j/k` select · `a` this app's audit trail · `y`/`n` allow/deny **exactly this row** — this app, this port and direction, and the peer it named (a row whose peer has no resolved name falls back to the port, which is all such a row says) · `Y`/`N` allow/deny **this peer's hostname**, any port (needs a resolved name; uses the exact name — `--host '*.foo.com'` on the CLI for a whole domain) |
-
-### Presets
-
-`p` opens the catalogue over the whole grid. Type to filter, `↑`/`↓` to move, `Enter` to
-add, `Esc` to leave. Each entry says in one line what it actually does to your traffic,
-and one entry can lay down several rules at once — rules you already have are skipped, so
-picking two overlapping presets never leaves duplicates to clean up.
-
-| Group | What is in it |
-|---|---|
-| `off` | the escape hatches — **Allow everything (pause filtering)**, and pausing outbound only |
-| `lan` | your own network: the private ranges, link-local, mDNS/SSDP discovery |
-| `in` | what this machine offers — SSH, web serving, dev servers, SMB, printing, screen sharing, Syncthing, WireGuard, each scoped to the LAN where that is the only place it belongs |
-| `out` | what it may reach — stop being asked about DNS/NTP, the web, mail, SSH and git |
-| `harden` | ports worth shutting on principle: remote control, known implant ports, DoT, discovery leaks |
-| `bundle` | a whole posture in one keystroke: laptop on untrusted wifi, web server, home desktop, paranoid |
-
-Two things worth knowing before picking one. **Allow everything (pause filtering)** is an
-unqualified `accept` above the queue lines in both chains, so nothing reaches the daemon
-while it is on: no per-app matching, no prompts, no connection-layer blocking. Reach for it
-when guardit is in the way of something and you need the machine working now — it is
-better than `systemctl stop guardit`, which leaves the queues loaded with nothing listening
-on them and so takes the network down instead of opening it. And every other `allow`
-preset is the same mechanism in miniature: a kernel-level accept means the daemon never
-sees that traffic, so **per-app rules stop applying to it**. That is the point of "stop
-asking about the web" and a nasty surprise if you did not want it, which is why each
-preset says so in its own line. Presets are ordinary rules, so `space` switches any of
-them off again.
-
-`B` opens the blocking tab: the figures, the twelve category switches, and the names most
-recently blocked. `j/k` moves, `space` blocks or unblocks a category — ticking one whose
-lists aren't on disk downloads them there and then, in the background — and `u`
-re-downloads the lot. Each category shows its lists beside it, and `s` switches the selected
-one to the next list filed under it, the catalogue's choice first — the same line you would
-edit by hand. `h`/`l` (or `Tab`) moves over to the names recently blocked: newest first,
-`j/k` through them, and `y` on one never blocks it again, nor anything under it — the
-same allowlist entry `guardit blocklist allow` writes. `q`/`B` goes back.
-
-`A` opens the audit tab, holding the two "what has already happened" views side by side —
-`Tab` switches between them, `q`/`A` goes back. A pane's own `a` opens it scoped to the
-selected app: both halves then show only that app, its trail and its ports.
-
-| Pane | What it shows | Keys |
+| Pane | Shows | Keys |
 |---|---|---|
-| **Audit** | the full unthrottled trail from `history.jsonl` | `j/k` move · `/` filter by port, ip or name (live; a number is matched against the port, anything else as a substring of the address, resolved name or app path) · `f` flush with confirm |
-| **Listening ports** | every LISTEN/bound local socket, who owns it, and real bind conflicts (rare — the kernel already prevents most) | `j/k` select · `/` filter by port, address or owner · `a` this app's audit trail · `y`/`n` allow/deny **this port only** |
+| **System rules** | IP/port rules | `space` toggle · `a` add · `d` delete · `p` presets |
+| **Top apps** | who connects the most | — |
+| **Apps** | one row per app | `y`/`n` allow/deny · `space` enable · `d` forget · `/` filter · `a` audit |
+| **Flow** | the selected app's connections | `y`/`n` this exact row · `Y`/`N` this hostname · `a` audit |
 
-Other keys: `t` cycles color theme (remembered across restarts), `q` quits.
+| Tab | Shows | Keys |
+|---|---|---|
+| `B` blocking | figures, category switches, recently blocked names | `space` block · `s` switch list · `u` update · `h`/`l` to the names · `y` never block this name |
+| `A` audit | the full audit trail, listening ports | `/` filter · `f` flush · `y`/`n` allow/deny a port |
+| `p` presets | ready-made rules, grouped | type to filter · `Enter` add · `Esc` close |
 
-Downloading lists and loading the ruleset into the kernel both run off the draw loop, with
-a spinner segment at the far right of the status line saying which is happening — a
-category can pull half a dozen lists and one of them is 39 MB, and a frozen screen for a
-minute is indistinguishable from a crash.
+`m` auto mode · `t` theme · `q` back, or quit.
 
 ## License
 
