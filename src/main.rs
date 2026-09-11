@@ -529,7 +529,14 @@ fn set_app_rule(action: RuleAction, args: AppRuleArgs) {
             true
         }
         Err(_) => {
-            daemon::upsert_rule(&exe, args.port, direction, action, expires, args.host.clone());
+            daemon::upsert_rule(
+                &exe,
+                args.port,
+                direction,
+                action,
+                expires,
+                args.host.clone(),
+            );
             false
         }
     };
@@ -686,7 +693,9 @@ fn blocklist_cmd(cfg: Config, sub: BlocklistCmd) {
             } else {
                 println!("blocking on");
             }
-            println!("run `guardit blocklist update` to download the lists now (the daemon does it on its own within 10 minutes)");
+            println!(
+                "run `guardit blocklist update` to download the lists now (the daemon does it on its own within 10 minutes)"
+            );
         }
         BlocklistCmd::Off => {
             save_blocklist(cfg, |b| b.enabled = false);
@@ -847,7 +856,9 @@ fn reset_everything(cfg: &Config, yes: bool) {
         .map(|d| d.flatten().count())
         .unwrap_or(0);
     let lines = |p: std::path::PathBuf| {
-        fs::read_to_string(p).map(|t| t.lines().count()).unwrap_or(0)
+        fs::read_to_string(p)
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
     };
     println!("this will delete:");
     println!("  {} ip/port rule(s)", cfg.rule.len());

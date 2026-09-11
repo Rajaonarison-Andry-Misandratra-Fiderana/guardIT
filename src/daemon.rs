@@ -373,9 +373,9 @@ fn dns_loop() -> std::io::Result<()> {
                 // only udp left a way past the lists that cost nothing to use
                 Some(pkt) if pkt.proto == 6 && pkt.src_port == 53 => {
                     DNS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    match tcp_dns_span(payload, pkt.l4).and_then(|(dns, len)| {
-                        payload.get(dns..dns + len)
-                    }) {
+                    match tcp_dns_span(payload, pkt.l4)
+                        .and_then(|(dns, len)| payload.get(dns..dns + len))
+                    {
                         Some(dns) => match dns_question(dns) {
                             Some((name, q_end)) if BLOCKLIST.read().unwrap().blocked(&name) => {
                                 match nxdomain_reply_tcp(payload, pkt.l4, q_end) {
@@ -773,12 +773,7 @@ fn nxdomain_reply_tcp(payload: &[u8], l4: usize, q_end: usize) -> Option<Vec<u8>
     out[l4 + 16..l4 + 18].copy_from_slice(&[0, 0]);
     let tcp_len = (out.len() - l4) as u16;
     let ck = match payload[0] >> 4 {
-        4 => ones_complement(&[
-            &out[12..20],
-            &[0, 6],
-            &tcp_len.to_be_bytes(),
-            &out[l4..],
-        ]),
+        4 => ones_complement(&[&out[12..20], &[0, 6], &tcp_len.to_be_bytes(), &out[l4..]]),
         6 => ones_complement(&[
             &out[8..40],
             &(tcp_len as u32).to_be_bytes(),
@@ -830,18 +825,18 @@ fn nxdomain_reply(payload: &[u8], l4: usize, q_end: usize) -> Option<Vec<u8>> {
             let ip_ck = ones_complement(&[&out[..l4]]);
             out[10..12].copy_from_slice(&ip_ck.to_be_bytes());
             ones_complement(&[
-                &out[12..20],                 // src + dst
-                &[0, 17],                     // zero + protocol
-                &udp_len.to_be_bytes(),       // udp length, again
+                &out[12..20],           // src + dst
+                &[0, 17],               // zero + protocol
+                &udp_len.to_be_bytes(), // udp length, again
                 &out[l4..l4 + udp_len as usize],
             ])
         }
         6 => {
             out[4..6].copy_from_slice(&udp_len.to_be_bytes()); // payload length
             ones_complement(&[
-                &out[8..40],                            // src + dst
-                &(udp_len as u32).to_be_bytes(),        // upper-layer length
-                &[0, 0, 0, 17],                         // zeroes + next header
+                &out[8..40],                     // src + dst
+                &(udp_len as u32).to_be_bytes(), // upper-layer length
+                &[0, 0, 0, 17],                  // zeroes + next header
                 &out[l4..l4 + udp_len as usize],
             ])
         }
@@ -1083,7 +1078,11 @@ pub fn read_blocked(limit: usize, filter: Option<&str>) -> Vec<ipc::Blocked> {
 fn note_blocked(name: &str, exe: Option<String>) {
     BLOCKED_TOTAL.fetch_add(1, Ordering::Relaxed);
     if let Some(exe) = &exe {
-        *BLOCKED_BY_APP.lock().unwrap().entry(exe.clone()).or_default() += 1;
+        *BLOCKED_BY_APP
+            .lock()
+            .unwrap()
+            .entry(exe.clone())
+            .or_default() += 1;
     }
     let entry = ipc::Blocked {
         ts: now_ts(),
@@ -1571,9 +1570,9 @@ fn blocklist_update_loop() {
         if cfg.blocklist.block_encrypted_dns {
             keys.push(blocklist::DOH_IPS_KEY.to_string());
         }
-        let due = keys.iter().any(|k| {
-            blocklist::cached_at(k).is_none_or(|t| now.saturating_sub(t) >= max_age)
-        });
+        let due = keys
+            .iter()
+            .any(|k| blocklist::cached_at(k).is_none_or(|t| now.saturating_sub(t) >= max_age));
         if !due {
             continue;
         }
@@ -1589,14 +1588,14 @@ fn blocklist_update_loop() {
             }
         }
         reload_blocklist(&cfg);
-    reload_auto(&cfg);
-    if let Some(f) = cfg.auto.active() {
-        eprintln!(
-            "guardit daemon: auto mode on — unruled connections are decided here, \
+        reload_auto(&cfg);
+        if let Some(f) = cfg.auto.active() {
+            eprintln!(
+                "guardit daemon: auto mode on — unruled connections are decided here, \
              fallback {}",
-            f.as_str()
-        );
-    }
+                f.as_str()
+            );
+        }
         // the DoH addresses are compiled into the nft ruleset, not read at
         // match time, so a new set of them only takes effect on a reload
         if doh_ips_changed && let Err(e) = crate::ruleset::apply(&cfg) {
@@ -1915,8 +1914,7 @@ fn record_verdict(
 /// the scan loop picks it up within seconds (`reload_auto_if_changed`).
 /// Restarting the daemon to change it would mean dropping every connection
 /// held open at that moment, which is a strange price for turning a mode on.
-static AUTO: LazyLock<RwLock<Option<crate::auto::Fallback>>> =
-    LazyLock::new(|| RwLock::new(None));
+static AUTO: LazyLock<RwLock<Option<crate::auto::Fallback>>> = LazyLock::new(|| RwLock::new(None));
 
 pub fn reload_auto(cfg: &Config) {
     *AUTO.write().unwrap() = cfg.auto.active();
@@ -2097,39 +2095,42 @@ fn queue_loop(
         // for someone to answer. It sits *after* the blocklist and
         // require_resolved checks above on purpose — those are already
         // decisions, and re-deciding them would be a way to widen them.
-        let automatic = matched.is_none().then(|| {
-            let fallback = *AUTO.read().unwrap();
-            fallback.and_then(|fallback| {
-                let facts = crate::auto::Facts {
-                    exe: &exe,
-                    dir,
-                    port: rule_port,
-                    peer: peer_addr,
-                    peer_name: peer_name.as_deref(),
-                    // proto as well as port: a UDP service bound to 5353
-                    // says nothing about whether a TCP connection to 5353
-                    // has anywhere to land
-                    listening: listening
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .any(|e| e.port == rule_port && e.proto == proto_name(pkt.proto)),
-                    on_disk: crate::auto::on_disk(&exe),
-                };
-                match crate::auto::decide(&facts) {
-                    Some(d) => Some((d.action, d.why)),
-                    // nothing to judge it on. `Ask` is the one fallback that
-                    // is not a verdict: it hands the connection back to the
-                    // prompt below, so auto mode has only ever saved you the
-                    // questions it could answer itself
-                    None => match fallback {
-                        crate::auto::Fallback::Ask => None,
-                        crate::auto::Fallback::Allow => Some((Action::Allow, "no evidence")),
-                        crate::auto::Fallback::Deny => Some((Action::Deny, "no evidence")),
-                    },
-                }
+        let automatic = matched
+            .is_none()
+            .then(|| {
+                let fallback = *AUTO.read().unwrap();
+                fallback.and_then(|fallback| {
+                    let facts = crate::auto::Facts {
+                        exe: &exe,
+                        dir,
+                        port: rule_port,
+                        peer: peer_addr,
+                        peer_name: peer_name.as_deref(),
+                        // proto as well as port: a UDP service bound to 5353
+                        // says nothing about whether a TCP connection to 5353
+                        // has anywhere to land
+                        listening: listening
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|e| e.port == rule_port && e.proto == proto_name(pkt.proto)),
+                        on_disk: crate::auto::on_disk(&exe),
+                    };
+                    match crate::auto::decide(&facts) {
+                        Some(d) => Some((d.action, d.why)),
+                        // nothing to judge it on. `Ask` is the one fallback that
+                        // is not a verdict: it hands the connection back to the
+                        // prompt below, so auto mode has only ever saved you the
+                        // questions it could answer itself
+                        None => match fallback {
+                            crate::auto::Fallback::Ask => None,
+                            crate::auto::Fallback::Allow => Some((Action::Allow, "no evidence")),
+                            crate::auto::Fallback::Deny => Some((Action::Deny, "no evidence")),
+                        },
+                    }
+                })
             })
-        }).flatten();
+            .flatten();
 
         let verdict = match (matched, automatic) {
             (_, Some((action, why))) => {
@@ -2532,7 +2533,11 @@ mod tests {
             got.iter().map(|e| e.exe.as_str()).collect::<Vec<_>>(),
             ["/c", "/d"],
         );
-        assert_eq!(tail_entries(text.as_bytes(), 99, None).len(), 4, "fewer than asked for");
+        assert_eq!(
+            tail_entries(text.as_bytes(), 99, None).len(),
+            4,
+            "fewer than asked for"
+        );
         assert!(tail_entries(text.as_bytes(), 0, None).is_empty());
     }
 
@@ -2551,7 +2556,10 @@ mod tests {
         let mut text = history_lines(&["/a", "/b"]);
         text.push_str("\n{\"exe\": \"/c\", \"dir");
         let got = tail_entries(text.as_bytes(), 10, None);
-        assert_eq!(got.iter().map(|e| e.exe.as_str()).collect::<Vec<_>>(), ["/a", "/b"]);
+        assert_eq!(
+            got.iter().map(|e| e.exe.as_str()).collect::<Vec<_>>(),
+            ["/a", "/b"]
+        );
     }
 
     /// The fast path guesses which process to check first; it must never
@@ -2576,7 +2584,10 @@ mod tests {
             "the guess is checked, not trusted"
         );
         // and having answered, the process that did own it is remembered
-        assert_eq!(RECENT.lock().unwrap().front().copied(), Some(std::process::id()));
+        assert_eq!(
+            RECENT.lock().unwrap().front().copied(),
+            Some(std::process::id())
+        );
     }
 
     /// the one check that fails if inode_pid_map stops agreeing with the
@@ -2638,16 +2649,33 @@ mod tests {
         // getting this wrong takes the machine off its own network, so it is
         // spelled out rather than trusted to the std helpers alone
         for local in [
-            "127.0.0.1", "10.1.2.3", "192.168.1.1", "172.16.0.1", "169.254.1.1",
-            "100.64.0.1", "224.0.0.1", "0.0.0.0", "255.255.255.255",
-            "::1", "fe80::1", "fd00::1", "ff02::1", "::",
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "224.0.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "ff02::1",
+            "::",
         ] {
             assert!(
                 is_local_address(&local.parse().unwrap()),
                 "{local} must never be refused"
             );
         }
-        for remote in ["1.1.1.1", "140.82.121.4", "8.8.8.8", "2606:4700::1111", "2001:db8::1"] {
+        for remote in [
+            "1.1.1.1",
+            "140.82.121.4",
+            "8.8.8.8",
+            "2606:4700::1111",
+            "2001:db8::1",
+        ] {
             assert!(!is_local_address(&remote.parse().unwrap()), "{remote}");
         }
         // 172.16/12 stops at 172.31; 172.32 is public
@@ -2679,7 +2707,13 @@ mod tests {
             "ssh to an address from a config file is ordinary"
         );
         assert!(
-            !unresolved_destination(old, &"192.168.1.10".parse().unwrap(), 443, Direction::Out, None),
+            !unresolved_destination(
+                old,
+                &"192.168.1.10".parse().unwrap(),
+                443,
+                Direction::Out,
+                None
+            ),
             "the local network is reached without asking anyone"
         );
         assert!(
@@ -2735,7 +2769,10 @@ mod tests {
         let soa = &dns[q_end..];
         assert_eq!(&soa[0..2], &[0xC0, 0x0C], "owner is the question name");
         assert_eq!(&soa[2..6], &[0, 6, 0, 1], "SOA IN");
-        assert_eq!(u32::from_be_bytes(soa[6..10].try_into().unwrap()), NXDOMAIN_TTL);
+        assert_eq!(
+            u32::from_be_bytes(soa[6..10].try_into().unwrap()),
+            NXDOMAIN_TTL
+        );
         let rdlen = u16::from_be_bytes([soa[10], soa[11]]) as usize;
         assert_eq!(soa.len(), 12 + rdlen, "rdlength matches what follows it");
         // MINIMUM, the last field, is the negative ttl resolvers actually use
@@ -2761,12 +2798,7 @@ mod tests {
         assert_eq!(ones_complement(&[&out[..20]]), 0, "ip header checksum");
         let udp_len = (out.len() - 20) as u16;
         assert_eq!(
-            ones_complement(&[
-                &out[12..20],
-                &[0, 17],
-                &udp_len.to_be_bytes(),
-                &out[20..],
-            ]),
+            ones_complement(&[&out[12..20], &[0, 17], &udp_len.to_be_bytes(), &out[20..],]),
             0,
             "udp checksum"
         );
@@ -2812,7 +2844,11 @@ mod tests {
                 p.len(),
                 "shortening a segment would put every sequence number after it out by the difference"
             );
-            assert_eq!(&out[at - 2..at], &p[at - 2..at], "the length prefix is untouched");
+            assert_eq!(
+                &out[at - 2..at],
+                &p[at - 2..at],
+                "the length prefix is untouched"
+            );
 
             let dns = &out[at..at + len];
             assert_eq!(dns[3] & 0x0F, 3, "NXDOMAIN");
@@ -2840,7 +2876,10 @@ mod tests {
             0,
             "no room, so no SOA"
         );
-        assert!(out[at + len - 4..at + len].iter().all(|&b| b == 0), "tail zeroed");
+        assert!(
+            out[at + len - 4..at + len].iter().all(|&b| b == 0),
+            "tail zeroed"
+        );
 
         let (_, out, at, _) = rewritten_tcp(200);
         assert_eq!(
@@ -2908,7 +2947,10 @@ mod tests {
 
         // lengths and both checksums, or no stack will accept it
         assert_eq!(u16::from_be_bytes([out[2], out[3]]) as usize, out.len());
-        assert_eq!(u16::from_be_bytes([out[24], out[25]]) as usize, out.len() - 20);
+        assert_eq!(
+            u16::from_be_bytes([out[24], out[25]]) as usize,
+            out.len() - 20
+        );
         assert_eq!(ones_complement(&[&out[..20]]), 0, "ip checksum");
         let udp_len = (out.len() - 20) as u16;
         assert_eq!(

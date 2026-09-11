@@ -22,9 +22,9 @@ use ratatui::{Frame, Terminal};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Read as _, stdout};
-use std::sync::mpsc;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::Instant;
 
 /// covers the whole interface, not just a couple of accent colors: panel
@@ -1171,16 +1171,12 @@ pub fn run(cfg: Config) {
                 }
                 continue;
             }
-            if key.code == KeyCode::Char('t')
-                && !matches!(app.mode, Mode::Add(_) | Mode::Filter)
-            {
+            if key.code == KeyCode::Char('t') && !matches!(app.mode, Mode::Add(_) | Mode::Filter) {
                 app.theme_idx = (app.theme_idx + 1) % THEMES.len();
                 save_theme_idx(app.theme_idx);
                 continue;
             }
-            if key.code == KeyCode::Char('B')
-                && !matches!(app.mode, Mode::Add(_) | Mode::Filter)
-            {
+            if key.code == KeyCode::Char('B') && !matches!(app.mode, Mode::Add(_) | Mode::Filter) {
                 if in_blocking_tab(app.focus) {
                     leave_tab(&mut app);
                 } else {
@@ -1192,18 +1188,14 @@ pub fn run(cfg: Config) {
             // so it toggles from anywhere. Only on and off: which fallback
             // it uses is a decision to make once in the config, not one to
             // cycle past by accident on the way to turning it off
-            if key.code == KeyCode::Char('m')
-                && !matches!(app.mode, Mode::Add(_) | Mode::Filter)
-            {
+            if key.code == KeyCode::Char('m') && !matches!(app.mode, Mode::Add(_) | Mode::Filter) {
                 let enabled = !app.cfg.auto.enabled;
                 app.cfg = Config::update(|c| c.auto.enabled = enabled);
                 continue;
             }
             // jumpable to from anywhere, same idea as `t` — the audit tab is
             // its own tab, not nested under any pane's local keys
-            if key.code == KeyCode::Char('A')
-                && !matches!(app.mode, Mode::Add(_) | Mode::Filter)
-            {
+            if key.code == KeyCode::Char('A') && !matches!(app.mode, Mode::Add(_) | Mode::Filter) {
                 if in_log_tab(app.focus) {
                     close_app_log(&mut app);
                 } else {
@@ -1233,9 +1225,7 @@ pub fn run(cfg: Config) {
                         match key.code {
                             KeyCode::Esc => app.mode = Mode::Browse,
                             KeyCode::Down => *sel = if len == 0 { 0 } else { (*sel + 1) % len },
-                            KeyCode::Up => {
-                                *sel = if len == 0 { 0 } else { (*sel + len - 1) % len }
-                            }
+                            KeyCode::Up => *sel = if len == 0 { 0 } else { (*sel + len - 1) % len },
                             KeyCode::Backspace => {
                                 filter.pop();
                                 *sel = 0;
@@ -1923,8 +1913,8 @@ fn effective_status(e: &FlowWire, app_rules: &[AppRule]) -> FlowStatus {
         Some(e.direction),
         e.peer_name.as_deref(),
     )
-        .map(|r| FlowStatus::from(r.action))
-        .unwrap_or(e.status)
+    .map(|r| FlowStatus::from(r.action))
+    .unwrap_or(e.status)
 }
 
 /// force this app to allow/deny everything, whether or not it already had a
@@ -2156,9 +2146,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         // its own tab over the whole grid area: the audit trail and the
         // listening ports, which answer the same "what has been going on"
         // question and are both wider than a grid cell
-        let cols =
-            Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)])
-                .split(outer[1]);
+        let cols = Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)])
+            .split(outer[1]);
         draw_app_log(f, app, cols[0]);
         draw_conflicts(f, app, cols[1]);
     } else {
@@ -2176,8 +2165,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             Layout::vertical([Constraint::Percentage(46), Constraint::Percentage(54)])
                 .areas(outer[1]);
         let [rules, top_apps] =
-            Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)])
-                .areas(top);
+            Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)]).areas(top);
         draw_rules(f, app, rules);
         draw_top_apps(f, app, top_apps);
         // the divider reproduces the seam above it — the two adjacent border
@@ -2242,7 +2230,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             // 10 frames at ~100ms, from the job's own clock — without it a
             // minute-long download is indistinguishable from a freeze
             const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let frame = SPINNER[(busy.started.elapsed().as_millis() / 100) as usize % SPINNER.len()];
+            let frame =
+                SPINNER[(busy.started.elapsed().as_millis() / 100) as usize % SPINNER.len()];
             let text = format!(" {frame} {}… ", busy.label);
             let w = (text.chars().count() as u16).min(area.width);
             let [keys, seg] =
@@ -2264,7 +2253,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if matches!(app.mode, Mode::Filter) {
         let (label, buf) = match app.focus {
             Focus::AppLog => (" FILTER AUDIT — port, ip or name ", &app.log_filter),
-            Focus::Conflicts => (" FILTER PORTS — port, address or app ", &app.listening_filter),
+            Focus::Conflicts => (
+                " FILTER PORTS — port, address or app ",
+                &app.listening_filter,
+            ),
             _ => (" FILTER APPS ", &app.apps_filter),
         };
         let spans = vec![
@@ -2625,7 +2617,11 @@ fn draw_presets(f: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default().with_selected(Some(*sel));
     let list = List::new(items)
         .style(theme.base())
-        .highlight_style(Style::new().bg(theme.border_idle).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::new()
+                .bg(theme.border_idle)
+                .add_modifier(Modifier::BOLD),
+        )
         // a background alone is easy to lose in a light theme, and this is
         // the one list where picking the wrong row writes rules
         .highlight_symbol("\u{203a} ")
@@ -2766,8 +2762,7 @@ fn draw_apps(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!("apps — /{} ({} shown)", app.apps_filter, app.apps.len())
     };
-    let [head, body] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     f.render_widget(
         Paragraph::new(heading).style(half_heading(theme, app.focus == Focus::Apps)),
         head,
@@ -3158,9 +3153,11 @@ fn update_blocklists(app: &mut App) {
 /// instant — and the config on disk is already the source of truth by the
 /// time this runs, so nothing depends on it having finished.
 fn apply_ruleset(app: &mut App, cfg: Config) {
-    start_busy(app, "applying ruleset", move || match ruleset::apply(&cfg) {
-        Ok(()) => String::new(),
-        Err(e) => format!("apply failed: {e}"),
+    start_busy(app, "applying ruleset", move || {
+        match ruleset::apply(&cfg) {
+            Ok(()) => String::new(),
+            Err(e) => format!("apply failed: {e}"),
+        }
     });
 }
 
@@ -3313,8 +3310,7 @@ fn draw_blocking(f: &mut Frame, app: &mut App, area: Rect) {
         .areas(inner);
         (a, b, Some(c))
     } else {
-        let [a, b] =
-            Layout::vertical([Constraint::Length(11), Constraint::Min(0)]).areas(inner);
+        let [a, b] = Layout::vertical([Constraint::Length(11), Constraint::Min(0)]).areas(inner);
         (a, b, None)
     };
 
@@ -3604,8 +3600,7 @@ fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
                 e.direction.as_str(),
                 e.port.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
             );
-            let room = width
-                .saturating_sub(head.chars().count() + reason.chars().count());
+            let room = width.saturating_sub(head.chars().count() + reason.chars().count());
             let peer = e.peer();
             let peer = if peer.chars().count() > room && room > 1 {
                 format!("{}…", peer.chars().take(room - 1).collect::<String>())
@@ -3629,8 +3624,7 @@ fn draw_flow(f: &mut Frame, app: &mut App, area: Rect) {
             }
         })
         .collect();
-    let [head, body] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     f.render_widget(
         Paragraph::new(heading).style(half_heading(theme, app.focus == Focus::Flow)),
         head,
@@ -3691,10 +3685,7 @@ fn draw_conflicts(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             format!(" /{}", app.listening_filter)
         };
-        format!(
-            "listening ports{scope}{needle} ({})",
-            app.listening.len()
-        )
+        format!("listening ports{scope}{needle} ({})", app.listening.len())
     };
     let list = List::new(items)
         .style(theme.base())
@@ -3770,9 +3761,16 @@ mod tests {
     fn filtering_is_case_insensitive_and_matches_the_note_too() {
         assert!(!matching_presets("SSH").is_empty());
         assert!(!matching_presets("ssh").is_empty());
-        assert!(!matching_presets("spam").is_empty(), "a word only the notes use");
+        assert!(
+            !matching_presets("spam").is_empty(),
+            "a word only the notes use"
+        );
         assert!(matching_presets("zzzz").is_empty());
-        assert_eq!(matching_presets("").len(), PRESETS.len(), "no filter, no narrowing");
+        assert_eq!(
+            matching_presets("").len(),
+            PRESETS.len(),
+            "no filter, no narrowing"
+        );
     }
 
     /// picking a bundle twice, or two bundles that overlap, must not leave a
@@ -3807,7 +3805,11 @@ mod tests {
                 })
             })
             .count();
-        assert_eq!(dups, bundle.specs.len(), "every rule reads as already present");
+        assert_eq!(
+            dups,
+            bundle.specs.len(),
+            "every rule reads as already present"
+        );
     }
 
     fn demo_flow(port: u16, ip: &str, name: Option<&str>, exe: &str) -> FlowWire {
@@ -3856,7 +3858,7 @@ mod tests {
             by_app: vec![("/usr/bin/firefox".into(), 2_301)],
             updated_at: Some(now_ts() - 7200),
         };
-            app.cfg.rule = vec![Rule {
+        app.cfg.rule = vec![Rule {
             id: 1,
             action: Action::Allow,
             proto: Proto::Tcp,
@@ -4022,8 +4024,16 @@ mod tests {
             Focus::Conflicts,
         ] {
             assert_ne!(focus.right(), focus, "l goes nowhere from {focus:?}");
-            assert_eq!(focus.right().left(), focus, "h does not undo l from {focus:?}");
-            assert_eq!(in_tab(focus.right()), in_tab(focus), "l leaves {focus:?}'s tab");
+            assert_eq!(
+                focus.right().left(),
+                focus,
+                "h does not undo l from {focus:?}"
+            );
+            assert_eq!(
+                in_tab(focus.right()),
+                in_tab(focus),
+                "l leaves {focus:?}'s tab"
+            );
         }
     }
 
@@ -4120,7 +4130,10 @@ mod tests {
             "a global cap would have evicted the quiet app entirely"
         );
         assert_eq!(
-            app.flow.iter().filter(|e| e.exe.ends_with("chatty")).count(),
+            app.flow
+                .iter()
+                .filter(|e| e.exe.ends_with("chatty"))
+                .count(),
             FLOW_PER_APP
         );
         // and it kept the newest of the chatty ones, not the oldest
@@ -4158,7 +4171,15 @@ mod tests {
         assert_eq!(group(1_234), "1 234");
         assert_eq!(group(1_234_567), "1 234 567");
         // the bar labels have four columns at most, whatever the count
-        for n in [0, 9_999, 10_000, 999_999, 1_000_000, 9_999_999_999, u64::MAX] {
+        for n in [
+            0,
+            9_999,
+            10_000,
+            999_999,
+            1_000_000,
+            9_999_999_999,
+            u64::MAX,
+        ] {
             assert!(compact(n).len() <= 5, "{n} -> {}", compact(n));
         }
         assert_eq!(compact(999), "999");
@@ -4268,16 +4289,3 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-

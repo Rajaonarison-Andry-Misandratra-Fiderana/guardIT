@@ -562,7 +562,11 @@ mod tests {
         a.enabled = true;
         assert_eq!(a.active(), Some(crate::auto::Fallback::Allow));
         a.fallback = crate::auto::Fallback::Ask;
-        assert_eq!(a.active(), Some(crate::auto::Fallback::Ask), "on, still asking");
+        assert_eq!(
+            a.active(),
+            Some(crate::auto::Fallback::Ask),
+            "on, still asking"
+        );
     }
 
     /// a config written before `[auto]` existed has to keep meaning what it
@@ -640,12 +644,21 @@ mod tests {
         assert!(host_matches("*.foo.com", Some("a.foo.com")));
         assert!(host_matches("*.foo.com", Some("deep.a.foo.com")));
         assert!(host_matches("*.foo.com", Some("foo.com")), "apex included");
-        assert!(host_matches("*.foo.com", Some("FOO.COM")), "case-insensitive");
+        assert!(
+            host_matches("*.foo.com", Some("FOO.COM")),
+            "case-insensitive"
+        );
         assert!(host_matches("*.foo.com", Some("foo.com.")), "trailing dot");
         assert!(!host_matches("*.foo.com", Some("evilfoo.com")));
         assert!(!host_matches("*.foo.com", Some("foo.com.evil.net")));
-        assert!(!host_matches("foo.com", Some("a.foo.com")), "exact means exact");
-        assert!(!host_matches("*.foo.com", None), "unresolved peer matches nothing");
+        assert!(
+            !host_matches("foo.com", Some("a.foo.com")),
+            "exact means exact"
+        );
+        assert!(
+            !host_matches("*.foo.com", None),
+            "unresolved peer matches nothing"
+        );
     }
 
     #[test]
@@ -675,7 +688,13 @@ mod tests {
             Some(Action::Allow)
         );
         assert_eq!(
-            act(super::match_rule(&rules, "/usr/bin/a", Some(443), None, None)),
+            act(super::match_rule(
+                &rules,
+                "/usr/bin/a",
+                Some(443),
+                None,
+                None
+            )),
             Some(Action::Allow),
             "an unresolved peer falls through to the port rule"
         );
@@ -700,10 +719,24 @@ mod tests {
 
     #[test]
     fn host_must_be_a_hostname_or_wildcard() {
-        for ok in ["example.com", "*.example.com", "a-b_c.example.com", "localhost"] {
+        for ok in [
+            "example.com",
+            "*.example.com",
+            "a-b_c.example.com",
+            "localhost",
+        ] {
             assert!(validate_host(ok).is_ok(), "{ok}");
         }
-        for bad in ["", "*.", "*", "ex ample.com", "a//b", "a..b", ".example.com", "http://x"] {
+        for bad in [
+            "",
+            "*.",
+            "*",
+            "ex ample.com",
+            "a//b",
+            "a..b",
+            ".example.com",
+            "http://x",
+        ] {
             assert!(validate_host(bad).is_err(), "{bad}");
         }
     }

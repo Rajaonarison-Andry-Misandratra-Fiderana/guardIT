@@ -182,20 +182,20 @@ const HOSTILE_OUTBOUND: [(u16, &str); 9] = [
 /// talking on this port" is unremarkable enough that asking a human adds
 /// nothing.
 const ORDINARY: [u16; 14] = [
-    22,  // ssh
-    53,  // dns
-    67,  // dhcp
-    68,  // dhcp
-    80,  // http
-    123, // ntp
-    443, // https
-    465, // smtps
-    587, // submission
-    993, // imaps
-    995, // pop3s
-    5353, // mdns
+    22,    // ssh
+    53,    // dns
+    67,    // dhcp
+    68,    // dhcp
+    80,    // http
+    123,   // ntp
+    443,   // https
+    465,   // smtps
+    587,   // submission
+    993,   // imaps
+    995,   // pop3s
+    5353,  // mdns
     11371, // hkp, keyservers
-    9418, // git
+    9418,  // git
 ];
 
 fn under(path: &str, prefixes: &[&str]) -> bool {
@@ -234,9 +234,7 @@ pub fn decide(f: &Facts) -> Option<Decision> {
             // 3. a service that is an anomaly the moment it crosses the
             //    internet — and only then; the same port on your own network
             //    is a NAS or a printer
-            if remote
-                && let Some((_, name)) = HOSTILE_OUTBOUND.iter().find(|(p, _)| *p == f.port)
-            {
+            if remote && let Some((_, name)) = HOSTILE_OUTBOUND.iter().find(|(p, _)| *p == f.port) {
                 return deny(name);
             }
             // 4. inside your own network: a printer, a NAS, a router's admin
@@ -365,7 +363,11 @@ mod tests {
             listening: false,
             on_disk: false,
         });
-        assert_eq!(act(gone), Some(Action::Deny), "and no reason to allow saves it");
+        assert_eq!(
+            act(gone),
+            Some(Action::Deny),
+            "and no reason to allow saves it"
+        );
     }
 
     #[test]

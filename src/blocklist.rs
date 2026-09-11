@@ -528,7 +528,14 @@ pub const CATEGORIES: &[Category] = &[
     Category {
         key: "telemetry",
         about: "device and OS telemetry",
-        sources: &["hagezi:native.winoffice", "hagezi:native.apple", "hagezi:native.samsung", "hagezi:native.xiaomi", "hagezi:native.amazon", "hagezi:native.tiktok"],
+        sources: &[
+            "hagezi:native.winoffice",
+            "hagezi:native.apple",
+            "hagezi:native.samsung",
+            "hagezi:native.xiaomi",
+            "hagezi:native.amazon",
+            "hagezi:native.tiktok",
+        ],
     },
     Category {
         key: "social",
@@ -708,7 +715,10 @@ pub fn parse_line(line: &str) -> Option<&str> {
     // `#$#`) start with a domain, so they have to be rejected before `#` is
     // treated as a comment — otherwise every one of them silently becomes a
     // rule blocking the site it was meant to only hide an element on
-    if ["##", "#@#", "#?#", "#$#", "#%#"].iter().any(|m| line.contains(m)) {
+    if ["##", "#@#", "#?#", "#$#", "#%#"]
+        .iter()
+        .any(|m| line.contains(m))
+    {
         return None;
     }
     let line = line.split('#').next()?.trim();
@@ -800,7 +810,11 @@ impl Blocklist {
             allow: cfg
                 .allow
                 .iter()
-                .map(|d| d.trim_end_matches('.').to_ascii_lowercase().into_boxed_str())
+                .map(|d| {
+                    d.trim_end_matches('.')
+                        .to_ascii_lowercase()
+                        .into_boxed_str()
+                })
                 .collect(),
         }
     }
@@ -868,7 +882,11 @@ pub fn explain(cfg: &BlocklistConfig, name: &str) -> Why {
     let allow: HashSet<Box<str>> = cfg
         .allow
         .iter()
-        .map(|d| d.trim_end_matches('.').to_ascii_lowercase().into_boxed_str())
+        .map(|d| {
+            d.trim_end_matches('.')
+                .to_ascii_lowercase()
+                .into_boxed_str()
+        })
         .collect();
     let allowed_by = suffixes
         .iter()
@@ -1018,14 +1036,23 @@ mod tests {
     #[test]
     fn parses_every_format_in_the_catalogue() {
         // hosts
-        assert_eq!(parse_line("0.0.0.0 ads.example.com"), Some("ads.example.com"));
-        assert_eq!(parse_line("127.0.0.1\tads.example.com # why"), Some("ads.example.com"));
+        assert_eq!(
+            parse_line("0.0.0.0 ads.example.com"),
+            Some("ads.example.com")
+        );
+        assert_eq!(
+            parse_line("127.0.0.1\tads.example.com # why"),
+            Some("ads.example.com")
+        );
         // bare domain (hagezi wildcard, oisd)
         assert_eq!(parse_line("ads.example.com"), Some("ads.example.com"));
         assert_eq!(parse_line("ads.example.com."), Some("ads.example.com"));
         // adblock domain anchor (adguard)
         assert_eq!(parse_line("||ads.example.com^"), Some("ads.example.com"));
-        assert_eq!(parse_line("||ads.example.com^$third-party"), Some("ads.example.com"));
+        assert_eq!(
+            parse_line("||ads.example.com^$third-party"),
+            Some("ads.example.com")
+        );
     }
 
     #[test]
@@ -1077,7 +1104,10 @@ mod tests {
         assert!(l.blocked("example.com"));
         assert!(l.blocked("bad.example.com"));
         assert!(!l.blocked("good.example.com"));
-        assert!(!l.blocked("sub.good.example.com"), "allow covers its subtree too");
+        assert!(
+            !l.blocked("sub.good.example.com"),
+            "allow covers its subtree too"
+        );
     }
 
     #[test]
@@ -1133,7 +1163,11 @@ mod tests {
             ..Default::default()
         };
         let list = Blocklist::load(&cfg);
-        for blocked in ["google-analytics.com", "scorecardresearch.com", "criteo.com"] {
+        for blocked in [
+            "google-analytics.com",
+            "scorecardresearch.com",
+            "criteo.com",
+        ] {
             assert!(list.blocked(blocked), "{blocked}");
         }
         assert!(

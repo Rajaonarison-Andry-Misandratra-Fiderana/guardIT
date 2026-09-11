@@ -224,9 +224,7 @@ fn forward_chain(out: &mut String, cfg: &Config, block_dns: bool) {
             out.push('\n');
         }
     }
-    out.push_str(&format!(
-        "    ct state new queue num {QUEUE_FWD} bypass\n"
-    ));
+    out.push_str(&format!("    ct state new queue num {QUEUE_FWD} bypass\n"));
     out.push_str("  }\n");
 }
 
@@ -373,7 +371,10 @@ mod tests {
             chain.contains(&format!("queue num {QUEUE_FWD} bypass")),
             "must bypass: a restarting daemon cannot be allowed to cut container networking"
         );
-        assert!(chain.contains("tcp dport 23 drop"), "the ip rules apply here too");
+        assert!(
+            chain.contains("tcp dport 23 drop"),
+            "the ip rules apply here too"
+        );
         // the tap, so a container's own lookups feed the same name map
         assert!(chain.contains(&format!("udp sport 53 queue num {QUEUE_DNS} bypass")));
         assert!(chain.contains(&format!("udp dport 53 queue num {QUEUE_DNS} bypass")));
@@ -533,11 +534,41 @@ mod tests {
             (Action::Allow, Proto::Any, "any", None, None),
             (Action::Deny, Proto::Any, "any", None, Some(Direction::In)),
             (Action::Allow, Proto::Any, "192.168.0.0/16", None, None),
-            (Action::Allow, Proto::Tcp, "10.0.0.0/8", Some(22), Some(Direction::In)),
-            (Action::Deny, Proto::Udp, "any", Some(5353), Some(Direction::Out)),
-            (Action::Allow, Proto::Any, "any", Some(53), Some(Direction::Out)),
-            (Action::Deny, Proto::Tcp, "fd00::/8", Some(445), Some(Direction::Out)),
-            (Action::Allow, Proto::Any, "2001:db8::1", None, Some(Direction::In)),
+            (
+                Action::Allow,
+                Proto::Tcp,
+                "10.0.0.0/8",
+                Some(22),
+                Some(Direction::In),
+            ),
+            (
+                Action::Deny,
+                Proto::Udp,
+                "any",
+                Some(5353),
+                Some(Direction::Out),
+            ),
+            (
+                Action::Allow,
+                Proto::Any,
+                "any",
+                Some(53),
+                Some(Direction::Out),
+            ),
+            (
+                Action::Deny,
+                Proto::Tcp,
+                "fd00::/8",
+                Some(445),
+                Some(Direction::Out),
+            ),
+            (
+                Action::Allow,
+                Proto::Any,
+                "2001:db8::1",
+                None,
+                Some(Direction::In),
+            ),
         ];
         for (i, (action, proto, src, port, direction)) in shapes.into_iter().enumerate() {
             cfg.rule.push(Rule {
