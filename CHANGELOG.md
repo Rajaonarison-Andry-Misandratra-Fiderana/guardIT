@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **The README is shorter.** Everything after the CLI section — auto mode, domain rules,
+  blocking, configuration, the TUI — is cut to a short lead, its commands and one table
+  each, with the few things to know before turning a feature on in alert boxes. 448
+  lines down to 277.
+
 ## 0.3.0 — 2026-09-11
 
 DNS-level ads and tracking blocking, auto mode for machines nobody is watching, rules by
