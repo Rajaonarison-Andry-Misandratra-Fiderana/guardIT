@@ -1,6 +1,6 @@
 # Maintainer: Fiderana Rajaonarison <mirovarajaonarison@gmail.com>
 pkgname=guardit
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="nftables-backed firewall with per-app control and a live TUI dashboard"
 arch=('x86_64')

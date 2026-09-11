@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-09-11
+
+DNS-level ads and tracking blocking, auto mode for machines nobody is watching, rules by
+domain — and a TUI rebuilt around them.
 
 - **Moving between panes is never held by a modal you cannot see.** A preset picker or an
   audit-log flush confirmation survived `B` into the blocking tab, where it could not be
