@@ -1567,7 +1567,7 @@ fn blocklist_update_loop() {
         }
         let max_age = cfg.blocklist.update_hours as u64 * 3600;
         let now = now_ts();
-        let mut keys: Vec<String> = cfg.blocklist.sources.clone();
+        let mut keys: Vec<String> = blocklist::effective_sources(&cfg.blocklist);
         if cfg.blocklist.block_encrypted_dns {
             keys.push(blocklist::DOH_IPS_KEY.to_string());
         }
